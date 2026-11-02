@@ -1,15 +1,11 @@
 name: NPU Smoke Test
 
-# Runs an arbitrary pytest target against the L1 base image built by image-ci.yml, on
-# real NPU hardware. The target comes from the `test_path` input, so this workflow is
-# not tied to any single test suite.
+# Runs the pytest target from `test_path` against the L1 base image from image-ci.yml on
+# real NPU hardware (see .github/workflows/scripts/verify_env.py for the stack checks).
 #
-# Whatever the target is, the job first verifies that the runtime stack is sane
-# (see .github/workflows/scripts/verify_env.py).
-#
-# container.image is required: Ascend maps /dev/davinci* through the container runtime,
-# so a job running on the runner host cannot reach the NPUs (see npu-probe.yml). The SWR
-# repo is private, hence container.credentials.
+# container.image is mandatory: Ascend maps /dev/davinci* via the container runtime, so a
+# host-level job cannot reach the NPUs (npu-probe.yml). The SWR repo is private, hence
+# credentials.
 
 on:
   workflow_dispatch:
@@ -37,16 +33,11 @@ on:
         required: false
         default: '-v --durations=20'
       transformers_spec:
-        description: 'transformers constraint (some tests need a newer release, e.g. Qwen3MoeRMSNorm needs >=4.51)'
+        description: 'Extra transformers constraint; leave empty to keep the version shipped in the image'
         required: false
-        default: 'transformers>=4.51'
-      install_test_deps:
-        description: 'Install test deps (image already has torch/transformers/safetensors/pytest; only omegaconf is missing)'
-        required: false
-        default: true
-        type: boolean
+        default: ''
 
-# Serialize jobs per runner pool so the NPUs are not shared.
+# Serialize per runner pool: the NPUs cannot be shared.
 concurrency:
   group: npu-smoke-${{ inputs.runner_label }}
   cancel-in-progress: false
@@ -63,7 +54,7 @@ jobs:
     name: smoke (${{ inputs.runner_label }})
     runs-on: ${{ inputs.runner_label }}
 
-    # Pull 6~8 GiB L1 image (SWR ~4 MiB/s, worst case ~30 min) + install + run ops tests
+    # Pull ~6 GiB image over SWR (~4 MiB/s, up to 30 min) + install + tests
     timeout-minutes: 90
 
     container:
@@ -103,27 +94,22 @@ jobs:
       - name: ③ Install torchturbo
         env:
           TRANSFORMERS_SPEC: ${{ inputs.transformers_spec }}
-          INSTALL_TEST_DEPS: ${{ inputs.install_test_deps }}
         run: |
           set -euo pipefail
           BEFORE=$(python -c "import torch; print(torch.__version__)")
 
-          if [ "$INSTALL_TEST_DEPS" = "true" ]; then
-            # Let pyproject resolve project deps so this list cannot drift from it.
-            # --no-build-isolation: [build-system].requires lists torch, without this flag
-            # pip downloads a full torch wheel just to run setuptools.
-            # numpy<2 must resolve together with transformers, otherwise transformers may
-            # bump numpy to 2.x and break the triton-ascend operator stack.
-            python -m pip install --no-cache-dir -q \
-              --no-build-isolation \
-              -e ".[dev]" \
-              "numpy<2" \
-              "${TRANSFORMERS_SPEC}"
-          else
-            # Only valid when the image already ships every runtime dep.
-            echo "::notice::install_test_deps=false, skipping third-party install"
-            python -m pip install -e . --no-deps --no-build-isolation -q
+          # pyproject is the single source of deps, so this cannot drift. omegaconf is the
+          # only one missing from the image and it only needs PyYAML, so nothing else moves.
+          # --no-build-isolation: [build-system].requires lists torch, without this flag pip
+          # downloads a full torch wheel just to run setuptools.
+          # numpy is not constrained here on purpose: nothing in this resolution pulls it,
+          # and a constraint would install numpy into an image that lacks it. verify_env.py
+          # checks numpy instead.
+          ARGS=(-e ".[dev]")
+          if [ -n "${TRANSFORMERS_SPEC}" ]; then
+            ARGS+=("${TRANSFORMERS_SPEC}")
           fi
+          python -m pip install --no-cache-dir -q --no-build-isolation "${ARGS[@]}"
 
           AFTER=$(python -c "import torch; print(torch.__version__)")
           echo "torch before: ${BEFORE}"
