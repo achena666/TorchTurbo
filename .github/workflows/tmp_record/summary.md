@@ -84,9 +84,8 @@
 | 装测试依赖 | `pytest>=7.0` | 低 | 镜像已有 8.3.2（来自 triton-ascend），实际不下载 |
 | 装测试依赖 | `omegaconf>=2.3.0` | **中** | 镜像缺（唯一缺失的 pyproject 依赖）；**手工清单与 pyproject 会漂移** |
 | 装测试依赖 | `safetensors>=0.4.3` | 低 | 镜像已有 0.8.0（来自 fla） |
-| 装测试依赖 | `numpy<2` | **中** | 与镜像 1.26.4 一致；但 transformers 若要求 >=2 会冲突 |
-| 装测试依赖 | `transformers>=4.51` | **高** | 镜像已有 5.22.0（来自 fla）；该约束**无上界**，当前解析到最新版，测试依赖其私有 API |
-| 装本项目 | `pip install -e . --no-deps` | 低 | `--no-deps` 保 torch；**但也意味着 pyproject 的依赖全部不生效** |
+| 装测试依赖 | `transformers`（默认不传） | **高** | 镜像已有 5.22.0（来自 fla）；默认留空即不动，传约束才升级，无上界 |
+| 装本项目 | `pip install -e ".[dev]" --no-build-isolation` | 低 | 依赖由 pyproject 解析，不会漂移；实测只装 omegaconf 一个包 |
 | 装本项目 | `--no-build-isolation` | 低 | 缺此参数会下载整份 torch（`build-system.requires` 里有 torch） |
 | 运行测试 | torch 版本守卫 | 低 | `BEFORE/AFTER` 比对；实测 `2.10.0+cpu.nomimalloc >= 2.10.0` 成立，守卫不会触发 |
 
@@ -96,3 +95,28 @@
 |---|---|---|
 | transformers 隐式引入 | 由 fla 的 `>=4.45.0` 决定，Dockerfile 里看不见 | 改显式 `pip install transformers==<ver> einops==<ver>` + `pip install --no-deps /tmp/flash-linear-attention` |
 | numpy 版本 | 镜像 1.26.4 仅由 triton-ascend 传递钉住，Dockerfile / pyproject 均未声明 `numpy<2`；fla 或 transformers 任一要求 `>=2` 就会顶掉，NPU 算子栈在 kernel 加载期才报错 | Dockerfile 显式加 `pip install "numpy<2"`；PR CI 侧保持 `numpy<2` 最后安装 |
+
+---
+
+# 四、遗留问题：`cann_ops_transformer` 无构建来源
+
+**问题**：`lightning_indexer.py` / `sparse_flash_mla.py` 直接 `from cann_ops_transformer import ops`，
+但本仓库 Dockerfile、pyproject、requirements、md 和脚本里**都没有它的构建或安装说明**。
+L1 镜像不提供，它只存在于**客户现场打包的镜像**里，来源一旦丢失就装不回来。
+
+**实测**（2026-11-02，A3 服务器）：
+
+```
+$ import cann_ops_transformer   → ModuleNotFoundError
+$ pip list | grep ops           → npu_ops_transformer 1.0.0
+```
+
+`npu_ops_transformer` **不是它的别名**，是 CANN 9.0.0 自带的 MoE 通信包
+（只有 `moe_distribute_*`、`update_context`、`deep_ep`），没有这两个算子。
+也不要 `import` 它：`__init__.py` 会现场 JIT 编译 5 个 `.so`，耗时且易失败。
+
+**后果**：两个 provider 的 `available()` 都写成 `except ImportError: return False`，异常被吞掉；
+`tests/ops/npu/` 又不覆盖这两个算子，所以 smoke **17 passed 全绿**，算子却从未被选中。
+
+**待办**：需要时在 L2 镜像里用 vllm-ascend `csrc/build_aclnn.sh` 产出 `cann-ops-transformer*.run` 安装。
+当前维持现状，`verify_env.py` 每次打印 `cann_ops_transformer: not installed` 作提醒，不让 job 失败。

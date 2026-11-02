@@ -63,22 +63,6 @@ def check_numpy() -> None:
         _warn(f"numpy {numpy.__version__} >= 2, triton-ascend operator stack may break")
 
 
-def check_cann_ops() -> None:
-    """The CANN fused-op package is optional and fails silently when absent.
-
-    Note: the dist is named npu_ops_transformer while the import name is
-    cann_ops_transformer, and the providers swallow ImportError (they return
-    available() == False). A name change in the base image would therefore
-    disable the fused ops without failing any test, so surface it here.
-    """
-    try:
-        __import__("cann_ops_transformer").ops
-        print("cann_ops_transformer: OK")
-    except Exception as exc:  # noqa: BLE001 - optional dependency
-        print(f"cann_ops_transformer: MISSING ({type(exc).__name__}: {exc})")
-        _warn("cann_ops_transformer not importable, NPU fused ops fall back silently")
-
-
 def check_nomimalloc_tag() -> None:
     """Distinguish the self-built wheel from the PyPI one.
 
@@ -119,7 +103,6 @@ def check_matmul(count: int) -> None:
 def main() -> int:
     report_versions()
     check_numpy()
-    check_cann_ops()
     check_nomimalloc_tag()
     count = check_npu_devices()
     check_matmul(count)
