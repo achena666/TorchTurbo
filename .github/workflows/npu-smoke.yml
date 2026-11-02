@@ -102,9 +102,6 @@ jobs:
           # only one missing from the image and it only needs PyYAML, so nothing else moves.
           # --no-build-isolation: [build-system].requires lists torch, without this flag pip
           # downloads a full torch wheel just to run setuptools.
-          # numpy is not constrained here on purpose: nothing in this resolution pulls it,
-          # and a constraint would install numpy into an image that lacks it. verify_env.py
-          # checks numpy instead.
           ARGS=(-e ".[dev]")
           if [ -n "${TRANSFORMERS_SPEC}" ]; then
             ARGS+=("${TRANSFORMERS_SPEC}")

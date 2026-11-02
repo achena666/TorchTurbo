@@ -8,7 +8,10 @@ name: Image CI (base)
 #   · Docker 28.0.4 + buildx v0.38.1（docker-daemon 驱动，非远程 buildkitd）
 #   · quay.io 拉 cann:9.0.0-a3 全量 172 s（25.2 MiB/s）→ FROM 保持 quay.io
 #   · 推 SWR 4.00 MiB/s → L1 产物 6~8 GiB 约需 26~34 min
-#   · 4 核跑 PyTorch 源码编译 3~5 h，MAX_JOBS=8 需 24 GB 内存会 OOM → 默认 4
+#   · 4 核跑 PyTorch 源码编译 3~5 h，MAX_JOBS=8 需 24 GB 内存会 OOM → 4 核时上限 4
+#   · 两段源码编译（fla-npu 84.7 min + PyTorch 68.1 min）占 209 min 的 73%，
+#     理论上换核心多的机器是最大杠杆；但当前资源池只有 ubuntu-22.04-arm，
+#     所以只能靠缓存命中（use_cache）与 MAX_JOBS 打满 4 核来减时。
 #
 # 硬约束（SWR 只收 Docker v2s2，不收 OCI image index）：
 #   --output type=image,push=true,oci-mediatypes=false
@@ -37,17 +40,12 @@ on:
         required: false
         default: ''
       max_jobs:
-        description: 'Dockerfile 里的 MAX_JOBS（4 核 15 GiB 建议 4；8 会 OOM）'
+        description: 'MAX_JOBS；auto = min(nproc, 内存GB/3)。一般不用手填'
         required: true
-        default: '4'
+        default: 'auto'
       use_cache:
-        description: '是否用 GHA 构建缓存（type=gha）。首次构建建议 false，避免缓存导出失败拖垮整次构建'
+        description: '是否用 GHA 构建缓存（type=gha, mode=min）。默认开：重建时能省掉大部分层'
         required: true
-        default: false
-        type: boolean
-      free_disk:
-        description: '构建前腾磁盘（GH 托管有效；自托管可能无 sudo）。110 GB 本来就够，失败可忽略'
-        required: false
         default: true
         type: boolean
 
@@ -119,20 +117,7 @@ jobs:
           test -f "$DOCKERFILE" || { echo "::error::找不到 $DOCKERFILE"; exit 1; }
           head -3 "$DOCKERFILE"
 
-      - name: ③ 腾磁盘（可选，失败不阻断）
-        if: ${{ inputs.free_disk }}
-        continue-on-error: true
-        uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          # 必须保留 swap：15 GiB 内存 + MAX_JOBS=4 本来就很贴（峰值约 12 GB），
-          # 这个 action 的 swap-storage 默认是 true，会把 3 GiB swap 一起删掉。
-          swap-storage: false
-
-      - name: ④ 建立 buildx builder（缓存导出需要 docker-container 驱动）
+      - name: ③ 建立 buildx builder（缓存导出需要 docker-container 驱动）
         id: builder
         run: |
           set -uo pipefail
@@ -150,7 +135,7 @@ jobs:
           fi
           docker buildx ls | head -20 || true
 
-      - name: ⑤ 计算 tag
+      - name: ④ 计算 tag
         id: tag
         run: |
           set -uo pipefail
@@ -160,6 +145,7 @@ jobs:
           if [ -n "$INPUT_TAG" ]; then
             IMMUTABLE="$INPUT_TAG"
           else
+            # 同 commit 同日重跑会撞⑥的前置检查，此时手填 push_tag 即可
             IMMUTABLE="base-${STAMP}-${SHORT_SHA}"
           fi
           FULL="${REGISTRY}/${REPOSITORY}"
@@ -167,7 +153,7 @@ jobs:
           echo "full=${FULL}" >> "$GITHUB_OUTPUT"
           echo "::notice::不可变 tag = ${FULL}:${IMMUTABLE}；滚动 tag = ${FULL}:${MOVING_TAG}"
 
-      - name: ⑥ 登录 SWR（仅 should_push=true）
+      - name: ⑤ 登录 SWR（仅 should_push=true）
         if: ${{ inputs.should_push }}
         env:
           SWR_USER: ${{ secrets.SWR_USERNAME }}
@@ -185,7 +171,7 @@ jobs:
           fi
           echo "::notice::docker login 成功（${REGISTRY}）"
 
-      - name: ⑦ 前置检查（不可变 tag 已存在则拒绝，不覆盖）
+      - name: ⑥ 前置检查（不可变 tag 已存在则拒绝，不覆盖）
         if: ${{ inputs.should_push }}
         env:
           TAG_IMM: ${{ steps.tag.outputs.immutable }}
@@ -208,8 +194,10 @@ jobs:
           fi
           echo "::notice::前置检查通过：${TAG_IMM} 空闲"
 
-      - name: ⑧ 构建并推送基础镜像
+      - name: ⑦ 构建并推送基础镜像
         id: build
+        # job 级 timeout 是兜底；这里更早失败，避免某一层 pip/网络 hang 住白占数小时
+        timeout-minutes: 320
         env:
           TAG_IMM: ${{ steps.tag.outputs.immutable }}
           FULL: ${{ steps.tag.outputs.full }}
@@ -221,6 +209,17 @@ jobs:
           set -uo pipefail
           START=$(date +%s)
           echo "begin=$(date -u +%H:%M:%S)"
+
+          # MAX_JOBS=auto：按核数与内存现算。实测 4 核 / 15 GiB 用 4 可完成（峰值 ~12 GB），
+          # 8 会 OOM，所以按 ~3 GiB/job 估算：15/3=5 → 取核数 4。
+          if [ "$MAX_JOBS" = "auto" ]; then
+            CORES=$(nproc)
+            MEM_GB=$(awk '/MemTotal/{printf "%d", $2/1048576}' /proc/meminfo)
+            BY_MEM=$(( MEM_GB / 3 ))
+            if [ "$BY_MEM" -lt 1 ]; then BY_MEM=1; fi
+            if [ "$CORES" -lt "$BY_MEM" ]; then MAX_JOBS=$CORES; else MAX_JOBS=$BY_MEM; fi
+          fi
+          echo "max_jobs=${MAX_JOBS}" >> "$GITHUB_OUTPUT"
 
           # tag 参数 / 输出目标
           # 注意：type=cacheonly 不产出镜像，只导出缓存，所以这一支不能带 -t
@@ -235,13 +234,16 @@ jobs:
             echo "::notice::should_push=false —— 只验证构建，不产出镜像、不推送"
           fi
 
+          # mode=min 只导出最终镜像的层（约 6 GiB），落在 GH 单仓 10 GiB 配额内。
+          # mode=max 会把全部中间层导出去，超配额后缓存导出失败会连构建一起失败。
+          CACHE_SCOPE="torchturbo-base"
           CACHE_ARGS=()
-          if [ "$USE_CACHE" = "true" ] && [ -n "${BUILDER:-}" ]; then
-            CACHE_ARGS+=(--cache-from "type=gha,scope=torchturbo-base")
-            CACHE_ARGS+=(--cache-to "type=gha,mode=max,scope=torchturbo-base")
-            echo "缓存：type=gha,mode=max（scope=torchturbo-base）"
+          if [ -n "${BUILDER:-}" ] && { [ "$USE_CACHE" = "true" ] || [ "$SHOULD_PUSH" != "true" ]; }; then
+            CACHE_ARGS+=(--cache-from "type=gha,scope=${CACHE_SCOPE}")
+            CACHE_ARGS+=(--cache-to "type=gha,mode=min,scope=${CACHE_SCOPE}")
+            echo "缓存：type=gha,mode=min（scope=${CACHE_SCOPE}）"
           else
-            echo "缓存：未启用（首次构建建议关闭；GHA 缓存导出失败会让整次构建失败）"
+            echo "缓存：未启用（builder 不可用或缺省为 should_push=true 且 use_cache=false）"
           fi
 
           echo "--- 构建参数 ---"
@@ -266,6 +268,7 @@ jobs:
           fi
           docker buildx build \
             "${BUILDER_ARGS[@]}" \
+            --progress=plain \
             --platform "$PLATFORM" \
             --file "$DOCKERFILE" \
             --build-arg "MAX_JOBS=${MAX_JOBS}" \
@@ -309,7 +312,17 @@ jobs:
             echo "::notice::未推送到 registry，无 digest（should_push=${SHOULD_PUSH}）"
           fi
 
-      - name: ⑨ 校验产物（只有推送时才回读 manifest）
+      - name: ⑦b 上传构建日志（always，失败时唯一线索）
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: /tmp/build.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: ⑧ 校验产物（只有推送时才回读 manifest）
         id: verify
         if: ${{ inputs.should_push && success() }}
         env:
@@ -320,7 +333,7 @@ jobs:
           set -uo pipefail
           echo "media_type=" >> "$GITHUB_OUTPUT"
 
-          # digest 已在 ⑧ 由 --metadata-file 取出，这里不再重复解析
+          # digest 已在 ⑦ 由 --metadata-file 取出，这里不再重复解析
           DIGEST="${BUILD_DIGEST:-}"
           echo "digest = ${DIGEST:-<unknown>}"
 
@@ -363,7 +376,7 @@ jobs:
               echo "::warning::未识别的 manifest 格式：${FMT:-<空>}" ;;
           esac
 
-      - name: ⑩ 汇总到 Job Summary
+      - name: ⑨ 汇总到 Job Summary
         if: always()
         run: |
           {
@@ -374,7 +387,7 @@ jobs:
             echo "| runner | \`${{ inputs.runner }}\` |"
             echo "| Dockerfile | \`${{ env.DOCKERFILE }}\` |"
             echo "| platform | \`${{ env.PLATFORM }}\` |"
-            echo "| MAX_JOBS | \`${{ inputs.max_jobs }}\` |"
+            echo "| MAX_JOBS | \`${{ steps.build.outputs.max_jobs || inputs.max_jobs }}\` |"
             echo "| 使用缓存 | \`${{ inputs.use_cache }}\` |"
             echo "| 推送 | \`${{ inputs.should_push }}\` |"
             echo "| 不可变 tag | \`${{ steps.tag.outputs.full }}:${{ steps.tag.outputs.immutable }}\` |"
@@ -404,7 +417,7 @@ jobs:
             echo "> 本 workflow 只构建 **L1 base**；L2（ci-lf / ci-swift）由后续 workflow 基于它构建。"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: ⑪ 清理 buildx builder
+      - name: ⑩ 清理 buildx builder
         if: always()
         run: |
           B="${{ steps.builder.outputs.name }}"

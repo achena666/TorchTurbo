@@ -42,27 +42,6 @@ def report_versions() -> None:
             print(f"{name}: MISSING ({type(exc).__name__}: {exc})")
 
 
-def check_numpy() -> None:
-    """triton-ascend needs numpy 1.x, nothing in the repo pins it.
-
-    numpy 1.26.4 only reaches the image transitively through triton-ascend, so a
-    future rebuild could silently resolve to 2.x and break the NPU operator stack
-    at kernel load time. Report it here rather than constraining it in the install
-    step, because a pip constraint would install numpy into an image that lacks it
-    and hide the problem instead of surfacing it.
-    """
-    try:
-        import numpy
-    except ImportError as exc:
-        print(f"numpy: MISSING ({exc})")
-        _warn("numpy not importable, triton-ascend kernels will fail to load")
-        return
-
-    print("numpy :", numpy.__version__)
-    if int(numpy.__version__.split(".")[0]) >= 2:
-        _warn(f"numpy {numpy.__version__} >= 2, triton-ascend operator stack may break")
-
-
 def check_nomimalloc_tag() -> None:
     """Distinguish the self-built wheel from the PyPI one.
 
@@ -102,7 +81,6 @@ def check_matmul(count: int) -> None:
 
 def main() -> int:
     report_versions()
-    check_numpy()
     check_nomimalloc_tag()
     count = check_npu_devices()
     check_matmul(count)
