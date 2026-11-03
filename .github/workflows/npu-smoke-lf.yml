@@ -79,14 +79,32 @@ jobs:
         id: torchturbo
         run: |
           set -uo pipefail
-          START=$(date +%s)
 
+          # Which index pip will actually use. ARG PIP_INDEX_URL only applies at build
+          # time (ARG is not baked into the image), so inside the pod the source comes
+          # from the pod's own pip config / env. Printed before the timer starts.
+          echo "--- pip source ---"
+          python -m pip config list 2>/dev/null || true
+          env | grep -iE '^(PIP_|.*_PROXY=)' || echo "(no PIP_* / proxy env)"
+
+          echo "--- already satisfied before install ---"
+          python -m pip list 2>/dev/null \
+            | grep -iE '^(torch|torch[-_]npu|numpy|triton|omegaconf|PyYAML|pytest|safetensors|pluggy|iniconfig|pygments)\b' \
+            || true
+
+          START=$(date +%s)
+          # No -q on purpose: the Collecting/Downloading lines are the only direct evidence
+          # of whether anything was fetched or everything was already in the image.
           # --no-build-isolation: [build-system].requires lists torch, without this flag pip
           # downloads a full torch wheel just to run setuptools.
-          python -m pip install --no-cache-dir -q --no-build-isolation -e ".[dev]"
-          RC=$?
-
+          python -m pip install --no-cache-dir --no-build-isolation -e ".[dev]" 2>&1 | tee /tmp/turbo.log
+          RC=${PIPESTATUS[0]}
           ELAPSED=$(( $(date +%s) - START ))
+
+          echo "--- what pip actually did ---"
+          grep -E '^(Collecting|Downloading|Using cached|Installing collected|Requirement already satisfied)' \
+            /tmp/turbo.log | sed 's/ (from .*//' || echo "(no pip action lines)"
+
           echo "elapsed=${ELAPSED}" >> "$GITHUB_OUTPUT"
           echo "rc=${RC}" >> "$GITHUB_OUTPUT"
           echo "::notice::torchturbo install took ${ELAPSED}s (rc=${RC})"
@@ -118,7 +136,8 @@ jobs:
           python - <<'PROBE' > /tmp/after.txt 2>&1 || true
           import importlib
           for name in ("torch", "torch_npu", "numpy", "triton",
-                       "fla", "fla_npu", "transformers", "llamafactory", "deepspeed"):
+                       "fla", "fla_npu", "transformers", "llamafactory", "deepspeed",
+                       "omegaconf", "pytest"):
               try:
                   module = importlib.import_module(name)
                   print(f"{name}={getattr(module, '__version__', 'unknown')}")
