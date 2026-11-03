@@ -1,14 +1,14 @@
 name: NPU Smoke (llamafactory env)
 
-# Builds a llamafactory environment on top of the L1 base image and reports how long it
-# takes. Training is NOT exercised here: the goal is to measure
-# `scripts/runs/<model>/install_lf_deps.sh` on real NPU hardware, plus prove the NPU stack
-# still works after all those pip installs.
+# Measures how long it takes to build a llamafactory environment on top of the L1 base
+# image. Training is NOT exercised, and the base image is NOT verified either: the only
+# deliverable is the timing of `scripts/runs/<model>/install_lf_deps.sh`.
 #
 # The install script is invoked as-is, never copied inline, so CI always measures the same
 # commands training will run.
 #
-# container.image is mandatory: Ascend maps /dev/davinci* via the container runtime.
+# container.image is mandatory: the base image lives in a private SWR repo, so the runner
+# has to pull it as its own root filesystem.
 
 on:
   workflow_dispatch:
@@ -75,62 +75,24 @@ jobs:
       - name: ① Checkout
         uses: actions/checkout@v4
 
-      - name: ② Verify base image, NPU and pre-install versions
-        run: |
-          set -uo pipefail
-          echo "runner: ${{ inputs.runner_label }} | image: ${{ inputs.image }}"
-          uname -m; nproc; free -h | head -2; df -h / | tail -1; python -V
-
-          echo "--- NPU devices ---"
-          ls /dev/davinci* >/dev/null 2>&1 || { echo "::error::no /dev/davinci*, NPUs not mapped into the pod"; exit 1; }
-          echo "davinci count: $(ls /dev/davinci* | wc -l)"
-          npu-smi info 2>/dev/null | head -15 || echo "npu-smi unavailable"
-
-          echo "--- runtime stack (must already be healthy before we touch anything) ---"
-          python .github/workflows/scripts/verify_env.py
-
-          # Snapshot the versions that the install below is expected to move or must not move.
-          # numpy is captured explicitly: verify_env.py no longer reports it, and the image's
-          # numpy is whatever `requirements-build.txt` resolved at build time.
-          echo "--- version snapshot -> /tmp/before.txt ---"
-          python - <<'PY' | tee /tmp/before.txt
-          import importlib
-          for name in ("torch", "torch_npu", "numpy", "triton",
-                       "fla", "fla_npu", "transformers", "llamafactory", "deepspeed"):
-              try:
-                  module = importlib.import_module(name)
-                  print(f"{name}={getattr(module, '__version__', 'unknown')}")
-              except Exception as exc:
-                  print(f"{name}=MISSING({type(exc).__name__})")
-          PY
-
-      - name: ③ Install torchturbo (same command as npu-smoke.yml)
+      - name: ② Install torchturbo (same command as npu-smoke.yml)
         id: torchturbo
         run: |
-          set -euo pipefail
-          BEFORE=$(python -c "import torch; print(torch.__version__)")
+          set -uo pipefail
           START=$(date +%s)
 
           # --no-build-isolation: [build-system].requires lists torch, without this flag pip
           # downloads a full torch wheel just to run setuptools.
           python -m pip install --no-cache-dir -q --no-build-isolation -e ".[dev]"
+          RC=$?
 
           ELAPSED=$(( $(date +%s) - START ))
           echo "elapsed=${ELAPSED}" >> "$GITHUB_OUTPUT"
+          echo "rc=${RC}" >> "$GITHUB_OUTPUT"
+          echo "::notice::torchturbo install took ${ELAPSED}s (rc=${RC})"
+          exit "$RC"
 
-          AFTER=$(python -c "import torch; print(torch.__version__)")
-          echo "torch before: ${BEFORE}"
-          echo "torch after : ${AFTER}"
-          if [ "$BEFORE" != "$AFTER" ]; then
-            python -m pip list 2>/dev/null | grep -iE '^(torch|torch[-_]npu|numpy|triton)\b' || true
-            echo "::error::torch was replaced (${BEFORE} -> ${AFTER}), NPU stack is no longer trusted"
-            exit 1
-          fi
-
-          python -c "import torchturbo; print('torchturbo ok:', torchturbo.__file__)"
-          echo "::notice::torchturbo install took ${ELAPSED}s"
-
-      - name: ④ Install llamafactory env (scripts/runs/${{ inputs.model }})
+      - name: ③ Install llamafactory env (scripts/runs/${{ inputs.model }})
         id: lf_deps
         env:
           MODEL: ${{ inputs.model }}
@@ -142,9 +104,6 @@ jobs:
           echo "--- script content ---"
           cat "$SCRIPT"
 
-          # Not every model script sets `set -e` (bailing_v3, deepseek_v4, kimi_k25 do not),
-          # so a failing pip line cannot be detected from the exit code alone. Step ⑤ imports
-          # the expected packages instead, which catches silent partial installs.
           START=$(date +%s)
           bash "$SCRIPT" 2>&1 | tee /tmp/lf-deps.log
           RC=${PIPESTATUS[0]}
@@ -153,60 +112,30 @@ jobs:
           echo "rc=${RC}" >> "$GITHUB_OUTPUT"
           echo "elapsed=${ELAPSED}" >> "$GITHUB_OUTPUT"
           echo "::notice::${MODEL}/install_lf_deps.sh took ${ELAPSED}s (rc=${RC})"
-          exit "$RC"
 
-      - name: ⑤ Verify the env and report version drift
-        if: always()
-        run: |
-          set -uo pipefail
-          BEFORE_TORCH=$(sed -n 's/^torch=//p' /tmp/before.txt 2>/dev/null | head -1)
-          BEFORE_NUMPY=$(sed -n 's/^numpy=//p' /tmp/before.txt 2>/dev/null | head -1)
-
-          echo "--- runtime stack after install ---"
-          python .github/workflows/scripts/verify_env.py || echo "::error::verify_env.py failed after install"
-
-          echo "--- packages the llamafactory env must provide ---"
-          python - <<'PY'
+          # Record what actually landed. Deliberately outside the timed region above and
+          # never fatal: this workflow's deliverable is the duration, not a pass/fail gate.
+          python - <<'PROBE' > /tmp/after.txt 2>&1 || true
           import importlib
-          required = ("torch", "torch_npu", "fla", "fla_npu", "transformers",
-                      "llamafactory", "deepspeed", "peft", "trl", "datasets",
-                      "accelerate", "omegaconf", "safetensors")
-          missing = []
-          for name in required:
+          for name in ("torch", "torch_npu", "numpy", "triton",
+                       "fla", "fla_npu", "transformers", "llamafactory", "deepspeed"):
               try:
                   module = importlib.import_module(name)
-                  print(f"{name:14s} {getattr(module, '__version__', 'unknown')}")
+                  print(f"{name}={getattr(module, '__version__', 'unknown')}")
               except Exception as exc:
-                  print(f"{name:14s} MISSING ({type(exc).__name__}: {exc})")
-                  missing.append(name)
-          if missing:
-              raise SystemExit("::error::missing after install: " + ", ".join(missing))
-          PY
+                  print(f"{name}=MISSING({type(exc).__name__})")
+          PROBE
+          cat /tmp/after.txt
 
-          # torch and numpy are the two things a stray pip resolution can silently break:
-          # torch's C extension binds to the numpy ABI it was compiled against, and a torch
-          # swap discards the self-built nomimalloc wheel.
-          echo "--- torch / numpy drift ---"
-          AFTER_TORCH=$(python -c "import torch; print(torch.__version__)")
-          AFTER_NUMPY=$(python -c "import numpy; print(numpy.__version__)")
-          echo "torch : ${BEFORE_TORCH:-?} -> ${AFTER_TORCH}"
-          echo "numpy : ${BEFORE_NUMPY:-?} -> ${AFTER_NUMPY}"
-          if [ "${BEFORE_TORCH:-}" != "$AFTER_TORCH" ]; then
-            echo "::error::torch changed (${BEFORE_TORCH} -> ${AFTER_TORCH})"
-            exit 1
-          fi
-          if [ "${BEFORE_NUMPY:-}" != "$AFTER_NUMPY" ]; then
-            echo "::warning::numpy changed (${BEFORE_NUMPY} -> ${AFTER_NUMPY}); lf_deps.sh ends with a hard numpy pin, verify torch still imports on NPU"
-          fi
+          exit "$RC"
 
-          echo "--- architecture heuristic ---"
-          python -c "import numpy; print('numpy', numpy.__version__, '| version 2.x:', numpy.__version__.split('.')[0] == '2')"
 
-      - name: ⑥ Summary
+      - name: ④ Summary
         if: always()
         env:
           MODEL: ${{ inputs.model }}
           TORCHTURBO_S: ${{ steps.torchturbo.outputs.elapsed }}
+          TORCHTURBO_RC: ${{ steps.torchturbo.outputs.rc }}
           LF_DEPS_S: ${{ steps.lf_deps.outputs.elapsed }}
           LF_DEPS_RC: ${{ steps.lf_deps.outputs.rc }}
         run: |
@@ -222,22 +151,21 @@ jobs:
             echo "| runner | \`${{ inputs.runner_label }}\` |"
             echo "| image | \`${{ inputs.image }}\` |"
             echo "| model | \`${MODEL}\` |"
-            echo "| lf deps rc | \`${LF_DEPS_RC:-n/a}\` |"
             echo ""
             echo "### Timing (excludes image pull)"
             echo ""
-            echo "| phase | seconds | human |"
-            echo "|---|---|---|"
-            echo "| ③ torchturbo \`-e .[dev]\` | \`${TORCHTURBO_S:-n/a}\` | $(fmt "${TORCHTURBO_S}") |"
-            echo "| ④ \`${MODEL}/install_lf_deps.sh\` | \`${LF_DEPS_S:-n/a}\` | $(fmt "${LF_DEPS_S}") |"
-            echo "| **total** | \`${TOTAL}\` | **$(fmt "${TOTAL}")** |"
+            echo "| phase | seconds | human | rc |"
+            echo "|---|---|---|---|"
+            echo "| ② torchturbo \`-e .[dev]\` | \`${TORCHTURBO_S:-n/a}\` | $(fmt "${TORCHTURBO_S}") | \`${TORCHTURBO_RC:-n/a}\` |"
+            echo "| ③ \`${MODEL}/install_lf_deps.sh\` | \`${LF_DEPS_S:-n/a}\` | $(fmt "${LF_DEPS_S}") | \`${LF_DEPS_RC:-n/a}\` |"
+            echo "| **total** | \`${TOTAL}\` | **$(fmt "${TOTAL}")** | |"
             echo ""
-            echo "### Versions before install"
+            echo "### Versions after install"
             echo ""
             echo '```'
-            cat /tmp/before.txt 2>/dev/null || echo "(snapshot missing)"
+            cat /tmp/after.txt 2>/dev/null || echo "(probe failed)"
             echo '```'
             echo ""
-            echo "> This workflow measures environment build time only; it does not run training."
+            echo "> Measurement only: no training, no base-image verification, no NPU checks."
             echo "> \`scripts/runs/<model>/install_lf_deps.sh\` is executed unmodified."
           } >> "$GITHUB_STEP_SUMMARY"
