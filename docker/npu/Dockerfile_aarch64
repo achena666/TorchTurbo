@@ -65,6 +65,7 @@ RUN git clone https://github.com/fla-org/flash-linear-attention.git /tmp/flash-l
     && rm -rf /tmp/flash-linear-attention
 # Install other packages
 RUN pip install py-spy==0.4.2
+RUN pip install pybind11
 
 # Configure shell startup and SSH access.
 RUN rm -f /etc/profile.d/system-info.sh /etc/motd

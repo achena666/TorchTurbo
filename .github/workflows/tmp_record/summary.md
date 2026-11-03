@@ -98,6 +98,17 @@
 
 ## 3.4 PyTorch 与 numpy 的版本必须一致
 
+报错日志
+~~~
+File "torchturbo/engine/checkpoint/coordinator.py", line 258, in _weight_converter
+    converter = collective_check(...)
+File "torchturbo/engine/checkpoint/distributed.py", line 44, in collective_check
+    dist.all_gather_object(errors, error)
+File "torch/distributed/distributed_c10d.py", line 3172, in _tensor_to_object
+    buf = tensor.numpy().tobytes()[:tensor_size]
+RuntimeError: Numpy is not available
+~~~
+
 torch 的 C 扩展在**编译期**绑定 numpy ABI，运行期换大版本即报错。旧顺序里 numpy 1.26.4
 由 `triton-ascend` 传递带出、且发生在 torch 编译之前；训练侧 `lf_deps.sh` 结尾的
 `pip install numpy==2.0` 又把它升到 2.0.0 → SFT 启动即失败。
@@ -162,4 +173,33 @@ passes / `torch.export`。**两者只在 `torch.compile` / `torch.fx` 时 import
 `python -c "import jinja2, networkx"` 做构建期断言。
 代价：该行位于第 4 层，改动会让其后全部缓存失效，即一次完整重建（约 160 min）。
 
-**修复**： 编译pytorch时 取消掉--no-deps, 能否自己建立jinja2/ network
+**修复**：已落地。torch wheel 安装去掉 `--no-deps`，改为按元数据自行解析——
+这 6 个依赖都不含 numpy，不影响编译期 numpy 版本。
+
+---
+
+# 六、llamafactory 环境构建耗时基线
+
+复核结论：运行时安装 lf 依赖只需 **360 s**，不值得为它单独做 L2 镜像。
+
+| 阶段 | 耗时 | 说明 |
+|---|---|---|
+| 拉 base 镜像（冷节点） | SWR 3min12s / quay 42min | 见第二章 |
+| ③ `pip install -e ".[dev]" --no-build-isolation` | ~60 s | 只装 omegaconf + pytest |
+| ④ `scripts/runs/<model>/install_lf_deps.sh` | **360 s** | 15 个包 |
+| 合计（不含拉镜像） | **~7 min** | |
+
+**为什么不做 L2（ci-lf / ci-swift）**：
+
+- 净收益仅 4~4.5 min。冷节点上 L2 多 2.5 GB，按 SWR 4 MiB/s 要多拉 1.5~2 min，抵掉一部分。
+- 一次 L2 构建 + 推送要 16~18 min（base 6 min + 推送 10 min），需运行 4 次以上才回本。
+- 调试期 base 还在改，`FROM` 一变 L2 整层失效，等于每次 base 调试多付一次 L2 成本。
+- per-model 增量（`tiktoken` / `torchvision==0.25.0` / `qwen-vl-utils==0.0.14`）只有 1~2 个包、10~30 s，留在运行时装。
+- lf 与 swift 的 `transformers` / `trl` / `datasets` / `peft` 版本互斥，本来也得拆两个镜像。
+
+**重启条件**：base 连续 2~3 次构建无改动 + CI 进入 PR 门禁（每天 ≥5 次运行）+ 有固定
+NPU 节点（镜像命中率 >80%）。届时做 2 个框架镜像，而非每模型一个。
+
+**注意**：L2 唯一不可替代的价值是"版本冲突在构建期暴露"（如 `ms_swift 4.4.2` 要求
+`datasets<4.8.5`，而 `swift_deps.sh` 装 `5.0.1`，pip 只警告不失败）。但这可以在运行期
+用 `python -m pip check` 拿到，不需要为此建镜像。
