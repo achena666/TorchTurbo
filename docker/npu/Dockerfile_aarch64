@@ -37,7 +37,7 @@ RUN git clone --branch v2.10.0 --depth 1 --recurse-submodules --shallow-submodul
         USE_MIMALLOC=OFF BUILD_TEST=0 BLAS=OpenBLAS \
         PYTORCH_BUILD_VERSION=2.10.0+cpu.nomimalloc PYTORCH_BUILD_NUMBER=1 \
         python setup.py bdist_wheel \
-    && pip install dist/torch-*.whl --force-reinstall --no-deps \
+    && pip install dist/torch-*.whl --force-reinstall  \
     && cd / \
     && rm -rf /tmp/pytorch
 # Install Ascend NPU packages and configure custom operators.

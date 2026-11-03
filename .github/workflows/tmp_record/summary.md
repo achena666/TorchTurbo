@@ -96,6 +96,22 @@
 | transformers 隐式引入 | 由 fla 的 `>=4.45.0` 决定，Dockerfile 里看不见 | 改显式 `pip install transformers==<ver> einops==<ver>` + `pip install --no-deps /tmp/flash-linear-attention` |
 | numpy 版本 | 镜像 1.26.4 仅由 triton-ascend 传递钉住，Dockerfile / pyproject 均未声明 `numpy<2`；fla 或 transformers 任一要求 `>=2` 就会顶掉，NPU 算子栈在 kernel 加载期才报错 | Dockerfile 显式加 `pip install "numpy<2"`；PR CI 侧保持 `numpy<2` 最后安装 |
 
+## 3.4 PyTorch 与 numpy 的版本必须一致
+
+torch 的 C 扩展在**编译期**绑定 numpy ABI，运行期换大版本即报错。旧顺序里 numpy 1.26.4
+由 `triton-ascend` 传递带出、且发生在 torch 编译之前；训练侧 `lf_deps.sh` 结尾的
+`pip install numpy==2.0` 又把它升到 2.0.0 → SFT 启动即失败。
+
+改法（`eaadf67`）：torch 编译块上移到所有 pip 装包之前，直接用 CANN 镜像自带 numpy；
+`triton-ascend` 加 `--no-deps`，防止它把 numpy 拉回 1.26.4。`verify_env.py` 里
+「numpy 必须是 1.x」的旧断言已删除，它与新契约正好相反，否则每次 CI 都会误报警告。
+
+残留：`jinja2` / `networkx` 原本由 PyPI 版 torch 带来（`torch_npu` 先装时 pip 解析
+`torch==2.10.0` 顺带装的），改序后无人安装。两者只在 `torch.compile` 与 `torch.fx`
+时才 import，eager 训练和 smoke 都测不出来。**本次保留 `--no-deps` 原样先构一版**；
+修复待确认后再上：去掉它让 wheel 元数据自行解析（6 个依赖都不含 numpy，不影响编译期
+版本），并加 `python -c "import jinja2, networkx"` 断言。
+
 ---
 
 # 四、遗留问题：`cann_ops_transformer` 无构建来源
@@ -120,3 +136,30 @@ $ pip list | grep ops           → npu_ops_transformer 1.0.0
 
 **待办**：需要时在 L2 镜像里用 vllm-ascend `csrc/build_aclnn.sh` 产出 `cann-ops-transformer*.run` 安装。
 当前维持现状，`verify_env.py` 每次打印 `cann_ops_transformer: not installed` 作提醒，不让 job 失败。
+
+---
+
+# 五、遗留问题：`jinja2` / `networkx` 缺失
+
+**问题**：`8cdcb33` 把 torch 编译块上移到 `torch_npu` 之前后，这两个包没有任何地方安装。
+
+**成因**：torch 的 wheel 声明了 `install_requires`（`setup.py:1696`）：
+`filelock`、`typing-extensions`、`sympy`、`networkx`、`jinja2`、`fsspec`。
+旧顺序里 `torch_npu` 先装、pip 需解析 `torch==2.10.0`，会从 PyPI 拉一份 torch 并
+顺带装齐这些依赖；随后源码 torch 用 `--no-deps` 只覆盖文件，依赖留在原地。
+改序后 `2.10.0+cpu.nomimalloc` 已满足该约束，pip 判定 already satisfied，**一跳都不装**。
+
+**缺口只有 2 个**：`filelock` / `fsspec` 由 `huggingface-hub` 提供，`sympy` 由 fla-npu
+的 `requirements.txt` 提供，`typing-extensions` 由 `requirements-build.txt` 提供。
+`jinja2` 只出现在 `huggingface-hub` 的 `extra` 里（默认不装），`networkx` 无人提供。
+
+**影响**：`jinja2` 是 `torch._inductor` 的代码生成模板引擎，`networkx` 供 `torch.fx`
+passes / `torch.export`。**两者只在 `torch.compile` / `torch.fx` 时 import**，eager
+算子测试与 SFT 都走不到，所以 smoke 全绿也发现不了。
+
+**待办**：去掉 torch wheel 安装的 `--no-deps`，让 pip 按元数据自行解析（这 6 个依赖
+都不含 numpy，不影响编译期 numpy 版本），并加一行
+`python -c "import jinja2, networkx"` 做构建期断言。
+代价：该行位于第 4 层，改动会让其后全部缓存失效，即一次完整重建（约 160 min）。
+
+**修复**： 编译pytorch时 取消掉--no-deps, 能否自己建立jinja2/ network
