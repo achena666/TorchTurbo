@@ -111,16 +111,23 @@ jobs:
         run: |
           set -uo pipefail
           echo "marker= ${{ inputs.marker }}"
+          echo "--- /root/.cache 现状（判持久化的主要依据）---"
+          df -h /root/.cache 2>/dev/null || true
+          du -sh /root/.cache 2>/dev/null || true
+          ls -la /root/.cache 2>/dev/null | head -20 || true
+          echo "--- huggingface 缓存是否已有内容 ---"
+          for d in /root/.cache/huggingface /root/.cache/huggingface/hub /root/.cache/huggingface/datasets; do
+            printf '%-40s ' "$d"
+            if [ -d "$d" ]; then du -sh "$d" 2>/dev/null || echo present; else echo ABSENT; fi
+          done
 
           for d in /models /datasets /workspace /root/.cache /tmp; do
             [ -d "$d" ] || { echo "$d: ABSENT"; continue; }
             f="$d/.torchturbo-probe"
             if printf 'run=%s marker=%s ts=%s host=%s\n' \
-                 "$GITHUB_RUN_ID" "${{ inputs.marker }}" "$(date -Is)" "$(hostname)" \
+                 "$GITHUB_RUN_ID" "${{ inputs.marker }}" "$(date -Is)" "${HOSTNAME:-$(uname -n)}" \
                  > "$f" 2>/dev/null; then
               echo "$d: WRITABLE"
-              echo "    previous runs seen under this dir:"
-              ls -1a "$d" 2>/dev/null | grep -i probe | sed 's/^/      /' || true
               echo "    content: $(cat "$f")"
             else
               echo "$d: READ-ONLY (or no permission)"
@@ -140,9 +147,24 @@ jobs:
       - name: ④ 下载源可达性（模型/数据集从哪来）
         run: |
           set -uo pipefail
+          echo
           echo "=== 相关环境变量 ==="
-          env | grep -iE '^(HF_|HUGGINGFACE|TRANSFORMERS|PIP_|.*_PROXY=|NO_PROXY=)' || echo "(none)"
+          env | grep -iE '^(HF_|HUGGINGFACE|TRANSFORMERS|PIP_|HOME=|XDG_|.*_PROXY=|NO_PROXY=)' || echo "(none)"
           python -m pip config list 2>/dev/null || true
+          echo
+          echo "=== Python 视角的 HF 缓存位置（未设 HF_HOME 时的默认值）==="
+          python - <<'PY' 2>/dev/null || echo "(python probe failed)"
+          import os
+          print("HOME              =", os.path.expanduser("~"))
+          print("HF_HOME           =", os.environ.get("HF_HOME", "<unset>"))
+          print("HF_HUB_CACHE      =", os.environ.get("HF_HUB_CACHE", "<unset>"))
+          print("default ~/.cache  =", os.path.expanduser("~/.cache"))
+          try:
+              from huggingface_hub.constants import HF_HUB_CACHE as c
+              print("hub constant      =", c)
+          except Exception as exc:
+              print("hub constant      = unavailable:", type(exc).__name__)
+          PY
 
           echo
           echo "=== HTTP 探测（10s 超时）==="
