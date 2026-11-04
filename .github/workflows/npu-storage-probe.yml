@@ -1,0 +1,215 @@
+name: NPU Storage Probe
+
+# 目的：验证 NPU runner pod 里模型权重与数据集到底能不能缓存。
+# docs/docs/ci-infrastructure-deployment-zh.md 说 NFS 提供 /models（预置模型权重），
+# 但同一份文档里 /pip-cache + PIP_INDEX_URL 在实测中并不存在（pod 实际用 /tmp/pip-cache
+# 和 Squid 代理），所以文档结论不能直接采信，必须实测。
+#
+# 一次跑完回答四个问题：
+#   ① /models 是否存在、是不是 NFS、多大、可否写
+#   ② pod 里哪些目录是持久挂载（/root/.cache、/workspace、/pip-cache、/tmp）
+#   ③ 二次运行是否还能看到上次写的标记（真正的"持久"判据）
+#   ④ hf-mirror / huggingface.co 是否可直连（决定模型能否在 pod 内下载）
+#
+# 不装任何包、不跑训练，全部步骤 continue-on-error，结果见 Job Summary。
+# 只在 workflow_dispatch 手动触发。
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: 'Runner 标签（必须与 Settings → Actions → Runners 里的原文一致）'
+        required: true
+        default: 'linux-aarch64-a3-800i-2'
+        type: choice
+        options:
+          - linux-aarch64-a3-800i-0
+          - linux-aarch64-a3-800i-2
+          - linux-aarch64-a3-800i-4
+          - linux-aarch64-a3-800i-8
+      image:
+        description: 'container.image；默认与 npu-smoke-lf.yml 相同，保证 pod 模板一致'
+        required: true
+        default: 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest'
+      # 同一个 runner 连跑两次，第二次看到 marker 才算真正持久。用 run id 区分。
+      marker:
+        description: '持久化标记内容；两次运行填不同值即可看出是否残留'
+        required: false
+        default: 'probe-1'
+        type: string
+
+concurrency:
+  group: npu-storage-probe-${{ inputs.runner_label }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: storage (${{ inputs.runner_label }})
+    runs-on: ${{ inputs.runner_label }}
+
+    # container.image 是必须的：ARC 只有见到容器的 pod 才会走 NPU 的 pod 模板，
+    # 而 /models 之类的挂载就定义在那份模板里。
+    container:
+      image: ${{ inputs.image }}
+      credentials:
+        username: ${{ secrets.SWR_USERNAME }}
+        password: ${{ secrets.SWR_PASSWORD }}
+      options: --user root
+
+    timeout-minutes: 60
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: ① Pod 基本信息与磁盘
+        run: |
+          set -uo pipefail
+          echo "label : ${{ inputs.runner_label }}"
+          echo "image : ${{ inputs.image }}"
+          echo "RUNNER_NAME=${RUNNER_NAME:-<unset>}"
+          uname -a
+          head -3 /etc/os-release || true
+          echo "--- cpu / mem ---"
+          nproc
+          free -h
+          echo "--- df ---"
+          df -h / /tmp 2>/dev/null || true
+
+      - name: ② 挂载点全览（NFS 在此暴露）
+        run: |
+          set -uo pipefail
+          echo "=== findmnt 关键路径 ==="
+          for p in /models /datasets /workspace /pip-cache /root/.cache /home/runner/.cache /tmp/pip-cache /tmp; do
+            printf '%-24s ' "$p"
+            if [ -e "$p" ]; then
+              findmnt -nT "$p" -o SOURCE,FSTYPE,OPTIONS 2>/dev/null | head -1 || echo "(not a mount)"
+            else
+              echo "ABSENT"
+            fi
+          done
+
+          echo
+          echo "=== 全部网络/共享文件系统挂载 ==="
+          findmnt -t nfs,nfs4,cifs,glusterfs,ceph,fuse.sshfs,fuse.s3fs 2>/dev/null || true
+          echo "--- 若上面为空，退回 /proc/mounts 过滤 ---"
+          awk '$3 ~ /^(nfs|nfs4|cifs|glusterfs|fuse\.)/ {print $2, $3, $4}' /proc/mounts || true
+
+          echo
+          echo "=== 候选目录内容 ==="
+          for p in /models /datasets /workspace /pip-cache; do
+            echo "--- $p ---"
+            ls -la "$p" 2>/dev/null | head -15 || echo "(unreadable/absent)"
+            du -sh "$p" 2>/dev/null || true
+          done
+
+      - name: ③ 可写性与持久化标记
+        run: |
+          set -uo pipefail
+          echo "marker= ${{ inputs.marker }}"
+
+          for d in /models /datasets /workspace /root/.cache /tmp; do
+            [ -d "$d" ] || { echo "$d: ABSENT"; continue; }
+            f="$d/.torchturbo-probe"
+            if printf 'run=%s marker=%s ts=%s host=%s\n' \
+                 "$GITHUB_RUN_ID" "${{ inputs.marker }}" "$(date -Is)" "$(hostname)" \
+                 > "$f" 2>/dev/null; then
+              echo "$d: WRITABLE"
+              echo "    previous runs seen under this dir:"
+              ls -1a "$d" 2>/dev/null | grep -i probe | sed 's/^/      /' || true
+              echo "    content: $(cat "$f")"
+            else
+              echo "$d: READ-ONLY (or no permission)"
+            fi
+          done
+
+          echo
+          echo "=== 历史标记残留（判持久化的关键证据）==="
+          for d in /models /datasets /workspace /root/.cache /tmp; do
+            [ -d "$d" ] || continue
+            for f in "$d"/.torchturbo-probe*; do
+              [ -f "$f" ] || continue
+              echo "$f -> $(cat "$f" 2>/dev/null)"
+            done
+          done
+
+      - name: ④ 下载源可达性（模型/数据集从哪来）
+        run: |
+          set -uo pipefail
+          echo "=== 相关环境变量 ==="
+          env | grep -iE '^(HF_|HUGGINGFACE|TRANSFORMERS|PIP_|.*_PROXY=|NO_PROXY=)' || echo "(none)"
+          python -m pip config list 2>/dev/null || true
+
+          echo
+          echo "=== HTTP 探测（10s 超时）==="
+          for u in \
+            https://hf-mirror.com \
+            https://huggingface.co \
+            https://repo.huaweicloud.com/repository/pypi/simple/ \
+            https://github.com ; do
+            printf '%-56s ' "$u"
+            curl -s -o /dev/null -w '%{http_code}  %{time_total}s\n' -m 10 "$u" \
+              || echo "FAIL/TIMEOUT"
+          done
+
+          echo
+          echo "=== hf-mirror 上 Qwen3.5-2B 的 config.json 是否可取 ==="
+          curl -s -m 20 -o /dev/null -w 'config.json -> %{http_code}\n' \
+            https://hf-mirror.com/Qwen/Qwen3.5-2B/raw/main/config.json || echo failed
+
+      - name: ⑤ Summary
+        if: always()
+        run: |
+          set -uo pipefail
+
+          models_mnt=$(findmnt -nT /models -o SOURCE,FSTYPE 2>/dev/null | head -1) || models_mnt=''
+          [ -d /models ] || models_mnt=''
+          if [ -z "$models_mnt" ]; then
+            [ -d /models ] && models_state='存在但非独立挂载' || models_state='**不存在**'
+          else
+            models_state="\`${models_mnt}\`"
+          fi
+
+          models_sz=$(du -sh /models 2>/dev/null | awk '{print $1}') || models_sz='-'
+          models_rw=readonly
+          if touch /models/.wtest 2>/dev/null; then models_rw=writable; rm -f /models/.wtest; fi
+          [ -d /models ] || models_rw='n/a'
+
+          cache_mnt=$(findmnt -nT /root/.cache -o SOURCE,FSTYPE 2>/dev/null | head -1) || cache_mnt=''
+          [ -d /root/.cache ] || cache_mnt=''
+          cache_state=${cache_mnt:-非独立挂载（Pod 销毁即丢）}
+
+          http() { curl -s -o /dev/null -w '%{http_code}' -m 10 "$1" 2>/dev/null || echo ERR; }
+          hf_m=$(http https://hf-mirror.com)
+          hf_o=$(http https://huggingface.co)
+
+          {
+            echo "## NPU Storage Probe"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| runner | \`${{ inputs.runner_label }}\` |"
+            echo "| image | \`${{ inputs.image }}\` |"
+            echo "| marker | \`${{ inputs.marker }}\` |"
+            echo "| run id | \`${GITHUB_RUN_ID}\` |"
+            echo ""
+            echo "| 路径 | 挂载 | 大小 | 可写 |"
+            echo "|---|---|---|---|"
+            echo "| \`/models\` | ${models_state} | ${models_sz} | ${models_rw} |"
+            echo "| \`/root/.cache\` | ${cache_state} | - | - |"
+            echo ""
+            echo "### 下载源"
+            echo ""
+            echo "| 站点 | HTTP |"
+            echo "|---|---|"
+            echo "| hf-mirror.com | ${hf_m} |"
+            echo "| huggingface.co | ${hf_o} |"
+            echo ""
+            echo "> 持久化判据：**同一 runner 连跑两次、第二次仍能看到上次的 marker**。"
+            echo "> 只跑一次时，第二次请把 \`marker\` 改成别的值再触发。"
+            echo "> 详细列表见上方 ②/③ 步日志。"
+          } >> "$GITHUB_STEP_SUMMARY"
