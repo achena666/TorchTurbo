@@ -39,6 +39,35 @@ on:
           - deepseek_v4
           - kimi_k25
           - llada2
+      # ---- 以下为可选的训练 stage；不开启时行为与原来完全一致 ----
+      train:
+        description: '环境装完后是否真跑一次 Qwen3.5-2B 训练'
+        required: true
+        default: false
+        type: boolean
+      train_model_path:
+        description: '模型路径；默认用 NFS 上的缓存，命中则 0 下载'
+        required: true
+        default: '/root/.cache/models/Qwen/Qwen3.5-2B'
+        type: string
+      train_max_steps:
+        description: '训练步数（sanity check 保持极小）'
+        required: true
+        default: '3'
+        type: string
+      train_seq_len:
+        description: 'cutoff_len'
+        required: true
+        default: '2048'
+        type: string
+      train_finetuning_type:
+        description: '微调方式'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - lora
 
 # Separate group from npu-smoke.yml, but still serialized per pool: NPUs cannot be shared.
 concurrency:
@@ -51,6 +80,9 @@ permissions:
 env:
   PYTHONUNBUFFERED: '1'
   PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  # hf-mirror 在 pod 内可达（200），huggingface.co 是 503，必须走镜像。
+  HF_ENDPOINT: 'https://hf-mirror.com'
+  HF_HOME: '/root/.cache/huggingface'
 
 jobs:
   lf-env:
@@ -148,8 +180,126 @@ jobs:
 
           exit "$RC"
 
+      # 只有显式勾选 train 时才会执行；不勾选时整个 step 直接 skipped，
+      # 于是默认行为仍是原来的「只测安装耗时」。
+      - name: ④ Train Qwen3.5-2B (smoke)
+        id: train
+        if: ${{ inputs.train }}
+        env:
+          MODEL: ${{ inputs.train_model_path }}
+          MAX_STEPS: ${{ inputs.train_max_steps }}
+          SEQ_LEN: ${{ inputs.train_seq_len }}
+          FINETUNING_TYPE: ${{ inputs.train_finetuning_type }}
+          RUNNER_LABEL: ${{ inputs.runner_label }}
+        run: |
+          set -uo pipefail
+          set +e
+          D="$MODEL"
 
-      - name: ④ Summary
+          # 卡数直接取 runner 标签的尾缀（-2 / -4 / -8），避免与 yaml 里的 sp_size 不匹配。
+          NPUS_PER_NODE="${RUNNER_LABEL##*-}"
+          case "$NPUS_PER_NODE" in
+            ''|*[!0-9]*) NPUS_PER_NODE=2 ;;
+          esac
+          export NPUS_PER_NODE
+          echo "cards=${NPUS_PER_NODE} (from ${RUNNER_LABEL})"
+
+          # --- 卷身份：前几次 run 落到过两份不同的 SFS，命中与否取决于它 ---
+          uuid=$(findmnt -nT /root/.cache -o SOURCE 2>/dev/null | sed -n '1p' | cut -d. -f1)
+          echo "sfs_uuid=${uuid:-?}"
+
+          # --- 模型就绪判定 ---
+          # 只看目录 inode 大小没有意义（实测 22~499 字节），必须看 config + 权重总量。
+          # Qwen3.5-2B 的 bf16 权重约 4.5 GB，取 3 GB 作为下限。
+          bytes=0
+          if [ -f "$D/config.json" ]; then
+            bytes=$(timeout 180 du -sb "$D" 2>/dev/null | awk '{print $1}')
+            bytes=${bytes:-0}
+          fi
+          echo "existing bytes=${bytes}"
+          if [ "$bytes" -gt 3000000000 ] 2>/dev/null; then
+            cache_hit=yes
+          else
+            cache_hit=no
+          fi
+
+          if [ "$cache_hit" = no ]; then
+            echo "::notice::model MISS on sfs=${uuid:-?}; downloading Qwen/Qwen3.5-2B via ${HF_ENDPOINT}"
+            mkdir -p "$D"
+            MODEL_DIR="$D" python - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+
+          # local_dir 直写目标目录，这样模型只存在一份，不额外占 HF_HUB_CACHE 的空间。
+          print(snapshot_download(
+              repo_id="Qwen/Qwen3.5-2B",
+              local_dir=os.environ["MODEL_DIR"],
+              max_workers=8,
+          ))
+          PY
+            if [ $? -ne 0 ]; then
+              echo "::error::snapshot_download failed"
+              exit 1
+            fi
+          else
+            echo "::notice::model HIT on sfs=${uuid:-?} ($(du -sh "$D" 2>/dev/null | awk '{print $1}'))"
+          fi
+
+          bytes=$(timeout 180 du -sb "$D" 2>/dev/null | awk '{print $1}')
+          bytes=${bytes:-0}
+          shard=$(timeout 60 find "$D" -maxdepth 1 -name '*.safetensors' 2>/dev/null | wc -l)
+          echo "model: bytes=${bytes} shards=${shard}"
+          if [ "$bytes" -lt 3000000000 ] 2>/dev/null || [ "$shard" -eq 0 ]; then
+            echo "::error::model incomplete at $D (bytes=${bytes}, shards=${shard})"
+            exit 1
+          fi
+
+          # --- tt_config ---
+          # 复用 qwen3_5_moe/lf_text_sft.sh，但它默认的 yaml 是 ep_size=8（MoE）。
+          # 2B 是 dense，两张卡走序列并行，所以这里按需生成一份并行配置，
+          # 不往仓库里加新文件。
+          TT=/tmp/tt_qwen3_5_2b.yaml
+          if [ -n "${TT_CONFIG:-}" ] && [ -f "${TT_CONFIG}" ]; then
+            TT="$TT_CONFIG"
+            echo "using provided TT_CONFIG=$TT"
+          else
+            cat > "$TT" <<'YAML'
+          engine_config:
+            parallel_plan:
+              sp_size: 2
+              ep_size: 1
+            backend_config:
+              cpu_offload:
+                enabled: false
+          YAML
+            echo "generated TT_CONFIG=$TT (sp_size=2, ep_size=1)"
+            sed -n '1,20p' "$TT"
+          fi
+
+          echo "model=$MODEL steps=$MAX_STEPS seq=$SEQ_LEN ft=$FINETUNING_TYPE"
+          START=$(date +%s)
+          MODEL="$MODEL" TT_CONFIG="$TT" NPUS_PER_NODE="$NPUS_PER_NODE" \
+            SEQ_LEN="$SEQ_LEN" FINETUNING_TYPE="$FINETUNING_TYPE" \
+            MAX_STEPS="$MAX_STEPS" \
+            bash scripts/runs/qwen3_5_moe/lf_text_sft.sh 2>&1 | tee /tmp/train.log
+          RC=${PIPESTATUS[0]}
+          ELAPSED=$(( $(date +%s) - START ))
+
+          echo "--- loss 行 ---"
+          grep -oE "'loss': [0-9.]+" /tmp/train.log | sed -n '1,20p' || echo "(no loss lines)"
+          LAST=$(grep -oE "'loss': [0-9.]+" /tmp/train.log | tail -1 || true)
+          echo "::notice::train rc=${RC} in ${ELAPSED}s; hit=${cache_hit}; ${LAST:-no loss logged}"
+
+          echo "rc=${RC}" >> "$GITHUB_OUTPUT"
+          echo "elapsed=${ELAPSED}" >> "$GITHUB_OUTPUT"
+          echo "cache_hit=${cache_hit}" >> "$GITHUB_OUTPUT"
+          echo "sfs_uuid=${uuid:-?}" >> "$GITHUB_OUTPUT"
+          echo "shards=${shard}" >> "$GITHUB_OUTPUT"
+          echo "model_size=$(du -sh "$D" 2>/dev/null | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          exit "$RC"
+
+
+      - name: ⑤ Summary
         if: always()
         env:
           MODEL: ${{ inputs.model }}
@@ -157,9 +307,16 @@ jobs:
           TORCHTURBO_RC: ${{ steps.torchturbo.outputs.rc }}
           LF_DEPS_S: ${{ steps.lf_deps.outputs.elapsed }}
           LF_DEPS_RC: ${{ steps.lf_deps.outputs.rc }}
+          TRAIN_S: ${{ steps.train.outputs.elapsed }}
+          TRAIN_RC: ${{ steps.train.outputs.rc }}
+          TRAIN_HIT: ${{ steps.train.outputs.cache_hit }}
+          TRAIN_SFS: ${{ steps.train.outputs.sfs_uuid }}
+          TRAIN_SHARDS: ${{ steps.train.outputs.shards }}
+          TRAIN_SIZE: ${{ steps.train.outputs.model_size }}
+          TRAIN_ENABLED: ${{ inputs.train }}
         run: |
           set -uo pipefail
-          TOTAL=$(( ${TORCHTURBO_S:-0} + ${LF_DEPS_S:-0} ))
+          TOTAL=$(( ${TORCHTURBO_S:-0} + ${LF_DEPS_S:-0} + ${TRAIN_S:-0} ))
           fmt() { awk -v s="${1:-0}" 'BEGIN{printf "%d min %02d s", s/60, s%60}'; }
 
           {
@@ -170,6 +327,12 @@ jobs:
             echo "| runner | \`${{ inputs.runner_label }}\` |"
             echo "| image | \`${{ inputs.image }}\` |"
             echo "| model | \`${MODEL}\` |"
+            echo "| train stage | ${TRAIN_ENABLED} |"
+            if [ "${TRAIN_ENABLED}" = "true" ]; then
+              echo "| model cache | **${TRAIN_HIT:-?}** |"
+              echo "| SFS uuid | \`${TRAIN_SFS:-?}\` |"
+              echo "| shards / size | ${TRAIN_SHARDS:-?} / ${TRAIN_SIZE:-?} |"
+            fi
             echo ""
             echo "### Timing (excludes image pull)"
             echo ""
@@ -177,6 +340,9 @@ jobs:
             echo "|---|---|---|---|"
             echo "| ② torchturbo \`-e .[dev]\` | \`${TORCHTURBO_S:-n/a}\` | $(fmt "${TORCHTURBO_S}") | \`${TORCHTURBO_RC:-n/a}\` |"
             echo "| ③ \`${MODEL}/install_lf_deps.sh\` | \`${LF_DEPS_S:-n/a}\` | $(fmt "${LF_DEPS_S}") | \`${LF_DEPS_RC:-n/a}\` |"
+            if [ "${TRAIN_ENABLED}" = "true" ]; then
+              echo "| ④ Qwen3.5-2B train | \`${TRAIN_S:-n/a}\` | $(fmt "${TRAIN_S}") | \`${TRAIN_RC:-n/a}\` |"
+            fi
             echo "| **total** | \`${TOTAL}\` | **$(fmt "${TOTAL}")** | |"
             echo ""
             echo "### Versions after install"
@@ -184,7 +350,23 @@ jobs:
             echo '```'
             cat /tmp/after.txt 2>/dev/null || echo "(probe failed)"
             echo '```'
+            if [ "${TRAIN_ENABLED}" = "true" ]; then
+              echo ""
+              echo "### 训练尾部"
+              echo ""
+              echo '```'
+              tail -40 /tmp/train.log 2>/dev/null || echo "(no train log)"
+              echo '```'
+            fi
             echo ""
             echo "> Measurement only: no training, no base-image verification, no NPU checks."
             echo "> \`scripts/runs/<model>/install_lf_deps.sh\` is executed unmodified."
           } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${TRAIN_ENABLED}" = "true" ]; then
+            # 注解是唯一匿名可读的输出通道，关键数字也放这里。
+            echo "::notice title=Qwen3.5-2B smoke::sfs=${TRAIN_SFS:-?} cache_hit=${TRAIN_HIT:-?} shards=${TRAIN_SHARDS:-?} size=${TRAIN_SIZE:-?} train_s=${TRAIN_S:-n/a} train_rc=${TRAIN_RC:-n/a}"
+            if [ "${TRAIN_RC:-1}" != "0" ]; then
+              echo "::error title=Qwen3.5-2B train failed::rc=${TRAIN_RC:-n/a}; see the train tail in the job summary"
+            fi
+          fi
