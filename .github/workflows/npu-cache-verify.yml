@@ -1,0 +1,192 @@
+name: NPU Cache Verify Qwen3.5
+
+# 目的：确认 /root/.cache 里的 Qwen3.5-2B 与 gsm8k 是「真的完整可用」，还是空壳目录。
+#
+# 背景：npu-cache-search 已证明这两个名字存在，但 printf 的 %s 只给了目录 inode 大小
+# （22 / 499 字节），无法判断 blob 是否下全。本 workflow 只读、不下载、不训练。
+#
+# 安全约束（沿用前几次教训）：
+#   1. 不对 /root/.cache 整卷递归（ccache/bazel/conda 是海量小文件）
+#   2. du 只作用于单个模型目录（文件数极少，几 GB 量级，安全）
+#   3. 一律 sed 截断，不用 head（避免 SIGPIPE → exit 141）
+#   4. 诊断型 step 用 set +e，step 级设 timeout-minutes
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: 'Runner 标签'
+        required: true
+        default: 'linux-aarch64-a3-800i-2'
+        type: choice
+        options:
+          - linux-aarch64-a3-800i-0
+          - linux-aarch64-a3-800i-2
+          - linux-aarch64-a3-800i-4
+          - linux-aarch64-a3-800i-8
+      image:
+        description: 'container.image'
+        required: true
+        default: 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest'
+      model_dir:
+        description: '模型目录（plain 目录形态）'
+        required: true
+        default: '/root/.cache/models/Qwen/Qwen3.5-2B'
+        type: string
+
+concurrency:
+  group: npu-cache-verify-${{ inputs.runner_label }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify-qwen3.5 (${{ inputs.runner_label }})
+    runs-on: ${{ inputs.runner_label }}
+    container:
+      image: ${{ inputs.image }}
+      credentials:
+        username: ${{ secrets.SWR_USERNAME }}
+        password: ${{ secrets.SWR_PASSWORD }}
+      options: --user root
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: ① 卷身份（本次落到哪份 SFS）
+        timeout-minutes: 3
+        run: |
+          set +e
+          echo "runner: ${{ inputs.runner_label }}"
+          findmnt -nT /root/.cache -o SOURCE,FSTYPE 2>/dev/null | sed -n '1p'
+          findmnt -nT /root/.cache -o OPTIONS 2>/dev/null | sed -n '1p' | grep -o 'addr=[0-9.]*'
+          df -h /root/.cache 2>/dev/null
+
+      - name: ② plain 目录形态核查
+        timeout-minutes: 8
+        run: |
+          set +e
+          D='${{ inputs.model_dir }}'
+          echo "=== ${D} ==="
+          if [ ! -d "$D" ]; then
+            echo "ABSENT — 本次 pod 的卷上没有这个目录"
+            echo "volume_missing=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "--- 顶层清单（含大小）---"
+          timeout 60 ls -la "$D" 2>/dev/null | sed -n '1,60p'
+
+          echo
+          echo "--- 关键文件是否齐备 ---"
+          missing=0
+          for f in config.json tokenizer_config.json generation_config.json \
+                   model.safetensors.index.json model.safetensors ; do
+            if [ -f "$D/$f" ]; then
+              sz=$(timeout 20 stat -c %s "$D/$f" 2>/dev/null)
+              echo "  OK   $f  (${sz} bytes)"
+            else
+              echo "  MISS $f"
+              [ "$f" = "model.safetensors" ] || [ "$f" = "model.safetensors.index.json" ] || missing=$((missing+1))
+            fi
+          done
+
+          echo
+          echo "--- 全部 .safetensors 分片 ---"
+          timeout 60 find "$D" -maxdepth 1 -name '*.safetensors' -printf '%10s  %f\n' 2>/dev/null \
+            | sed -n '1,60p'
+          n_shard=$(timeout 60 find "$D" -maxdepth 1 -name '*.safetensors' 2>/dev/null | wc -l)
+          echo "分片数: ${n_shard}"
+
+          echo
+          echo "--- 目录总占用（只对这一层，文件数极少，安全）---"
+          timeout 120 du -sh "$D" 2>/dev/null
+
+          # 2B bf16 ≈ 4.5 GB；低于 1 GB 基本可判为残缺
+          bytes=$(timeout 120 du -sb "$D" 2>/dev/null | awk '{print $1}')
+          echo "目录字节数: ${bytes:-unknown}"
+          if [ -n "${bytes:-}" ] && [ "$bytes" -gt 1000000000 ] 2>/dev/null; then
+            echo "verdict=COMPLETE_LIKELY" >> "$GITHUB_ENV"
+          else
+            echo "verdict=INCOMPLETE_OR_EMPTY" >> "$GITHUB_ENV"
+          fi
+
+          echo
+          echo "--- config.json 内容（判 architectures / 层数）---"
+          timeout 20 sed -n '1,60p' "$D/config.json" 2>/dev/null || echo "(unreadable)"
+
+      - name: ③ HF hub 形态核查（若存在）
+        timeout-minutes: 8
+        run: |
+          set +e
+          H='/root/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B'
+          echo "=== ${H} ==="
+          if [ ! -d "$H" ]; then
+            echo "ABSENT"
+            exit 0
+          fi
+          for sub in refs snapshots blobs ; do
+            printf '%-12s ' "$sub"
+            if [ -d "$H/$sub" ]; then
+              n=$(timeout 60 ls -1 "$H/$sub" 2>/dev/null | sed -n '1,500p' | wc -l)
+              echo "present (${n} 项)"
+            else
+              echo "ABSENT"
+            fi
+          done
+
+          echo
+          echo "--- snapshots 下的真实文件名（软链指向 blobs）---"
+          timeout 60 ls -laR "$H/snapshots" 2>/dev/null | sed -n '1,120p'
+
+          echo
+          echo "--- blobs 体积（Hub 形态下权重都在这里）---"
+          timeout 180 du -sh "$H" 2>/dev/null
+
+      - name: ④ gsm8k 完整性
+        timeout-minutes: 5
+        run: |
+          set +e
+          echo "=== /root/.cache/datasets/openai/gsm8k ==="
+          timeout 60 ls -laR /root/.cache/datasets/openai/gsm8k 2>/dev/null | sed -n '1,80p'
+          echo
+          echo "=== 各 parquet 大小 ==="
+          timeout 60 find /root/.cache/datasets -maxdepth 4 -name '*.parquet' \
+              -printf '%10s  %p\n' 2>/dev/null | sed -n '1,40p'
+
+      - name: ⑤ Summary
+        if: always()
+        timeout-minutes: 3
+        run: |
+          set +e
+          D='${{ inputs.model_dir }}'
+          uuid=$(findmnt -nT /root/.cache -o SOURCE 2>/dev/null | sed -n '1p' | cut -d. -f1)
+          cap=$(df -h /root/.cache 2>/dev/null | awk 'NR==2{print $2" 总 / "$3" 已用 / "$4" 可用"}')
+          sz=$(timeout 120 du -sh "$D" 2>/dev/null | awk '{print $1}')
+          shard=$(timeout 60 find "$D" -maxdepth 1 -name '*.safetensors' 2>/dev/null | wc -l)
+          cfg=$( [ -f "$D/config.json" ] && echo yes || echo no )
+          gsm=$( [ -d /root/.cache/datasets/openai/gsm8k ] && echo yes || echo no )
+
+          {
+            echo "## Qwen3.5-2B 缓存校验"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| runner | \`${{ inputs.runner_label }}\` |"
+            echo "| SFS UUID | \`${uuid:-?}\` |"
+            echo "| 容量 | ${cap:-?} |"
+            echo "| 模型目录 | \`${D}\` |"
+            echo "| 目录存在 | $([ -d "$D" ] && echo '✅' || echo '❌') |"
+            echo "| config.json | ${cfg} |"
+            echo "| safetensors 分片 | ${shard} |"
+            echo "| 目录占用 | ${sz:-?} |"
+            echo "| gsm8k 缓存 | ${gsm} |"
+            echo "| 结论 | **${verdict:-未判定}** |"
+            echo ""
+            echo "> 2B 模型 bf16 完整应约 **4.5 GB**；远小于此值即视为残缺。"
+            echo "> SFS UUID 变化说明本次 pod 挂到了另一份卷，缓存命中是概率性的。"
+          } >> "$GITHUB_STEP_SUMMARY"
