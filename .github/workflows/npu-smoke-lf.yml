@@ -27,18 +27,31 @@ on:
         description: 'L1 base image; pin with repo@sha256:... for strict reproducibility'
         required: true
         default: 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest'
-      model:
-        description: 'scripts/runs 下的依赖安装目录。注意：只决定 install_lf_deps.sh 的来源，不影响 step ④ 的训练脚本'
+      model_type:
+        description: '模型：取 src/torchturbo/models 里 @register_model 的名字，映射表见 scripts/runs/model_map.tsv'
         required: true
-        default: 'qwen3_5_dense'
+        default: 'qwen3_5'
         type: choice
         options:
-          - qwen3_5_dense
+          - qwen3_5
           - qwen3_5_moe
-          - bailing_v3
+          - qwen3_5_moe_text
+          - bailing_hybrid
+          - bailing_moe_v3_vl
           - deepseek_v4
           - kimi_k25
-          - llada2
+          - llada2_moe
+          - qwen4_exp
+          - qwen3_moe
+          - glm_moe_dsa
+      framework:
+        description: '训练框架；决定用 lf_* 还是 swift_* 启动脚本'
+        required: true
+        default: 'lf'
+        type: choice
+        options:
+          - lf
+          - swift
       # ---- 以下为可选的训练 stage；不开启时行为与原来完全一致 ----
       train:
         description: '环境装完后是否真跑一次 Qwen3.5-2B 训练'
@@ -81,7 +94,7 @@ env:
 
 jobs:
   lf-env:
-    name: lf-env (${{ inputs.model }} on ${{ inputs.runner_label }})
+    name: lf-env (${{ inputs.model_type }}/${{ inputs.framework }} on ${{ inputs.runner_label }})
     runs-on: ${{ inputs.runner_label }}
 
     # Image pull (~30 min) + torchturbo (~1 min) + lf deps (~20 min) + a full-epoch 2B
@@ -104,7 +117,105 @@ jobs:
       - name: ① Checkout
         uses: actions/checkout@v4
 
-      - name: ② Install torchturbo (same command as npu-smoke.yml)
+      - name: ② model_type → 启动脚本映射
+        id: resolve
+        env:
+          MODEL_TYPE: ${{ inputs.model_type }}
+          FRAMEWORK: ${{ inputs.framework }}
+        run: |
+          set -uo pipefail
+          MAP=scripts/runs/model_map.tsv
+          MODEL_TYPE="${MODEL_TYPE:-}"
+          FRAMEWORK="${FRAMEWORK:-lf}"
+          test -f "$MAP" || { echo "::error::missing $MAP"; exit 1; }
+
+          echo "=== 映射表 $MAP ==="
+          grep -v '^\s*#' "$MAP" | sed '/^\s*$/d'
+
+          # 1) 注册表漂移检查：model_map.tsv 必须覆盖代码里 @register_model 的全部名字。
+          #    用 python3 的 re，不依赖任何三方包（这张表要在装依赖之前就能读）。
+          python3 - "$MAP" <<'PY'
+          import glob, re, sys
+
+          registered = set()
+          for path in glob.glob("src/torchturbo/models/*/model.py"):
+              src = open(path, encoding="utf-8").read()
+              registered.update(re.findall(r'@register_model\(\s*["\']([^"\']+)["\']', src))
+
+          mapped = set()
+          for line in open(sys.argv[1], encoding="utf-8"):
+              line = line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              mapped.add(line.split()[0])
+
+          missing = sorted(registered - mapped)
+          unknown = sorted(mapped - registered)
+          print(f"registered={len(registered)} mapped={len(mapped)}")
+          if missing:
+              print("::error::注册了但映射表未收录:", ", ".join(missing))
+          if unknown:
+              print("::warning::映射表里有未注册的名字:", ", ".join(unknown))
+          sys.exit(1 if missing else 0)
+          PY
+          DRIFT=$?
+
+          # 2) 解析当前 model_type
+          ROW=$(awk -v m="$MODEL_TYPE" '$1==m && $0 !~ /^\s*#/ {print; exit}' "$MAP")
+          if [ -z "$ROW" ]; then
+            echo "::error::model_type '$MODEL_TYPE' 不在 $MAP 里；可选项："
+            awk '$0 !~ /^\s*#/ && NF {printf "  %s\n", $1}' "$MAP"
+            exit 1
+          fi
+          set -- $ROW
+          RUN_DIR=$2
+          case "$FRAMEWORK" in
+            lf)    LAUNCHERS=$3 ;;
+            swift) LAUNCHERS=$4 ;;
+            *)     echo "::error::unknown framework $FRAMEWORK"; exit 1 ;;
+          esac
+
+          echo
+          echo "model_type=$MODEL_TYPE  framework=$FRAMEWORK  run_dir=$RUN_DIR  launchers=$LAUNCHERS"
+
+          # 3) 依赖安装脚本：优先按框架选，退回到通用的 install_lf_deps.sh
+          INSTALL=""
+          if [ "$RUN_DIR" != "-" ]; then
+            for c in "scripts/runs/$RUN_DIR/install_${FRAMEWORK}_deps.sh" \
+                     "scripts/runs/$RUN_DIR/install_lf_deps.sh"; do
+              [ -f "$c" ] && { INSTALL="$c"; break; }
+            done
+          fi
+
+          # 4) 训练脚本：取该框架列表里的第一个
+          TRAIN=""
+          if [ "$LAUNCHERS" != "-" ] && [ -n "$LAUNCHERS" ] && [ "$RUN_DIR" != "-" ]; then
+            for l in $(echo "$LAUNCHERS" | tr ',' ' '); do
+              [ -f "scripts/runs/$RUN_DIR/$l" ] && { TRAIN="scripts/runs/$RUN_DIR/$l"; break; }
+            done
+          fi
+
+          echo "install_script=${INSTALL:-<none>}"
+          echo "train_script=${TRAIN:-<none>}"
+          if [ "$RUN_DIR" = "-" ]; then
+            echo "::error::$MODEL_TYPE 在映射表里标记为暂不支持（run_dir=-），没有可用的依赖安装脚本"
+            exit 1
+          fi
+          if [ -z "$INSTALL" ]; then
+            echo "::error::$MODEL_TYPE 在 $FRAMEWORK 下没有依赖安装脚本（scripts/runs/$RUN_DIR/install_*_deps.sh 都不存在）"
+            exit 1
+          fi
+          if [ "$TRAIN" = "" ]; then
+            echo "::warning::$MODEL_TYPE 在 $FRAMEWORK 下没有启动脚本，训练 stage 会被跳过"
+          fi
+
+          echo "run_dir=$RUN_DIR" >> "$GITHUB_OUTPUT"
+          echo "install_script=$INSTALL" >> "$GITHUB_OUTPUT"
+          echo "train_script=$TRAIN" >> "$GITHUB_OUTPUT"
+          echo "launchers=${LAUNCHERS}" >> "$GITHUB_OUTPUT"
+          echo "drift=${DRIFT}" >> "$GITHUB_OUTPUT"
+
+      - name: ③ Install torchturbo (same command as npu-smoke.yml)
         id: torchturbo
         run: |
           set -uo pipefail
@@ -139,14 +250,16 @@ jobs:
           echo "::notice::torchturbo install took ${ELAPSED}s (rc=${RC})"
           exit "$RC"
 
-      - name: ③ Install llamafactory env (scripts/runs/${{ inputs.model }})
+      - name: ④ Install deps (${{ inputs.model_type }} / ${{ inputs.framework }})
         id: lf_deps
         env:
-          MODEL: ${{ inputs.model }}
+          MODEL_TYPE: ${{ inputs.model_type }}
+          INSTALL_SCRIPT: ${{ steps.resolve.outputs.install_script }}
         run: |
           set -uo pipefail
-          SCRIPT="scripts/runs/${MODEL}/install_lf_deps.sh"
+          SCRIPT="$INSTALL_SCRIPT"
           test -f "$SCRIPT" || { echo "::error::missing $SCRIPT"; exit 1; }
+          echo "model_type: $MODEL_TYPE"
           echo "script: $SCRIPT"
           echo "--- script content ---"
           cat "$SCRIPT"
@@ -158,7 +271,7 @@ jobs:
 
           echo "rc=${RC}" >> "$GITHUB_OUTPUT"
           echo "elapsed=${ELAPSED}" >> "$GITHUB_OUTPUT"
-          echo "::notice::${MODEL}/install_lf_deps.sh took ${ELAPSED}s (rc=${RC})"
+          echo "::notice::${SCRIPT} took ${ELAPSED}s (rc=${RC})"
 
           # Record what actually landed. Deliberately outside the timed region above and
           # never fatal: this workflow's deliverable is the duration, not a pass/fail gate.
@@ -179,15 +292,17 @@ jobs:
 
       # 只有显式勾选 train 时才会执行；不勾选时整个 step 直接 skipped，
       # 于是默认行为仍是原来的「只测安装耗时」。
-      - name: ④ Train Qwen3.5-2B (gsm8k SFT, 1 epoch)
+      - name: ⑤ Train (${{ inputs.model_type }} / ${{ inputs.framework }})
         id: train
-        if: ${{ inputs.train }}
+        if: ${{ inputs.train && steps.resolve.outputs.train_script != '' }}
         timeout-minutes: 240
         env:
           MODEL_HINT: ${{ inputs.train_model_path }}
           SEQ_LEN: ${{ inputs.train_seq_len }}
           FINETUNING_TYPE: ${{ inputs.train_finetuning_type }}
           RUNNER_LABEL: ${{ inputs.runner_label }}
+          MODEL_TYPE: ${{ inputs.model_type }}
+          TRAIN_SCRIPT: ${{ steps.resolve.outputs.train_script }}
         run: |
           set -uo pipefail
           set +e
@@ -292,15 +407,26 @@ jobs:
           fi
 
           # --- tt_config ---
-          # 复用 qwen3_5_moe/lf_text_sft.sh，但它默认的 yaml 是 ep_size=8（MoE）。
-          # 2B 是 dense，两张卡走序列并行，所以这里按需生成一份并行配置，
-          # 不往仓库里加新文件。
-          TT=/tmp/tt_qwen3_5_2b.yaml
+          # 优先级：外部显式传入 > 启动脚本同目录的 <脚本名>.yaml > /tmp 生成。
+          # qwen3_5_dense / qwen3_5_moe 都自带 lf_text_sft.yaml，直接复用它们，
+          # 不要用 CI 里臆造的并行配置覆盖仓库里的正式配置。
+          test -f "$TRAIN_SCRIPT" || { echo "::error::missing $TRAIN_SCRIPT"; exit 1; }
+          echo "train script: $TRAIN_SCRIPT"
+          TT=""
           if [ -n "${TT_CONFIG:-}" ] && [ -f "${TT_CONFIG}" ]; then
             TT="$TT_CONFIG"
             echo "using provided TT_CONFIG=$TT"
           else
-            cat > "$TT" <<'YAML'
+            SIBLING="${TRAIN_SCRIPT%.sh}.yaml"
+            if [ -f "$SIBLING" ]; then
+              TT="$SIBLING"
+              echo "using sibling TT_CONFIG=$TT"
+            else
+              # 没有配套 yaml 时兜底生成一份最小配置。
+              # sp_size 必须能整除 world_size（backend.py: world_size % sp_size）。
+              if [ $(( NPUS_PER_NODE % 2 )) -eq 0 ]; then SP=2; else SP=1; fi
+              TT=/tmp/tt_${MODEL_TYPE}.yaml
+              cat > "$TT" <<'YAML'
           engine_config:
             parallel_plan:
               sp_size: 2
@@ -309,19 +435,12 @@ jobs:
               cpu_offload:
                 enabled: false
           YAML
-            echo "generated TT_CONFIG=$TT (sp_size=2, ep_size=1)"
-            sed -n '1,20p' "$TT"
+              # 按实际卡数改写 sp_size（yaml 模板里写的是 2）
+              sed -i "s/sp_size: 2/sp_size: ${SP}/" "$TT"
+              echo "generated TT_CONFIG=$TT (sp_size=${SP}, ep_size=1)"
+            fi
           fi
-
-          echo "model=$MODEL seq=$SEQ_LEN ft=$FINETUNING_TYPE (full epoch, no step cap)"
-
-          # 注意：训练脚本是固定的 qwen3_5_moe/lf_text_sft.sh，与上面的 model 输入无关。
-          # 那个输入只决定 ③ 装哪份 install_lf_deps.sh；而这脚本本身全参数化
-          # （MODEL / TT_CONFIG / SEQ_LEN / FINETUNING_TYPE / DATASET / NPUS_PER_NODE），
-          # 所以 dense 模型也直接复用它。qwen3_5_dense 目录里没有 lf_text_sft.sh。
-          TRAIN_SCRIPT=scripts/runs/qwen3_5_moe/lf_text_sft.sh
-          test -f "$TRAIN_SCRIPT" || { echo "::error::missing $TRAIN_SCRIPT"; exit 1; }
-          echo "train script: $TRAIN_SCRIPT"
+          sed -n '1,25p' "$TT"
 
           START=$(date +%s)
           MODEL="$MODEL" TT_CONFIG="$TT" NPUS_PER_NODE="$NPUS_PER_NODE" \
@@ -344,10 +463,15 @@ jobs:
           exit "$RC"
 
 
-      - name: ⑤ Summary
+      - name: ⑥ Summary
         if: always()
         env:
-          MODEL: ${{ inputs.model }}
+          MODEL_TYPE: ${{ inputs.model_type }}
+          FRAMEWORK: ${{ inputs.framework }}
+          RUN_DIR: ${{ steps.resolve.outputs.run_dir }}
+          INSTALL_SCRIPT: ${{ steps.resolve.outputs.install_script }}
+          RESOLVED_TRAIN: ${{ steps.resolve.outputs.train_script }}
+          LAUNCHERS: ${{ steps.resolve.outputs.launchers }}
           TORCHTURBO_S: ${{ steps.torchturbo.outputs.elapsed }}
           TORCHTURBO_RC: ${{ steps.torchturbo.outputs.rc }}
           LF_DEPS_S: ${{ steps.lf_deps.outputs.elapsed }}
@@ -371,7 +495,12 @@ jobs:
             echo "|---|---|"
             echo "| runner | \`${{ inputs.runner_label }}\` |"
             echo "| image | \`${{ inputs.image }}\` |"
-            echo "| model | \`${MODEL}\` |"
+            echo "| model_type | \`${MODEL_TYPE}\` |"
+            echo "| framework | \`${FRAMEWORK}\` |"
+            echo "| run_dir | \`${RUN_DIR}\` |"
+            echo "| launchers | \`${LAUNCHERS}\` |"
+            echo "| install script | \`${INSTALL_SCRIPT}\` |"
+            echo "| train script | \`${RESOLVED_TRAIN:-<none>}\` |"
             echo "| train stage | ${TRAIN_ENABLED} |"
             if [ "${TRAIN_ENABLED}" = "true" ]; then
               echo "| model cache | **${TRAIN_HIT:-?}** |"
@@ -383,12 +512,18 @@ jobs:
             echo ""
             echo "| phase | seconds | human | rc |"
             echo "|---|---|---|---|"
-            echo "| ② torchturbo \`-e .[dev]\` | \`${TORCHTURBO_S:-n/a}\` | $(fmt "${TORCHTURBO_S}") | \`${TORCHTURBO_RC:-n/a}\` |"
-            echo "| ③ \`${MODEL}/install_lf_deps.sh\` | \`${LF_DEPS_S:-n/a}\` | $(fmt "${LF_DEPS_S}") | \`${LF_DEPS_RC:-n/a}\` |"
+            echo "| ③ torchturbo \`-e .[dev]\` | \`${TORCHTURBO_S:-n/a}\` | $(fmt "${TORCHTURBO_S}") | \`${TORCHTURBO_RC:-n/a}\` |"
+            echo "| ④ \`${INSTALL_SCRIPT}\` | \`${LF_DEPS_S:-n/a}\` | $(fmt "${LF_DEPS_S}") | \`${LF_DEPS_RC:-n/a}\` |"
             if [ "${TRAIN_ENABLED}" = "true" ]; then
-              echo "| ④ Qwen3.5-2B train | \`${TRAIN_S:-n/a}\` | $(fmt "${TRAIN_S}") | \`${TRAIN_RC:-n/a}\` |"
+              echo "| ⑤ train | \`${TRAIN_S:-n/a}\` | $(fmt "${TRAIN_S}") | \`${TRAIN_RC:-n/a}\` |"
             fi
             echo "| **total** | \`${TOTAL}\` | **$(fmt "${TOTAL}")** | |"
+            echo ""
+            echo "### model_type → 启动脚本映射"
+            echo ""
+            echo '```'
+            grep -v '^\s*#' scripts/runs/model_map.tsv 2>/dev/null | sed '/^\s*$/d' || echo "(map missing)"
+            echo '```'
             echo ""
             echo "### Versions after install"
             echo ""

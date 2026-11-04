@@ -1,0 +1,26 @@
+# model_type -> launch scripts, for CI.
+#
+# Columns (single-space separated, no spaces inside a column):
+#   1. model_type   exact name passed to @register_model(...) in
+#                   src/torchturbo/models/<dir>/model.py
+#   2. run_dir      directory under scripts/runs that holds its launch scripts;
+#                   "-" when no CI launcher exists yet
+#   3. lf_launchers    comma-separated llama-factory scripts, first one is the
+#                      default; "-" when unsupported
+#   4. swift_launchers same for ms-swift
+#
+# Keep this file in sync with the registry; npu-smoke-lf.yml fails if a
+# registered model_type is missing here, so drift shows up on the next run.
+#
+# model_type            run_dir           lf_launchers                          swift_launchers
+qwen3_5                 qwen3_5_dense     lf_text_sft.sh                        -
+qwen3_5_moe             qwen3_5_moe       lf_text_sft.sh                        swift_mllm_sft.sh,swift_text_dpo.sh
+qwen3_5_moe_text        qwen3_5_moe       lf_text_sft.sh                        swift_mllm_sft.sh
+bailing_hybrid          bailing_v3        lf_sft.sh,lf_pt.sh,lf_dpo.sh          swift_sft.sh,swift_pt.sh,swift_dpo.sh
+bailing_moe_v3_vl       -                 -                                     -
+deepseek_v4             deepseek_v4       -                                     -
+kimi_k25                kimi_k25          -                                     -
+llada2_moe              llada2            -                                     -
+qwen4_exp               qwen4_exp         -                                     swift_text_sft.sh
+qwen3_moe               -                 -                                     -
+glm_moe_dsa             -                 -                                     -
