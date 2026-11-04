@@ -46,9 +46,9 @@ on:
         default: false
         type: boolean
       train_model_path:
-        description: '模型路径；默认用 NFS 上的缓存，命中则 0 下载'
-        required: true
-        default: '/root/.cache/models/Qwen/Qwen3.5-2B'
+        description: '可选：显式指定模型目录；留空则自动探测下面几个缓存落点'
+        required: false
+        default: ''
         type: string
       train_seq_len:
         description: 'cutoff_len'
@@ -181,14 +181,13 @@ jobs:
         id: train
         if: ${{ inputs.train }}
         env:
-          MODEL: ${{ inputs.train_model_path }}
+          MODEL_HINT: ${{ inputs.train_model_path }}
           SEQ_LEN: ${{ inputs.train_seq_len }}
           FINETUNING_TYPE: ${{ inputs.train_finetuning_type }}
           RUNNER_LABEL: ${{ inputs.runner_label }}
         run: |
           set -uo pipefail
           set +e
-          D="$MODEL"
 
           # 卡数直接取 runner 标签的尾缀（-2 / -4 / -8），避免与 yaml 里的 sp_size 不匹配。
           NPUS_PER_NODE="${RUNNER_LABEL##*-}"
@@ -202,25 +201,68 @@ jobs:
           uuid=$(findmnt -nT /root/.cache -o SOURCE 2>/dev/null | sed -n '1p' | cut -d. -f1)
           echo "sfs_uuid=${uuid:-?}"
 
-          # --- 模型就绪判定 ---
-          # 只看目录 inode 大小没有意义（实测 22~499 字节），必须看 config + 权重总量。
-          # Qwen3.5-2B 的 bf16 权重约 4.5 GB，取 3 GB 作为下限。
-          bytes=0
-          if [ -f "$D/config.json" ]; then
-            bytes=$(timeout 180 du -sb "$D" 2>/dev/null | awk '{print $1}')
-            bytes=${bytes:-0}
-          fi
-          echo "existing bytes=${bytes}"
-          if [ "$bytes" -gt 3000000000 ] 2>/dev/null; then
+          # --- 模型目录探测 ---------------------------------------------------
+          # 只有目录 inode 大小说明不了任何问题（实测 22~499 字节），
+          # hub 形态下 snapshots/ 里还全是软链。
+          # 所以统一用「config.json 存在 + *.safetensors 总量 > 3 GB」判定，
+          # 2B 的 bf16 权重约 4.5 GB。
+          model_ok() {
+            _d=$1
+            [ -n "$_d" ] && [ -f "$_d/config.json" ] || return 1
+            # -L 必须加：hub 形态的 snapshots/<sha>/ 里全是软链，
+            # du 默认只统计软链本身（几十字节），会误判为未下载。
+            _b=$(timeout 180 du -sbL "$_d" 2>/dev/null | awk '{print $1}')
+            [ "${_b:-0}" -gt 3000000000 ] 2>/dev/null || return 1
+            _s=$(timeout 120 find "$_d" -maxdepth 2 -name '*.safetensors' 2>/dev/null | wc -l)
+            [ "$_s" -gt 0 ] || return 1
+            return 0
+          }
+
+          # 候选（按优先级）。hub 形态要展开 snapshots/<sha>。
+          # modelscope 的缓存目录会把 '.' 写成 '___'，但也会建一个原名软链，两种都试。
+          cands=""
+          [ -n "$MODEL_HINT" ] && cands="$MODEL_HINT"
+          cands="$cands
+          /root/.cache/models/Qwen/Qwen3.5-2B
+          /root/.cache/models/Qwen3.5-2B
+          /root/.cache/modelscope/hub/models/Qwen/Qwen3.5-2B
+          /root/.cache/modelscope/hub/models/Qwen/Qwen3-0___6B
+          /root/.cache/modelscope/hub/Qwen/Qwen3.5-2B"
+
+          # hub 形态：把每个 snapshot 子目录也当作候选
+          for h in /root/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B/snapshots ; do
+            [ -d "$h" ] || continue
+            for snap in "$h"/* ; do
+              [ -d "$snap" ] && cands="$cands
+          $snap"
+            done
+          done
+
+          MODEL=""
+          while IFS= read -r c ; do
+            c=$(printf '%s' "$c" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            [ -n "$c" ] || continue
+            [ -d "$c" ] || { echo "  miss (absent): $c" ; continue ; }
+            if model_ok "$c" ; then
+              echo "  HIT: $c"
+              MODEL="$c"
+              break
+            fi
+            echo "  miss (incomplete): $c"
+          done <<EOF
+          $cands
+          EOF
+
+          if [ -n "$MODEL" ] ; then
             cache_hit=yes
+            echo "::notice::model HIT on sfs=${uuid:-?}: $MODEL ($(du -sh "$MODEL" 2>/dev/null | awk '{print $1}'))"
           else
             cache_hit=no
-          fi
-
-          if [ "$cache_hit" = no ]; then
+            # 全都不中才下载；落在 plain 目录，避免 hub 软链形态被误判。
+            MODEL=/root/.cache/models/Qwen/Qwen3.5-2B
             echo "::notice::model MISS on sfs=${uuid:-?}; downloading Qwen/Qwen3.5-2B via ${HF_ENDPOINT}"
-            mkdir -p "$D"
-            MODEL_DIR="$D" python - <<'PY'
+            mkdir -p "$MODEL"
+            MODEL_DIR="$MODEL" python - <<'PY'
           import os
           from huggingface_hub import snapshot_download
 
@@ -235,16 +277,14 @@ jobs:
               echo "::error::snapshot_download failed"
               exit 1
             fi
-          else
-            echo "::notice::model HIT on sfs=${uuid:-?} ($(du -sh "$D" 2>/dev/null | awk '{print $1}'))"
           fi
 
-          bytes=$(timeout 180 du -sb "$D" 2>/dev/null | awk '{print $1}')
+          bytes=$(timeout 180 du -sbL "$MODEL" 2>/dev/null | awk '{print $1}')
           bytes=${bytes:-0}
-          shard=$(timeout 60 find "$D" -maxdepth 1 -name '*.safetensors' 2>/dev/null | wc -l)
-          echo "model: bytes=${bytes} shards=${shard}"
+          shard=$(timeout 120 find "$MODEL" -maxdepth 2 -name '*.safetensors' 2>/dev/null | wc -l)
+          echo "model: $MODEL  bytes=${bytes} shards=${shard}"
           if [ "$bytes" -lt 3000000000 ] 2>/dev/null || [ "$shard" -eq 0 ]; then
-            echo "::error::model incomplete at $D (bytes=${bytes}, shards=${shard})"
+            echo "::error::model incomplete at $MODEL (bytes=${bytes}, shards=${shard})"
             exit 1
           fi
 
