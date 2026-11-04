@@ -28,7 +28,7 @@ on:
         required: true
         default: 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest'
       model_type:
-        description: '模型：取 src/torchturbo/models 里 @register_model 的名字，映射表见 scripts/runs/model_map.tsv'
+        description: '模型：取 src/torchturbo/models 里 @register_model 的名字，映射表见 .github/workflows/model_map.tsv'
         required: true
         default: 'qwen3_5'
         type: choice
@@ -124,7 +124,7 @@ jobs:
           FRAMEWORK: ${{ inputs.framework }}
         run: |
           set -uo pipefail
-          MAP=scripts/runs/model_map.tsv
+          MAP=.github/workflows/model_map.tsv
           MODEL_TYPE="${MODEL_TYPE:-}"
           FRAMEWORK="${FRAMEWORK:-lf}"
           test -f "$MAP" || { echo "::error::missing $MAP"; exit 1; }
@@ -522,7 +522,7 @@ jobs:
             echo "### model_type → 启动脚本映射"
             echo ""
             echo '```'
-            grep -v '^\s*#' scripts/runs/model_map.tsv 2>/dev/null | sed '/^\s*$/d' || echo "(map missing)"
+            grep -v '^\s*#' .github/workflows/model_map.tsv 2>/dev/null | sed '/^\s*$/d' || echo "(map missing)"
             echo '```'
             echo ""
             echo "### Versions after install"
