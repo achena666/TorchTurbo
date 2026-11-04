@@ -28,7 +28,7 @@ on:
         required: true
         default: 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest'
       model:
-        description: 'Directory under scripts/runs (must contain install_lf_deps.sh)'
+        description: 'scripts/runs 下的依赖安装目录。注意：只决定 install_lf_deps.sh 的来源，不影响 step ④ 的训练脚本'
         required: true
         default: 'qwen3_5_dense'
         type: choice
@@ -314,10 +314,19 @@ jobs:
           fi
 
           echo "model=$MODEL seq=$SEQ_LEN ft=$FINETUNING_TYPE (full epoch, no step cap)"
+
+          # 注意：训练脚本是固定的 qwen3_5_moe/lf_text_sft.sh，与上面的 model 输入无关。
+          # 那个输入只决定 ③ 装哪份 install_lf_deps.sh；而这脚本本身全参数化
+          # （MODEL / TT_CONFIG / SEQ_LEN / FINETUNING_TYPE / DATASET / NPUS_PER_NODE），
+          # 所以 dense 模型也直接复用它。qwen3_5_dense 目录里没有 lf_text_sft.sh。
+          TRAIN_SCRIPT=scripts/runs/qwen3_5_moe/lf_text_sft.sh
+          test -f "$TRAIN_SCRIPT" || { echo "::error::missing $TRAIN_SCRIPT"; exit 1; }
+          echo "train script: $TRAIN_SCRIPT"
+
           START=$(date +%s)
           MODEL="$MODEL" TT_CONFIG="$TT" NPUS_PER_NODE="$NPUS_PER_NODE" \
             SEQ_LEN="$SEQ_LEN" FINETUNING_TYPE="$FINETUNING_TYPE" \
-            bash scripts/runs/qwen3_5_moe/lf_text_sft.sh 2>&1 | tee /tmp/train.log
+            bash "$TRAIN_SCRIPT" 2>&1 | tee /tmp/train.log
           RC=${PIPESTATUS[0]}
           ELAPSED=$(( $(date +%s) - START ))
 
