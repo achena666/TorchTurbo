@@ -89,7 +89,7 @@ jobs:
           for p in /models /datasets /workspace /pip-cache /root/.cache /home/runner/.cache /tmp/pip-cache /tmp; do
             printf '%-24s ' "$p"
             if [ -e "$p" ]; then
-              findmnt -nT "$p" -o SOURCE,FSTYPE,OPTIONS 2>/dev/null | head -1 || echo "(not a mount)"
+              findmnt -nT "$p" -o SOURCE,FSTYPE,OPTIONS 2>/dev/null | sed -n '1p' || echo "(not a mount)"
             else
               echo "ABSENT"
             fi
@@ -105,60 +105,101 @@ jobs:
           echo "=== 候选目录内容（只读一层，不递归）==="
           for p in /models /datasets /workspace /pip-cache; do
             echo "--- $p ---"
-            timeout 10 ls -la "$p" 2>/dev/null | head -15 || echo "(unreadable/absent)"
+            # 用 sed 而非 head 截断：head 提前退出会给 ls 发 SIGPIPE，
+            # 在 pipefail 下整个 step 会以 141 失败（第 41789952084 次就是这么挂的）。
+            timeout 10 ls -la "$p" 2>/dev/null | sed -n '1,15p' || echo "(unreadable/absent)"
           done
 
       - name: ③ 可写性与持久化标记
         timeout-minutes: 10
         run: |
+          # 诊断型探针：单个子命令失败不应中断整个实验。
           set -uo pipefail
-          # 铁律：/root/.cache 是共享 NFS 卷，绝不能在它上面跑无界递归 du。
-          # 第 41789952084 次运行就是因为 `du -sh /root/.cache` 遍历整棵共享树而卡死。
-          # 只读一层目录 + df，都是 O(1)/O(entries) 操作。
-          echo "marker= ${{ inputs.marker }}"
-          echo "--- /root/.cache 文件系统容量（O(1)，不遍历）---"
+          set +e
+          MARKER='${{ inputs.marker }}'
+          echo "marker= ${MARKER}"
+
+          echo
+          echo "=== 0) 历史标记残留（最先做，最不可能因后续命令失败而丢掉）==="
+          found=0
+          for d in /root/.cache /root/.cache/models /root/.cache/datasets /tmp; do
+            [ -d "$d" ] || continue
+            for f in "$d"/.torchturbo-probe*; do
+              [ -f "$f" ] || continue
+              found=$((found+1))
+              echo "$f -> $(timeout 5 cat "$f" 2>/dev/null)"
+            done
+          done
+          [ "$found" -eq 0 ] && echo "(本共享卷上看不到任何历史标记)"
+
+          echo
+          echo "=== 1) 共享卷身份（跨 run 是否为同一份存储）==="
+          # 铁律：/root/.cache 是大容量共享 NFS，绝不能对它递归 du（会挂死）。
+          # 只用 df（O(1)）与单层 ls（O(entries)）。
           df -h /root/.cache 2>/dev/null || true
           df -i /root/.cache 2>/dev/null || true
-          echo "--- /root/.cache 顶层内容（只一层）---"
-          timeout 20 ls -la /root/.cache 2>/dev/null | head -30 || echo "(ls timed out)"
-          echo "--- huggingface 缓存是否已在用 ---"
-          for d in /root/.cache/huggingface /root/.cache/huggingface/hub /root/.cache/huggingface/datasets; do
-            printf '%-40s ' "$d"
-            if [ -d "$d" ]; then
-              n=$(timeout 20 ls -1 "$d" 2>/dev/null | head -50 | wc -l)
-              echo "present (top-level entries>=${n})"
-            else
-              echo "ABSENT"
-            fi
-          done
+          echo "--- mount source / addr（比对两次 run 是否同一 SFS）---"
+          findmnt -nT /root/.cache -o SOURCE,FSTYPE,OPTIONS 2>/dev/null || true
 
-          for d in /models /datasets /workspace /root/.cache /tmp; do
-            [ -d "$d" ] || { echo "$d: ABSENT"; continue; }
-            f="$d/.torchturbo-probe"
-            if printf 'run=%s marker=%s ts=%s host=%s\n' \
-                 "$GITHUB_RUN_ID" "${{ inputs.marker }}" "$(date -Is)" "${HOSTNAME:-$(uname -n)}" \
-                 > "$f" 2>/dev/null; then
-              echo "$d: WRITABLE"
-              echo "    content: $(cat "$f")"
+          echo
+          echo "=== 2) /root/.cache 顶层内容（只一层）==="
+          timeout 30 ls -la /root/.cache 2>/dev/null | sed -n '1,60p' || echo "(ls timed out)"
+
+          echo
+          echo "=== 3) 已有缓存目录 ==="
+          for d in \
+            /root/.cache/huggingface \
+            /root/.cache/huggingface/hub \
+            /root/.cache/huggingface/datasets \
+            /root/.cache/models \
+            /root/.cache/datasets \
+            /root/.cache/modelscope ; do
+            if [ -d "$d" ]; then
+              echo "$d : present"
+              timeout 30 ls -1 "$d" 2>/dev/null | sed -n '1,25p' | sed 's/^/    /'
             else
-              echo "$d: READ-ONLY (or no permission)"
+              echo "$d : ABSENT"
             fi
           done
 
           echo
-          echo "=== 历史标记残留（判持久化的关键证据）==="
-          for d in /models /datasets /workspace /root/.cache /tmp; do
-            [ -d "$d" ] || continue
-            for f in "$d"/.torchturbo-probe*; do
-              [ -f "$f" ] || continue
-              echo "$f -> $(timeout 5 cat "$f" 2>/dev/null)"
-            done
+          echo "=== 4) 目标资源是否已在缓存（Qwen3.5 / gsm8k）==="
+          for p in /root/.cache/models /root/.cache/datasets /root/.cache/huggingface/hub; do
+            [ -d "$p" ] || continue
+            echo "--- $p ---"
+            timeout 60 ls -1 "$p" 2>/dev/null \
+              | grep -iE 'qwen3[._-]?5|qwen3.5|gsm8k' | sed -n '1,20p' | sed 's/^/    /'
+            echo "    (无匹配即为空)"
           done
+
+          echo
+          echo "=== 5) 基础设施已有的 HF 预热脚本（若存在则直接复用）==="
+          if [ -f /root/.cache/omni-hf-preload.sh ]; then
+            timeout 10 sed -n '1,80p' /root/.cache/omni-hf-preload.sh
+          else
+            echo "(absent)"
+          fi
+
+          echo
+          echo "=== 6) 可写性测试 ==="
+          for d in /models /datasets /workspace /root/.cache /tmp; do
+            [ -d "$d" ] || { echo "$d: ABSENT"; continue; }
+            f="$d/.torchturbo-probe"
+            if printf 'run=%s marker=%s ts=%s host=%s\n' \
+                 "$GITHUB_RUN_ID" "$MARKER" "$(date -Is)" "${HOSTNAME:-$(uname -n)}" \
+                 > "$f" 2>/dev/null; then
+              echo "$d: WRITABLE  -> $(cat "$f")"
+            else
+              echo "$d: READ-ONLY (or no permission)"
+            fi
+          done
+          echo "(exit 0: 本 step 为诊断探针，不因个别命令失败中断)"
 
       - name: ④ 下载源可达性（模型/数据集从哪来）
         timeout-minutes: 10
         run: |
           set -uo pipefail
+          set +e
           echo
           echo "=== 相关环境变量 ==="
           env | grep -iE '^(HF_|HUGGINGFACE|TRANSFORMERS|PIP_|HOME=|XDG_|.*_PROXY=|NO_PROXY=)' || echo "(none)"
@@ -200,8 +241,9 @@ jobs:
         timeout-minutes: 5
         run: |
           set -uo pipefail
+          set +e
 
-          models_mnt=$(findmnt -nT /models -o SOURCE,FSTYPE 2>/dev/null | head -1) || models_mnt=''
+          models_mnt=$(findmnt -nT /models -o SOURCE,FSTYPE 2>/dev/null | sed -n '1p') || models_mnt=''
           [ -d /models ] || models_mnt=''
           if [ -z "$models_mnt" ]; then
             [ -d /models ] && models_state='存在但非独立挂载' || models_state='**不存在**'
@@ -214,14 +256,29 @@ jobs:
           if touch /models/.wtest 2>/dev/null; then models_rw=writable; rm -f /models/.wtest; fi
           [ -d /models ] || models_rw='n/a'
 
-          cache_mnt=$(findmnt -nT /root/.cache -o SOURCE,FSTYPE 2>/dev/null | head -1) || cache_mnt=''
+          cache_mnt=$(findmnt -nT /root/.cache -o SOURCE,FSTYPE 2>/dev/null | sed -n '1p') || cache_mnt=''
           [ -d /root/.cache ] || cache_mnt=''
           cache_state=${cache_mnt:-非独立挂载（Pod 销毁即丢）}
+          # 共享卷 UUID：两次 run 对比它，就能知道是不是同一份 SFS。
+          cache_uuid=$(findmnt -nT /root/.cache -o SOURCE 2>/dev/null | sed -n '1p' | cut -d. -f1) || cache_uuid='-'
+          cache_addr=$(findmnt -nT /root/.cache -o SOURCE,OPTIONS 2>/dev/null | grep -o 'addr=[0-9.]*' | sed -n '1p') || cache_addr='-'
           # 容量取文件系统级统计，O(1)；绝不对共享 NFS 做递归 du。
           cache_cap=$(timeout 10 df -h /root/.cache 2>/dev/null | awk 'NR==2{print $2" / 已用 "$3" / 可用 "$4}') || cache_cap='-'
           cache_rw=readonly
           if touch /root/.cache/.wtest 2>/dev/null; then cache_rw=writable; rm -f /root/.cache/.wtest; fi
           [ -d /root/.cache ] || cache_rw='n/a'
+
+          # 已有缓存清单（只读一层）
+          hf_hub_n=$(timeout 30 ls -1 /root/.cache/huggingface/hub 2>/dev/null | wc -l) || hf_hub_n=0
+          cached_sets=''
+          for p in /root/.cache/models /root/.cache/datasets /root/.cache/modelscope; do
+            [ -d "$p" ] || continue
+            n=$(timeout 30 ls -1 "$p" 2>/dev/null | wc -l) || n=0
+            cached_sets="${cached_sets}\`${p}\`(${n}) "
+          done
+          [ -n "$cached_sets" ] || cached_sets='（无）'
+          marker_hit=$(timeout 10 cat /root/.cache/.torchturbo-probe 2>/dev/null) || marker_hit=''
+          [ -n "$marker_hit" ] || marker_hit='（无残留）'
 
           http() { timeout 15 curl -s -o /dev/null -w '%{http_code}' -m 10 "$1" 2>/dev/null || echo ERR; }
           hf_m=$(http https://hf-mirror.com)
@@ -241,6 +298,16 @@ jobs:
             echo "|---|---|---|---|"
             echo "| \`/models\` | ${models_state} | ${models_sz} | ${models_rw} |"
             echo "| \`/root/.cache\` | ${cache_state} | ${cache_cap} | ${cache_rw} |"
+            echo ""
+            echo "### 共享卷身份（跨 run 对比用）"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| SFS UUID | \`${cache_uuid}\` |"
+            echo "| 挂载地址 | \`${cache_addr:-?}\` |"
+            echo "| \`hf/hub\` 条目数 | ${hf_hub_n} |"
+            echo "| 已有缓存目录 | ${cached_sets} |"
+            echo "| 上次 marker | ${marker_hit} |"
             echo ""
             echo "### 下载源"
             echo ""
