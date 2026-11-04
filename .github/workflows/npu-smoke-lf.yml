@@ -219,14 +219,14 @@ jobs:
           }
 
           # 候选（按优先级）。hub 形态要展开 snapshots/<sha>。
-          # modelscope 的缓存目录会把 '.' 写成 '___'，但也会建一个原名软链，两种都试。
+          # modelscope 会把 '.' 转义成 '___'，同时建一个原名的软链，两种都试。
           cands=""
           [ -n "$MODEL_HINT" ] && cands="$MODEL_HINT"
           cands="$cands
           /root/.cache/models/Qwen/Qwen3.5-2B
           /root/.cache/models/Qwen3.5-2B
           /root/.cache/modelscope/hub/models/Qwen/Qwen3.5-2B
-          /root/.cache/modelscope/hub/models/Qwen/Qwen3-0___6B
+          /root/.cache/modelscope/hub/models/Qwen/Qwen3___5-2B
           /root/.cache/modelscope/hub/Qwen/Qwen3.5-2B"
 
           # hub 形态：把每个 snapshot 子目录也当作候选
@@ -255,7 +255,7 @@ jobs:
 
           if [ -n "$MODEL" ] ; then
             cache_hit=yes
-            echo "::notice::model HIT on sfs=${uuid:-?}: $MODEL ($(du -sh "$MODEL" 2>/dev/null | awk '{print $1}'))"
+            echo "::notice::model HIT on sfs=${uuid:-?}: $MODEL ($(du -shL "$MODEL" 2>/dev/null | awk '{print $1}'))"
           else
             cache_hit=no
             # 全都不中才下载；落在 plain 目录，避免 hub 软链形态被误判。
@@ -328,7 +328,7 @@ jobs:
           echo "cache_hit=${cache_hit}" >> "$GITHUB_OUTPUT"
           echo "sfs_uuid=${uuid:-?}" >> "$GITHUB_OUTPUT"
           echo "shards=${shard}" >> "$GITHUB_OUTPUT"
-          echo "model_size=$(du -sh "$D" 2>/dev/null | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "model_size=$(du -shL "$MODEL" 2>/dev/null | awk '{print $1}')" >> "$GITHUB_OUTPUT"
           exit "$RC"
 
 
