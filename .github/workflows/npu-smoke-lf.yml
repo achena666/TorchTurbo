@@ -1,11 +1,11 @@
 name: NPU Smoke (llamafactory env)
 
 # Measures how long it takes to build a llamafactory environment on top of the L1 base
-# image. Training is NOT exercised, and the base image is NOT verified either: the only
-# deliverable is the timing of `scripts/runs/<model>/install_lf_deps.sh`.
+# image. The install script is invoked as-is, never copied inline, so CI always measures
+# the same commands training will run.
 #
-# The install script is invoked as-is, never copied inline, so CI always measures the same
-# commands training will run.
+# An optional ④ stage then runs a real Qwen3.5-2B gsm8k SFT. It is off by default, so the
+# default deliverable is still only the timing of `scripts/runs/<model>/install_lf_deps.sh`.
 #
 # container.image is mandatory: the base image lives in a private SWR repo, so the runner
 # has to pull it as its own root filesystem.
@@ -53,7 +53,7 @@ on:
       train_seq_len:
         description: 'cutoff_len'
         required: true
-        default: '2048'
+        default: '1024'
         type: string
       train_finetuning_type:
         description: '微调方式'
@@ -84,8 +84,10 @@ jobs:
     name: lf-env (${{ inputs.model }} on ${{ inputs.runner_label }})
     runs-on: ${{ inputs.runner_label }}
 
-    # Pull ~6 GiB over SWR (up to 30 min) + torchturbo (~1 min) + lf deps (~20 min) + checks
-    timeout-minutes: 90
+    # Image pull (~30 min) + torchturbo (~1 min) + lf deps (~20 min) + a full-epoch 2B
+    # SFT. The last one dominates and is unbounded, hence the generous ceiling; step ④
+    # carries its own limit so a hung training run cannot eat the whole budget.
+    timeout-minutes: 300
 
     container:
       image: ${{ inputs.image }}
@@ -177,9 +179,10 @@ jobs:
 
       # 只有显式勾选 train 时才会执行；不勾选时整个 step 直接 skipped，
       # 于是默认行为仍是原来的「只测安装耗时」。
-      - name: ④ Train Qwen3.5-2B (smoke)
+      - name: ④ Train Qwen3.5-2B (gsm8k SFT, 1 epoch)
         id: train
         if: ${{ inputs.train }}
+        timeout-minutes: 240
         env:
           MODEL_HINT: ${{ inputs.train_model_path }}
           SEQ_LEN: ${{ inputs.train_seq_len }}
@@ -260,7 +263,7 @@ jobs:
             cache_hit=no
             # 全都不中才下载；落在 plain 目录，避免 hub 软链形态被误判。
             MODEL=/root/.cache/models/Qwen/Qwen3.5-2B
-            echo "::notice::model MISS on sfs=${uuid:-?}; downloading Qwen/Qwen3.5-2B via ${HF_ENDPOINT}"
+            echo "::notice::model MISS on sfs=${uuid:-?}; downloading Qwen/Qwen3.5-2B via ${HF_ENDPOINT:-https://hf-mirror.com}"
             mkdir -p "$MODEL"
             MODEL_DIR="$MODEL" python - <<'PY'
           import os
