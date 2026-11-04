@@ -20,8 +20,6 @@ FINETUNING_TYPE=${FINETUNING_TYPE:-full}
 DATASET=${DATASET:-gsm8k}
 # turbo engine flags (sp/ep, freeze, cpu offload) live in the sibling yaml.
 TT_CONFIG=${TT_CONFIG:-"$(dirname "$0")/lf_text_sft.yaml"}
-# Optional hard step cap, useful for CI smoke runs. Unset keeps a full epoch.
-MAX_STEPS=${MAX_STEPS:-}
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
@@ -110,5 +108,4 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --bf16 \
     --neat_packing \
     --trust_remote_code \
-    ${MAX_STEPS:+--max_steps $MAX_STEPS} \
     2>&1 | tee $LOG_FILE

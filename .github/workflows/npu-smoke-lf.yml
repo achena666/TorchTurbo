@@ -50,11 +50,6 @@ on:
         required: true
         default: '/root/.cache/models/Qwen/Qwen3.5-2B'
         type: string
-      train_max_steps:
-        description: '训练步数（sanity check 保持极小）'
-        required: true
-        default: '3'
-        type: string
       train_seq_len:
         description: 'cutoff_len'
         required: true
@@ -187,7 +182,6 @@ jobs:
         if: ${{ inputs.train }}
         env:
           MODEL: ${{ inputs.train_model_path }}
-          MAX_STEPS: ${{ inputs.train_max_steps }}
           SEQ_LEN: ${{ inputs.train_seq_len }}
           FINETUNING_TYPE: ${{ inputs.train_finetuning_type }}
           RUNNER_LABEL: ${{ inputs.runner_label }}
@@ -276,11 +270,10 @@ jobs:
             sed -n '1,20p' "$TT"
           fi
 
-          echo "model=$MODEL steps=$MAX_STEPS seq=$SEQ_LEN ft=$FINETUNING_TYPE"
+          echo "model=$MODEL seq=$SEQ_LEN ft=$FINETUNING_TYPE (full epoch, no step cap)"
           START=$(date +%s)
           MODEL="$MODEL" TT_CONFIG="$TT" NPUS_PER_NODE="$NPUS_PER_NODE" \
             SEQ_LEN="$SEQ_LEN" FINETUNING_TYPE="$FINETUNING_TYPE" \
-            MAX_STEPS="$MAX_STEPS" \
             bash scripts/runs/qwen3_5_moe/lf_text_sft.sh 2>&1 | tee /tmp/train.log
           RC=${PIPESTATUS[0]}
           ELAPSED=$(( $(date +%s) - START ))
