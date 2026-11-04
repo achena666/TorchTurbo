@@ -67,6 +67,7 @@ jobs:
 
     steps:
       - name: ① Pod 基本信息与磁盘
+        timeout-minutes: 3
         run: |
           set -uo pipefail
           echo "label : ${{ inputs.runner_label }}"
@@ -81,6 +82,7 @@ jobs:
           df -h / /tmp 2>/dev/null || true
 
       - name: ② 挂载点全览（NFS 在此暴露）
+        timeout-minutes: 5
         run: |
           set -uo pipefail
           echo "=== findmnt 关键路径 ==="
@@ -100,25 +102,34 @@ jobs:
           awk '$3 ~ /^(nfs|nfs4|cifs|glusterfs|fuse\.)/ {print $2, $3, $4}' /proc/mounts || true
 
           echo
-          echo "=== 候选目录内容 ==="
+          echo "=== 候选目录内容（只读一层，不递归）==="
           for p in /models /datasets /workspace /pip-cache; do
             echo "--- $p ---"
-            ls -la "$p" 2>/dev/null | head -15 || echo "(unreadable/absent)"
-            du -sh "$p" 2>/dev/null || true
+            timeout 10 ls -la "$p" 2>/dev/null | head -15 || echo "(unreadable/absent)"
           done
 
       - name: ③ 可写性与持久化标记
+        timeout-minutes: 10
         run: |
           set -uo pipefail
+          # 铁律：/root/.cache 是共享 NFS 卷，绝不能在它上面跑无界递归 du。
+          # 第 41789952084 次运行就是因为 `du -sh /root/.cache` 遍历整棵共享树而卡死。
+          # 只读一层目录 + df，都是 O(1)/O(entries) 操作。
           echo "marker= ${{ inputs.marker }}"
-          echo "--- /root/.cache 现状（判持久化的主要依据）---"
+          echo "--- /root/.cache 文件系统容量（O(1)，不遍历）---"
           df -h /root/.cache 2>/dev/null || true
-          du -sh /root/.cache 2>/dev/null || true
-          ls -la /root/.cache 2>/dev/null | head -20 || true
-          echo "--- huggingface 缓存是否已有内容 ---"
+          df -i /root/.cache 2>/dev/null || true
+          echo "--- /root/.cache 顶层内容（只一层）---"
+          timeout 20 ls -la /root/.cache 2>/dev/null | head -30 || echo "(ls timed out)"
+          echo "--- huggingface 缓存是否已在用 ---"
           for d in /root/.cache/huggingface /root/.cache/huggingface/hub /root/.cache/huggingface/datasets; do
             printf '%-40s ' "$d"
-            if [ -d "$d" ]; then du -sh "$d" 2>/dev/null || echo present; else echo ABSENT; fi
+            if [ -d "$d" ]; then
+              n=$(timeout 20 ls -1 "$d" 2>/dev/null | head -50 | wc -l)
+              echo "present (top-level entries>=${n})"
+            else
+              echo "ABSENT"
+            fi
           done
 
           for d in /models /datasets /workspace /root/.cache /tmp; do
@@ -140,11 +151,12 @@ jobs:
             [ -d "$d" ] || continue
             for f in "$d"/.torchturbo-probe*; do
               [ -f "$f" ] || continue
-              echo "$f -> $(cat "$f" 2>/dev/null)"
+              echo "$f -> $(timeout 5 cat "$f" 2>/dev/null)"
             done
           done
 
       - name: ④ 下载源可达性（模型/数据集从哪来）
+        timeout-minutes: 10
         run: |
           set -uo pipefail
           echo
@@ -185,6 +197,7 @@ jobs:
 
       - name: ⑤ Summary
         if: always()
+        timeout-minutes: 5
         run: |
           set -uo pipefail
 
@@ -196,7 +209,7 @@ jobs:
             models_state="\`${models_mnt}\`"
           fi
 
-          models_sz=$(du -sh /models 2>/dev/null | awk '{print $1}') || models_sz='-'
+          models_sz=$(timeout 15 du -sh /models 2>/dev/null | awk '{print $1}') || models_sz='-'
           models_rw=readonly
           if touch /models/.wtest 2>/dev/null; then models_rw=writable; rm -f /models/.wtest; fi
           [ -d /models ] || models_rw='n/a'
@@ -204,8 +217,13 @@ jobs:
           cache_mnt=$(findmnt -nT /root/.cache -o SOURCE,FSTYPE 2>/dev/null | head -1) || cache_mnt=''
           [ -d /root/.cache ] || cache_mnt=''
           cache_state=${cache_mnt:-非独立挂载（Pod 销毁即丢）}
+          # 容量取文件系统级统计，O(1)；绝不对共享 NFS 做递归 du。
+          cache_cap=$(timeout 10 df -h /root/.cache 2>/dev/null | awk 'NR==2{print $2" / 已用 "$3" / 可用 "$4}') || cache_cap='-'
+          cache_rw=readonly
+          if touch /root/.cache/.wtest 2>/dev/null; then cache_rw=writable; rm -f /root/.cache/.wtest; fi
+          [ -d /root/.cache ] || cache_rw='n/a'
 
-          http() { curl -s -o /dev/null -w '%{http_code}' -m 10 "$1" 2>/dev/null || echo ERR; }
+          http() { timeout 15 curl -s -o /dev/null -w '%{http_code}' -m 10 "$1" 2>/dev/null || echo ERR; }
           hf_m=$(http https://hf-mirror.com)
           hf_o=$(http https://huggingface.co)
 
@@ -219,10 +237,10 @@ jobs:
             echo "| marker | \`${{ inputs.marker }}\` |"
             echo "| run id | \`${GITHUB_RUN_ID}\` |"
             echo ""
-            echo "| 路径 | 挂载 | 大小 | 可写 |"
+            echo "| 路径 | 挂载 | 容量 | 可写 |"
             echo "|---|---|---|---|"
             echo "| \`/models\` | ${models_state} | ${models_sz} | ${models_rw} |"
-            echo "| \`/root/.cache\` | ${cache_state} | - | - |"
+            echo "| \`/root/.cache\` | ${cache_state} | ${cache_cap} | ${cache_rw} |"
             echo ""
             echo "### 下载源"
             echo ""
