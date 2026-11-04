@@ -25,12 +25,31 @@ RUN curl -fsSL https://gosspublic.alicdn.com/ossutil/install.sh \
 
 # Use a public PyPI mirror for packages without an explicit index.
 ARG PIP_INDEX_URL=https://repo.huaweicloud.com/repository/pypi/simple
+RUN pip install torch_npu==2.10.0.post2
+# Disable mimalloc to avoid MADV_FREE reclaiming DMA-written pages.
+# Patch PyTorch's AArch64 default so USE_MIMALLOC=OFF takes effect.
+ARG MAX_JOBS=8
+RUN git clone --branch v2.10.0 --depth 1 --recurse-submodules --shallow-submodules \
+        https://github.com/pytorch/pytorch.git /tmp/pytorch \
+    && cd /tmp/pytorch \
+    && sed -i 's/if(WIN32 OR (CPU_AARCH64 AND NOT APPLE))/if(WIN32)/' CMakeLists.txt \
+    && pip install -r requirements-build.txt wheel \
+    && USE_CUDA=0 USE_ROCM=0 USE_MPS=0 USE_XPU=0 \
+        USE_MIMALLOC=OFF BUILD_TEST=0 BLAS=OpenBLAS \
+        PYTORCH_BUILD_VERSION=2.10.0+cpu.nomimalloc PYTORCH_BUILD_NUMBER=1 \
+        python setup.py bdist_wheel \
+    && pip install dist/torch-*.whl --force-reinstall --no-deps \
+    && cd / \
+    && rm -rf /tmp/pytorch
 # Install Ascend NPU packages and configure custom operators.
 RUN pip install triton==3.5.0
+# --no-deps: avoids triton-ascend pinning numpy back to 1.26.4.
 RUN pip install triton-ascend==3.2.2 \
         --index-url=https://repo.huaweicloud.com/ascend/repos/pypi \
-        --extra-index-url=https://repo.huaweicloud.com/repository/pypi/simple
-RUN pip install torch_npu==2.10.0.post2
+        --extra-index-url=https://repo.huaweicloud.com/repository/pypi/simple \
+        --no-deps
+# triton-ascend==3.2.2 requires pybind11, dropped by --no-deps above.
+RUN pip install pybind11==3.1.0
 # Build fla-npu v26.9.1 for Ascend A3 at commit 36e67d2decea70745554f7aebf9a6a29e9168a91.
 RUN bash -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh \
     && git clone https://github.com/flashserve/flash-linear-attention-npu.git /tmp/flash-linear-attention-npu \
@@ -47,21 +66,6 @@ RUN git clone https://github.com/fla-org/flash-linear-attention.git /tmp/flash-l
     && sed -i 's/^__version__ = "0.6.0"$/__version__ = "0.6.0+main.954438d1"/' /tmp/flash-linear-attention/fla/__init__.py \
     && pip install /tmp/flash-linear-attention \
     && rm -rf /tmp/flash-linear-attention
-# Disable mimalloc to avoid MADV_FREE reclaiming DMA-written pages.
-# Patch PyTorch's AArch64 default so USE_MIMALLOC=OFF takes effect.
-ARG MAX_JOBS=8
-RUN git clone --branch v2.10.0 --depth 1 --recurse-submodules --shallow-submodules \
-        https://github.com/pytorch/pytorch.git /tmp/pytorch \
-    && cd /tmp/pytorch \
-    && sed -i 's/if(WIN32 OR (CPU_AARCH64 AND NOT APPLE))/if(WIN32)/' CMakeLists.txt \
-    && pip install -r requirements-build.txt wheel \
-    && USE_CUDA=0 USE_ROCM=0 USE_MPS=0 USE_XPU=0 \
-        USE_MIMALLOC=OFF BUILD_TEST=0 BLAS=OpenBLAS \
-        PYTORCH_BUILD_VERSION=2.10.0+cpu.nomimalloc PYTORCH_BUILD_NUMBER=1 \
-        python setup.py bdist_wheel \
-    && pip install dist/torch-*.whl --force-reinstall --no-deps \
-    && cd / \
-    && rm -rf /tmp/pytorch
 # Install other packages
 RUN pip install py-spy==0.4.2
 
