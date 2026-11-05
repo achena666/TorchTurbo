@@ -437,8 +437,53 @@ jobs:
           export MODEL NPUS_PER_NODE SEQ_LEN FINETUNING_TYPE TT_CONFIG="$TT"
 
           START=$(date +%s)
-          bash "$TRAIN_SCRIPT" 2>&1 | tee /tmp/train.log
-          RC=${PIPESTATUS[0]}
+          # 启动脚本里是 `torchrun ... | tee $LOG_FILE`。trainer 异常退出时，它 fork
+          # 的数据集子进程（datasets 的 Pool）会变成孤儿继续占着管道写端，tee 永远
+          # 等不到 EOF，脚本就不返回 —— run 41954189913 就这样挂了 40+ min。
+          # 启动脚本属于上游仓，这里不改它，改成在外面做看门狗。
+          #
+          # 判定方式：脚本的直接子进程只有 torchrun 和 tee 两个。trainer 一死就只剩
+          # tee，而这个状态会一直保持。注意不能按 cmdline 找 trainer —— 池子里的孤儿
+          # 是 fork 出来的，命令行和 trainer 完全相同。
+          : > /tmp/train.log
+          if command -v setsid >/dev/null 2>&1 && command -v pgrep >/dev/null 2>&1 ; then
+            setsid bash "$TRAIN_SCRIPT" > /tmp/train.log 2>&1 &
+            WATCHDOG=yes
+          else
+            bash "$TRAIN_SCRIPT" > /tmp/train.log 2>&1 &
+            WATCHDOG=no
+          fi
+          TRAINPID=$!
+          tail -f /tmp/train.log &
+          TAILPID=$!
+
+          STUCK=0
+          while kill -0 "$TRAINPID" 2>/dev/null ; do
+            BUSY=0
+            for _p in $(pgrep -P "$TRAINPID" 2>/dev/null) ; do
+              [ "$(cat /proc/"$_p"/comm 2>/dev/null)" = tee ] || BUSY=$(( BUSY + 1 ))
+            done
+            if [ "$BUSY" = 0 ] ; then
+              STUCK=$(( STUCK + 1 ))          # 连续 15 s 只剩下 tee
+            else
+              STUCK=0
+            fi
+            [ "$STUCK" -ge 3 ] && break
+            sleep 5
+          done
+          if [ "$WATCHDOG" = yes ] && kill -0 "$TRAINPID" 2>/dev/null ; then
+            echo "::warning::trainer 已退出但 $TRAIN_SCRIPT 被孤儿子进程卡在 tee 上，清理进程组"
+            kill -TERM -"$TRAINPID" 2>/dev/null
+            sleep 10
+            kill -KILL -"$TRAINPID" 2>/dev/null
+            wait "$TRAINPID" 2>/dev/null
+            RC=1
+          else
+            wait "$TRAINPID" ; RC=$?
+          fi
+          sleep 2
+          kill "$TAILPID" 2>/dev/null
+          wait "$TAILPID" 2>/dev/null
           ELAPSED=$(( $(date +%s) - START ))
 
           LAST=$(grep -oE "'loss': [0-9.]+" /tmp/train.log | tail -1)
