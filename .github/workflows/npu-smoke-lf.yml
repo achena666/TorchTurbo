@@ -92,6 +92,11 @@ env:
   # 并发写同一个目录会留下半截 .py，而 transformers 只按 exists() 判缓存，之后
   # 所有 run 都读坏文件。放到 pod 本地的 /tmp（与 / 同 overlay，随 pod 销毁）。
   HF_MODULES_CACHE: '/tmp/hf-modules'
+  # 默认都是 10 s（constants.py:37）。元数据请求在镜像忙时常超 10 s，而
+  # 下载的超时是 httpx 的单次 read 超时：网络停顿 > 10 s 就 httpx.ReadTimeout，
+  # 且 http_get 的 retry_on_exceptions=() 不会重试，只能靠外层循环从头再来。
+  HF_HUB_ETAG_TIMEOUT: '30'
+  HF_HUB_DOWNLOAD_TIMEOUT: '120'
 
 jobs:
   lf-env:
@@ -337,15 +342,35 @@ jobs:
             MODEL="/root/.cache/models/$HF_REPO"
             echo "::notice::model MISS on sfs=${uuid:-?}; downloading $HF_REPO"
             mkdir -p "$MODEL"
-            REPO_ID="$HF_REPO" MODEL_DIR="$MODEL" python - <<'PY'
+            # hf-mirror 偶发 Cloudflare 5xx（521 Unassigned = 源站不可达），而
+            # huggingface_hub 只重试 408/429，所以这里自己退避重试。
+            # 注意：local_dir 模式每次尝试都从头下载（内部写进程唯一的临时文件），
+            # 重试代价是整个模型体积；max_workers=4 避免把镜像压垮。
+            cat > /tmp/hf_download.py <<'PY'
           import os
+
           from huggingface_hub import snapshot_download
 
-          # local_dir 直写目标目录，模型只存一份，不额外占 HF_HUB_CACHE 的空间。
-          print(snapshot_download(repo_id=os.environ["REPO_ID"],
-                                  local_dir=os.environ["MODEL_DIR"],
-                                  max_workers=8))
+          snapshot_download(
+              repo_id=os.environ["REPO_ID"],
+              local_dir=os.environ["MODEL_DIR"],
+              max_workers=4,
+          )
           PY
+            ok=no
+            for attempt in 1 2 3 ; do
+              echo "--- download attempt ${attempt}/3 ---"
+              if REPO_ID="$HF_REPO" MODEL_DIR="$MODEL" python /tmp/hf_download.py ; then
+                ok=yes; break
+              fi
+              W=$(( attempt * 30 ))
+              echo "attempt ${attempt} failed; retrying in ${W}s"
+              sleep "$W"
+            done
+            if [ "$ok" != yes ] ; then
+              echo "::error::从 ${HF_ENDPOINT} 下载 $HF_REPO 连续失败 3 次（镜像侧 5xx 时重跑即可）"
+              exit 1
+            fi
             r=$(probe "$MODEL") || { echo "::error::model incomplete at $MODEL"; exit 1; }
             BYTES=${r% *}; SHARDS=${r#* }
           fi
