@@ -1,0 +1,58 @@
+name: probe2
+
+# 临时探针：逐个加回 ci-pytest.yml 容器 job 的修饰，找出 GitHub 在哪一步
+# 直接不创建这个 job。验证完立即删除。
+on:
+  workflow_dispatch:
+    inputs:
+      timeout_minutes:
+        required: false
+        default: 30
+        type: number
+      use_container:
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  # 1. 只有 timeout-minutes 表达式
+  t_timeout:
+    name: t 只有 timeout 表达式
+    if: ${{ inputs.use_container }}
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: ${{ inputs.timeout_minutes || 60 }}
+    steps:
+      - run: echo "t ran"
+
+  # 2. container + options + defaults
+  u_container_full:
+    name: u 容器 options defaults
+    if: ${{ inputs.use_container }}
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: ${{ inputs.timeout_minutes || 60 }}
+    container:
+      image: alpine:3.20
+      options: --user root
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: echo "u ran"
+
+  # 3. container + credentials（指向不存在的 secret，只为验证创建行为）
+  v_container_creds:
+    name: v 容器 credentials
+    if: ${{ inputs.use_container }}
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: ${{ inputs.timeout_minutes || 60 }}
+    container:
+      image: alpine:3.20
+      credentials:
+        username: ${{ secrets.PROBE_NOT_EXIST_USER }}
+        password: ${{ secrets.PROBE_NOT_EXIST_PASS }}
+      options: --user root
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: echo "v ran"
