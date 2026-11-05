@@ -53,6 +53,17 @@ on:
         required: true
         default: '1024'
         type: string
+      # 冒烟用的小数据集。和启动脚本里各自的默认值（science / wikipedia_en /
+      # orca_rlhf）区分开：science.jsonl 有 2.6 GiB，而且它的 conversations[].info
+      # 里 test_case / instruction_constrain 前几十 MB 全是 null，datasets 会用首块
+      # 把 schema 锁成 null，后面遇到字符串就报
+      # "Couldn't cast array of type string to null"。gsm8k 只有 2.7 MB、带 parquet，
+      # 不会踩 schema 推断和下载这两个坑。
+      train_dataset:
+        description: '数据集名（必须是 dataset/dataset_info.json 里的 key）'
+        required: true
+        default: 'gsm8k'
+        type: string
       train_finetuning_type:
         description: '微调方式'
         required: true
@@ -292,6 +303,7 @@ jobs:
           RUNNER_LABEL: ${{ inputs.runner_label }}
           MODEL_TYPE: ${{ inputs.model_type }}
           TRAIN_SCRIPT: ${{ steps.resolve.outputs.train_script }}
+          DATASET_IN: ${{ inputs.train_dataset }}
         run: |
           set -uo pipefail
           set +e
@@ -434,7 +446,11 @@ jobs:
           echo "train script: $TRAIN_SCRIPT"
           echo "cards=$W  parallel: ${OLD} -> sp=$SP ep=$EP  (tt_config=$TT)"
 
+          # 启动脚本都是 DATASET=${DATASET:-<各自的默认>}，所以从外面指定即可，
+          # 不用改 scripts/runs 下的上游文件。
+          export DATASET="$DATASET_IN"
           export MODEL NPUS_PER_NODE SEQ_LEN FINETUNING_TYPE TT_CONFIG="$TT"
+          echo "dataset=$DATASET"
 
           START=$(date +%s)
           # 启动脚本里是 `torchrun ... | tee $LOG_FILE`。trainer 异常退出时，它 fork
@@ -499,6 +515,7 @@ jobs:
         env:
           MODEL_TYPE: ${{ inputs.model_type }}
           FRAMEWORK: ${{ inputs.framework }}
+          TRAIN_DATASET: ${{ inputs.train_dataset }}
           RUN_DIR: ${{ steps.resolve.outputs.run_dir }}
           INSTALL_SCRIPT: ${{ steps.resolve.outputs.install_script }}
           RESOLVED_TRAIN: ${{ steps.resolve.outputs.train_script }}
@@ -528,6 +545,7 @@ jobs:
             echo "| run_dir | \`${RUN_DIR}\` |"
             echo "| install / train | \`${INSTALL_SCRIPT}\` / \`${RESOLVED_TRAIN:-<none>}\` |"
             echo "| model cache | **${TRAIN_HIT:-?}** (sfs \`${TRAIN_SFS:-?}\`) |"
+            echo "| dataset | \`${TRAIN_DATASET:-?}\` |"
             echo "| shards / size | ${TRAIN_SHARDS:-?} / ${TRAIN_SIZE:-?} |"
             echo "| parallel (sp/ep) | \`${TRAIN_SP:-?}/${TRAIN_EP:-?}\` |"
             echo ""
