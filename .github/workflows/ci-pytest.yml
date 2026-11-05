@@ -97,11 +97,15 @@ on:
         required: true
         default: 'linux-aarch64-a3-800i-2'
         type: choice
+        # 手动入口也要能点名 CPU 池，否则「不带容器跑一遍」根本没法验证。
         options:
           - linux-aarch64-a3-800i-2
           - linux-aarch64-a3-800i-4
           - linux-aarch64-a3-800i-8
           - linux-aarch64-a3-800i-16
+          - linux-aarch64-cpu-4
+          - linux-aarch64-cpu-24
+          - ubuntu-22.04-arm
       image:
         description: 'L1 基础镜像；用 repo@sha256:... 可严格复现'
         required: true
@@ -143,8 +147,10 @@ jobs:
     name: pytest-${{ inputs.mode }}（容器 · ${{ inputs.runner_label }}）
     if: ${{ inputs.use_container }}
     runs-on: ${{ inputs.runner_label }}
-    # `|| 60` 是兜底：见 ci-train.yml 里同一处注释。
-    timeout-minutes: ${{ inputs.timeout_minutes || 60 }}
+    # `|| 60` 是兜底；外面必须包 fromJSON：dispatch 触发的 number 输入实际是
+    # 字符串（"30"），直接给 timeout-minutes 会让 GitHub **静默丢弃整个 job**
+    # （不是报错，是 run 里看不到这个 job）。详见 docs/ci/README.md。
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
     # 这里**不要**加 job 级 concurrency。曾经按 runner_label 分过组，结果
     # cancel-in-progress: false 并没带来排队：「同一个组里 pending 的 job
     # 只保留最后一个」。ci-full 的 5 个 L1 分片中 2/3/4 在创建 1 s 后全部
@@ -251,7 +257,7 @@ jobs:
     name: pytest-${{ inputs.mode }}（裸机 · ${{ inputs.runner_label }}）
     if: ${{ !inputs.use_container }}
     runs-on: ${{ inputs.runner_label }}
-    timeout-minutes: ${{ inputs.timeout_minutes || 60 }}
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
     # concurrency 与上面的容器 job 同理：会杀掉并行的分片，不加。
 
     defaults:

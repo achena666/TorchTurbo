@@ -246,9 +246,9 @@ jobs:
   sft:
     name: 训练（${{ inputs.model_type }}/${{ inputs.framework }} · ${{ inputs.runner_label }}）
     runs-on: ${{ inputs.runner_label }}
-    # `|| 45` 是兜底：万一以后有人用 dispatch 触发却没在 dispatch inputs 里声明
-    # timeout_minutes，空值会让 job 直接校验失败；空字符串在表达式里是 falsy。
-    timeout-minutes: ${{ inputs.timeout_minutes || 45 }}
+    # fromJSON 不能省：dispatch 触发的 number 输入实际是字符串，直接给
+    # timeout-minutes 会让 GitHub 静默丢弃整个 job。见 ci-pytest.yml。
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 45) }}
     # 这里**不要**加 job 级 concurrency：同组 pending 的 job 只保留最后一个，
     # 会把排在前面的 run 静默取消（ci-pytest.yml 里踩过，5 个分片剩 2 个）。
     # NPU 池的串行由 runner 自己保证 —— runner 忙的时候 job 就在 queued 里等。
@@ -295,7 +295,7 @@ jobs:
 
       - name: ⑤ 训练（${{ inputs.model_type }} / ${{ inputs.framework }}）
         id: run
-        timeout-minutes: ${{ inputs.train_timeout_minutes || 10 }}
+        timeout-minutes: ${{ fromJSON(inputs.train_timeout_minutes || 10) }}
         env:
           MODEL_HINT: ${{ inputs.train_model_path }}
           REPO_MAP: ${{ steps.resolve.outputs.hf_repo }}

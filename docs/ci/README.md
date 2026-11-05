@@ -151,6 +151,33 @@ self-hosted runner 忙着的时候，下一个 job 天然停在 `queued`。要�
 workflow 级 `concurrency` 仍然保留在三个入口文件里（`ci-pr-*` / `ci-full-*` /
 `image-ci-base`），那里语义是"同一条 ref 的新 run 顶掉旧的"，是对的。
 
+## `timeout-minutes` 必须包 `fromJSON`
+
+`workflow_dispatch` 里声明成 `type: number` 的输入，实际传进 `inputs` 的是**字符串**
+（`"30"`，不是 `30`）。直接写
+
+```yaml
+timeout-minutes: ${{ inputs.timeout_minutes || 60 }}
+```
+
+在 dispatch 触发时求值结果是字符串 `"30"`，而 `timeout-minutes` 只接受 number。
+GitHub 的反应不是报错，而是**把这个 job 从 run 里整个丢掉**：run 页面只看得到
+另一个被 skip 的 job，结论是 failure，没有任何提示。很容易被误判成"runner 没起来"。
+
+写法必须是：
+
+```yaml
+timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
+```
+
+`fromJSON` 对 number 和字符串两种输入都成立（number 输入在 `workflow_call` 下
+仍然走这条路，实测同样正常），所以两条触发链可以用同一份表达式。
+
+这个 bug 让 `ci-pytest.yml` / `ci-train.yml` 的**手动入口**完全不可用 —— 提交
+`f2acd5d` 之后的三次 dispatch 全是这个原因。定位过程：二分探针（`applied` 过的
+`zz-probe*.yml` 已删除），`p`/`q` 两个不带 `timeout-minutes` 的 job 正常创建，
+而带表达式的 `r` 直接消失。
+
 ## 需要配的东西
 
 | 名称 | 类型 | 必需 | 用途 |
