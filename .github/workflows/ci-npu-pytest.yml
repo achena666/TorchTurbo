@@ -1,0 +1,200 @@
+name: NPU pytest (reusable)
+
+# The shared body of every "install the stack on an NPU pod and run pytest" job.
+#
+# Deliberately separate from ci-npu-sft.yml rather than merged behind a `task`
+# switch: the two share a preamble (container, credentials, install, summary) but
+# nothing after it, and a workflow that is half `if:` guards is harder to read than
+# two files that each do one thing. What they *do* share is scripts/ci -- the
+# summary renderer, the environment probe, and the torch guard all live there.
+#
+# Callers: npu-smoke.yml, plus any model-specific suite that wants the same body.
+
+on:
+  workflow_call:
+    inputs:
+      runner_label:
+        description: 'Runner label; the trailing number is the card count'
+        required: true
+        type: string
+      image:
+        description: 'L1 base image; pin with repo@sha256:... for reproducibility'
+        required: true
+        type: string
+      test_path:
+        description: 'pytest target: a directory, a file, or a node id'
+        required: false
+        default: 'tests/ops/npu'
+        type: string
+      pytest_args:
+        description: 'Extra pytest arguments (space separated, word-split on purpose)'
+        required: false
+        default: '-v --durations=20'
+        type: string
+      transformers_spec:
+        description: 'Extra pip constraint for transformers; empty keeps the image version'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      SWR_USERNAME:
+        required: true
+      SWR_PASSWORD:
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  CI_SCRIPTS: ${{ github.workspace }}/scripts/ci
+  RESULT_JSON: /tmp/ci-result.json
+
+jobs:
+  pytest:
+    name: pytest (${{ inputs.runner_label }})
+    runs-on: ${{ inputs.runner_label }}
+
+    # ~6 GiB image pull at ~4 MiB/s is most of this on a cold runner.
+    timeout-minutes: 90
+
+    container:
+      image: ${{ inputs.image }}
+      credentials:
+        username: ${{ secrets.SWR_USERNAME }}
+        password: ${{ secrets.SWR_PASSWORD }}
+      options: --user root
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: ① Checkout
+        uses: actions/checkout@v4
+
+      # Seeded before anything can fail, so a run that dies here still reports why.
+      # verify_env.py is fatal on purpose: "NPU not mapped into the pod" and "the
+      # image is missing torch" are the two failures worth spending 20 s to catch,
+      # because every later step produces the same confusing error instead.
+      - name: ② 先行校验 + 运行时自检
+        env:
+          RUNNER_LABEL: ${{ inputs.runner_label }}
+          IMAGE: ${{ inputs.image }}
+          TEST_PATH: ${{ inputs.test_path }}
+          PYTEST_ARGS: ${{ inputs.pytest_args }}
+          TRANSFORMERS_SPEC: ${{ inputs.transformers_spec }}
+        run: |
+          set -uo pipefail
+          python3 "$CI_SCRIPTS/result.py" init --file "$RESULT_JSON" \
+            kind=pytest model_type=pytest \
+            runner_label="$RUNNER_LABEL" image="$IMAGE" \
+            test_path="$TEST_PATH" pytest_args="$PYTEST_ARGS"
+
+          # Recorded now, compared after every pip run: a replaced torch breaks the
+          # tests and would silently demote training to the CPU.
+          bash "$CI_SCRIPTS/torch_guard.sh" capture --file /tmp/torch-before.env
+
+          echo "target : ${TEST_PATH}"
+          echo "args   : ${PYTEST_ARGS}"
+          echo "spec   : ${TRANSFORMERS_SPEC:-<image default>}"
+          uname -m; nproc; free -h | head -2; df -h / | tail -1; python -V
+
+          echo "--- NPU devices ---"
+          ls /dev/davinci* >/dev/null 2>&1 \
+            || { echo "::error::no /dev/davinci*, NPUs not mapped into the pod"; exit 1; }
+          echo "davinci count: $(ls /dev/davinci* | wc -l)"
+          npu-smi info 2>/dev/null | head -15 || echo "npu-smi unavailable"
+
+          echo "--- runtime stack (fatal if the NPUs cannot compute) ---"
+          python "$CI_SCRIPTS/verify_env.py"
+
+      - name: ③ Install torchturbo
+        env:
+          TRANSFORMERS_SPEC: ${{ inputs.transformers_spec }}
+        run: |
+          set -uo pipefail
+
+          # pyproject is the single source of deps; omegaconf is the only one the
+          # image lacks. --no-build-isolation: [build-system].requires lists torch,
+          # so without it pip downloads a full torch wheel just to run setuptools.
+          ARGS=(-e ".[dev]")
+          if [ -n "${TRANSFORMERS_SPEC}" ]; then
+            ARGS+=("${TRANSFORMERS_SPEC}")
+          fi
+
+          START=$(date +%s)
+          python -m pip install --no-cache-dir --no-build-isolation "${ARGS[@]}" 2>&1 \
+            | tee /tmp/turbo.log
+          RC=${PIPESTATUS[0]}
+          ELAPSED=$(( $(date +%s) - START ))
+
+          grep -E '^(Collecting|Downloading|Using cached|Installing collected|Requirement already satisfied)' \
+            /tmp/turbo.log | sed 's/ (from .*//' || true
+
+          # The version probe is never fatal on its own; a missing module is data.
+          python - <<'PROBE' > /tmp/after.txt 2>&1 || true
+          import importlib
+          names = "torch torch_npu numpy triton fla fla_npu transformers llamafactory omegaconf pytest".split()
+          for n in names:
+              try:
+                  print(f"{n}={getattr(importlib.import_module(n), '__version__', 'unknown')}")
+              except Exception as e:
+                  print(f"{n}=MISSING({type(e).__name__})")
+          PROBE
+          cat /tmp/after.txt
+
+          if [ "$RC" -eq 0 ]; then
+            bash "$CI_SCRIPTS/torch_guard.sh" verify --file /tmp/torch-before.env || RC=1
+          fi
+
+          python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
+            --name '③ torchturbo `-e .[dev]`' --seconds "$ELAPSED" --rc "$RC"
+          echo "::notice::install took ${ELAPSED}s (rc=${RC})"
+          exit "$RC"
+
+      - name: ④ Run tests
+        env:
+          TEST_PATH: ${{ inputs.test_path }}
+          PYTEST_ARGS: ${{ inputs.pytest_args }}
+        run: |
+          set -uo pipefail
+
+          # --collect-only first: a typo in test_path then costs 10 s instead of the
+          # full install, and the collection count is the only cheap hint that a
+          # fixture import is broken rather than a test failing.
+          echo "--- collected ---"
+          python -m pytest "${TEST_PATH}" ${PYTEST_ARGS} --collect-only -q 2>&1 \
+            | tail -20 || true
+
+          echo "--- run ---"
+          START=$(date +%s)
+          set +e
+          # shellcheck disable=SC2086  # PYTEST_ARGS is meant to word-split
+          python -m pytest "${TEST_PATH}" ${PYTEST_ARGS} \
+            --junitxml=/tmp/pytest.xml 2>&1 | tee /tmp/pytest.log
+          RC=${PIPESTATUS[0]}
+          ELAPSED=$(( $(date +%s) - START ))
+
+          python3 "$CI_SCRIPTS/result.py" set --file "$RESULT_JSON" \
+            test_path="$TEST_PATH" pytest_args="$PYTEST_ARGS"
+          python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
+            --name '④ pytest' --seconds "$ELAPSED" --rc "$RC"
+          echo "::notice::pytest rc=${RC} in ${ELAPSED}s"
+          exit "$RC"
+
+      - name: ⑤ Summary
+        if: always()
+        env:
+          TEST_PATH: ${{ inputs.test_path }}
+        run: |
+          set -uo pipefail
+          python3 "$CI_SCRIPTS/result.py" report --file "$RESULT_JSON" \
+            --train-log /tmp/pytest.log \
+            --versions /tmp/after.txt \
+            --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY"
+
+          # Annotations are the only channel readable without logging in.
+          python3 "$CI_SCRIPTS/result.py" notice --file "$RESULT_JSON" \
+            --model-type "${TEST_PATH:-pytest}" || true

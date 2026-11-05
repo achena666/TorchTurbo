@@ -7,6 +7,16 @@ name: NPU Smoke (llamafactory env)
 # they are -- no command is copied in -- so what CI runs is what training runs.
 #
 # The model comes from model_map.tsv column 5 unless train_model_path overrides it.
+#
+# Two recipes, same form:
+#
+#   全量（映射表里那个 tiny 模型）   train_layers = 0, hf_repo_override 留空
+#   flash 前 6 层（一个周期）        train_layers = 6, hf_repo_override = inclusionAI/Ling-3.0-flash
+#
+# 6 层是有意义的：MTP 占 model.layers[num_hidden_layers]，裁剪之后它的 key 会落到
+# 被别人占用的层号上，load_state_dict(strict=False) 会默默留一个随机初始化的 MTP
+# 头，再乘 loss_scaling_factor=0.1 灌进 loss。所以 parallel_plan.py 在 layers>0 时
+# 强制 mtp.enabled=false。train_layers=0 才是真的下 255 GB，别拿它当冒烟。
 
 on:
   workflow_dispatch:
@@ -50,6 +60,16 @@ on:
         required: false
         default: ''
         type: string
+      hf_repo_override:
+        description: '覆盖映射表第 5 列的 hf_repo（flash 配方：inclusionAI/Ling-3.0-flash）'
+        required: false
+        default: ''
+        type: string
+      train_layers:
+        description: '只保留前 N 层，0 = 全量。flash 用 6（约一个周期）'
+        required: false
+        default: 0
+        type: number
       train_seq_len:
         description: 'cutoff_len'
         required: true
@@ -103,7 +123,7 @@ permissions:
 
 jobs:
   lf-env:
-    name: lf-env (${{ inputs.model_type }}/${{ inputs.framework }} on ${{ inputs.runner_label }})
+    name: lf-env (${{ inputs.model_type }}/${{ inputs.framework }} l${{ inputs.train_layers }} on ${{ inputs.runner_label }})
     uses: ./.github/workflows/ci-npu-sft.yml
     with:
       runner_label: ${{ inputs.runner_label }}
@@ -111,7 +131,8 @@ jobs:
       model_type: ${{ inputs.model_type }}
       framework: ${{ inputs.framework }}
       train_model_path: ${{ inputs.train_model_path }}
-      trim_layers: 0
+      hf_repo_override: ${{ inputs.hf_repo_override }}
+      trim_layers: ${{ inputs.train_layers }}
       train_seq_len: ${{ inputs.train_seq_len }}
       train_dataset: ${{ inputs.train_dataset }}
       train_finetuning_type: ${{ inputs.train_finetuning_type }}

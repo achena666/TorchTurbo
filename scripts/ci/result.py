@@ -30,6 +30,11 @@ from pathlib import Path
 
 DIAG_PREFIX = "[ttdiag]"
 
+# Two job shapes share this file. `kind` decides which summary layout is used, so a
+# pytest run never prints a table of "?" for model-cache columns it has no concept of.
+KIND_TRAIN = "train"
+KIND_PYTEST = "pytest"
+
 
 def _load(path: Path) -> dict:
     if not path.is_file():
@@ -88,8 +93,15 @@ def _grep(path: Path, needle: str, limit: int) -> str:
     return "\n".join(hits)
 
 
-def render(doc: dict, *, train_log: Path, traceback: Path, versions: Path) -> str:
-    phases = doc.get("phases", [])
+def _getter(doc: dict):
+    def get(key: str, default: str = "?") -> str:
+        value = doc.get(key, "")
+        return value if value not in ("", None) else default
+
+    return get
+
+
+def _phase_block(phases: list[dict]) -> tuple[list[str], int]:
     total = 0
     for phase in phases:
         try:
@@ -97,9 +109,19 @@ def render(doc: dict, *, train_log: Path, traceback: Path, versions: Path) -> st
         except Exception:
             pass
 
-    def get(key: str, default: str = "?") -> str:
-        value = doc.get(key, "")
-        return value if value not in ("", None) else default
+    lines = ["", "| phase | seconds | human | rc |", "|---|---|---|---|"]
+    for phase in phases:
+        lines.append(
+            f"| {phase.get('name', '?')} | `{phase.get('seconds', 'n/a')}` | "
+            f"{_fmt_seconds(phase.get('seconds'))} | `{phase.get('rc', 'n/a')}` |"
+        )
+    lines.append(f"| **total** | `{total}` | **{_fmt_seconds(total)}** | |")
+    return lines, total
+
+
+def _render_train(doc: dict, *, log: Path, traceback: Path, versions: Path) -> str:
+    get = _getter(doc)
+    phases = doc.get("phases", [])
 
     lines = [
         f"## {get('model_type')} / {get('framework')} on `{get('runner_label')}`",
@@ -115,17 +137,9 @@ def render(doc: dict, *, train_log: Path, traceback: Path, versions: Path) -> st
         f"| shards / size | {get('shards')} / {get('model_size')} |",
         f"| parallel (sp/ep) | `{get('sp')}/{get('ep')}` |",
         f"| output_dir | `{get('output_dir')}` |",
-        "",
-        "| phase | seconds | human | rc |",
-        "|---|---|---|---|",
     ]
-    for phase in phases:
-        lines.append(
-            f"| {phase.get('name', '?')} | `{phase.get('seconds', 'n/a')}` | "
-            f"{_fmt_seconds(phase.get('seconds'))} | `{phase.get('rc', 'n/a')}` |"
-        )
-    lines.append(f"| **total** | `{total}` | **{_fmt_seconds(total)}** | |")
-
+    phase_lines, _ = _phase_block(phases)
+    lines += phase_lines
     lines += [
         "",
         "### model_type → 启动脚本映射（model_type / run_dir / lf / swift / hf_repo）",
@@ -143,7 +157,7 @@ def render(doc: dict, *, train_log: Path, traceback: Path, versions: Path) -> st
         "### 训练尾部",
         "",
         "```",
-        _tail(train_log, 40) or "(no train log)",
+        _tail(log, 40) or "(no train log)",
         "```",
         "",
         "### Python 异常（excepthook 捕获，torchrun 转发会截断）",
@@ -155,22 +169,111 @@ def render(doc: dict, *, train_log: Path, traceback: Path, versions: Path) -> st
         "### loss 诊断（NaN 出在哪一层）",
         "",
         "```",
-        _grep(train_log, DIAG_PREFIX, 400) or "(none)",
+        _grep(log, DIAG_PREFIX, 400) or "(none)",
         "```",
     ]
     return "\n".join(lines) + "\n"
 
 
+def _render_pytest(doc: dict, *, log: Path, versions: Path, junit: Path) -> str:
+    get = _getter(doc)
+    phases = doc.get("phases", [])
+
+    lines = [
+        f"## pytest `{get('test_path')}` on `{get('runner_label')}`",
+        "",
+        "| item | value |",
+        "|---|---|",
+        f"| image | `{get('image')}` |",
+        f"| target | `{get('test_path')}` |",
+        f"| args | `{get('pytest_args')}` |",
+    ]
+    stats = _junit_stats(junit)
+    if stats is None:
+        lines.append("| tests | (no JUnit report) |")
+    else:
+        lines.append(
+            f"| tests | {stats['total']} total, **{stats['failed'] + stats['errors']} failed**, "
+            f"{stats['passed']} passed, {stats['skipped']} skipped |"
+        )
+    phase_lines, _ = _phase_block(phases)
+    lines += phase_lines
+    lines += [
+        "",
+        "### Versions after install",
+        "",
+        "```",
+        _tail(versions, 40) or "(probe failed)",
+        "```",
+        "",
+        "### 测试尾部",
+        "",
+        "```",
+        _tail(log, 60) or "(no pytest log)",
+        "```",
+    ]
+    if stats is not None and stats["failed_cases"]:
+        lines += ["", "### Failed cases", ""]
+        lines += [f"- `{name}`" for name in stats["failed_cases"]]
+    return "\n".join(lines) + "\n"
+
+
+def _junit_stats(path: Path) -> dict | None:
+    """Reuse the same parser the table renderer uses, so counts cannot disagree."""
+    if not path.is_file():
+        return None
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from junit_summary import parse  # noqa: PLC0415 - optional dependency
+
+        return parse(str(path))
+    except Exception:
+        return None
+
+
+def render(
+    doc: dict, *, log: Path, traceback: Path, versions: Path, junit: Path
+) -> str:
+    if doc.get("kind") == KIND_PYTEST:
+        return _render_pytest(doc, log=log, versions=versions, junit=junit)
+    return _render_train(doc, log=log, traceback=traceback, versions=versions)
+
+
+def _main_phase(doc: dict) -> dict:
+    needle = "pytest" if doc.get("kind") == KIND_PYTEST else "train"
+    found = {}
+    for phase in doc.get("phases", []):
+        if needle in (phase.get("name") or ""):
+            found = phase
+    return found
+
+
 def notice(doc: dict, model_type: str) -> str:
     """The one-line annotation that survives when the log is scrolled away.
 
-    ``train_rc`` is read from the recorded phase rather than from an environment
+    ``rc`` is read from the recorded phase rather than from an environment
     variable, so a failing job still reports the numbers that led to it.
     """
-    train = {}
-    for phase in doc.get("phases", []):
-        if "train" in (phase.get("name") or ""):
-            train = phase
+    phase = _main_phase(doc)
+    rc = phase.get("rc", "n/a")
+
+    if doc.get("kind") == KIND_PYTEST:
+        stats = _junit_stats(Path(doc.get("junit", "/tmp/pytest.xml")))
+        fields = [
+            f"target={doc.get('test_path', '?')}",
+            f"rc={rc}",
+            f"tests={stats['total'] if stats else '?'}",
+            f"failed={(stats['failed'] + stats['errors']) if stats else '?'}",
+            f"t={phase.get('seconds', 'n/a')}s",
+        ]
+        lines = [f"::notice title=pytest {model_type}::{' '.join(fields)}"]
+        if str(rc) not in ("0", "None", ""):
+            lines.append(
+                f"::error title=pytest failed::rc={rc}; "
+                "see the failed cases in the job summary"
+            )
+        return "\n".join(lines)
+
     fields = [
         f"sfs={doc.get('sfs_uuid', '?')}",
         f"cache_hit={doc.get('cache_hit', '?')}",
@@ -178,13 +281,13 @@ def notice(doc: dict, model_type: str) -> str:
         f"size={doc.get('model_size', '?')}",
         f"layers={doc.get('layers', '?')}",
         f"sp_ep={doc.get('sp', '?')}/{doc.get('ep', '?')}",
-        f"train_s={train.get('seconds', 'n/a')}",
-        f"train_rc={train.get('rc', 'n/a')}",
+        f"train_s={phase.get('seconds', 'n/a')}",
+        f"train_rc={rc}",
     ]
     lines = [f"::notice title=smoke {model_type}::{' '.join(fields)}"]
-    if str(train.get("rc")) not in ("0", "None", ""):
+    if str(rc) not in ("0", "None", ""):
         lines.append(
-            f"::error title=train failed::rc={train.get('rc')}; "
+            f"::error title=train failed::rc={rc}; "
             "see the train tail in the job summary"
         )
     return "\n".join(lines)
@@ -200,9 +303,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--name", default="")
     parser.add_argument("--seconds", default="")
     parser.add_argument("--rc", default="")
-    parser.add_argument("--train-log", default="/tmp/train.log")
+    parser.add_argument("--train-log", default="/tmp/train.log",
+                        help="主日志：训练用 train.log，pytest 用 pytest.log")
     parser.add_argument("--traceback", default="/tmp/tt_traceback.log")
     parser.add_argument("--versions", default="/tmp/after.txt")
+    parser.add_argument("--junit", default="/tmp/pytest.xml")
     parser.add_argument("--map", default=".github/workflows/model_map.tsv")
     parser.add_argument("values", nargs="*")
     args = parser.parse_args(argv)
@@ -252,9 +357,10 @@ def main(argv: list[str]) -> int:
     sys.stdout.write(
         render(
             doc,
-            train_log=Path(args.train_log),
+            log=Path(args.train_log),
             traceback=Path(args.traceback),
             versions=Path(args.versions),
+            junit=Path(args.junit),
         )
     )
     return 0

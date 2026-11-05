@@ -235,6 +235,29 @@ jobs:
           printf 'run_dir=%s\ninstall_script=%s\ntrain_script=%s\nhf_repo=%s\n' \
             "$RUN_DIR" "$INSTALL" "$TRAIN" "$REPO" >> "$GITHUB_OUTPUT"
 
+      # Catching a missing NPU here costs 20 s; catching it after two installs costs
+      # the whole timeout, and the resulting error looks like a training bug.
+      # verify_env.py runs a real matmul on every card, which is the only check that
+      # tells "no device" apart from "device present, stack broken".
+      - name: ②b NPU / 栈自检
+        run: |
+          set -uo pipefail
+
+          # Recorded before any pip runs; ③ and ④ both compare against it.
+          bash "$CI_SCRIPTS/torch_guard.sh" capture --file /tmp/torch-before.env
+
+          ls /dev/davinci* >/dev/null 2>&1 \
+            || { echo "::error::no /dev/davinci*, NPUs not mapped into the pod"; exit 1; }
+          echo "davinci count: $(ls /dev/davinci* | wc -l)"
+
+          START=$(date +%s)
+          set +e
+          python "$CI_SCRIPTS/verify_env.py"
+          RC=$?
+          python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
+            --name '②b NPU 自检' --seconds "$(( $(date +%s) - START ))" --rc "$RC"
+          exit "$RC"
+
       - name: ③ Install torchturbo
         id: torchturbo
         run: |
@@ -254,6 +277,12 @@ jobs:
 
           grep -E '^(Collecting|Downloading|Using cached|Installing collected|Requirement already satisfied)' \
             /tmp/turbo.log | sed 's/ (from .*//' || true
+
+          # pip resolves torch from the index whenever something asks for a newer
+          # one; the self-built NPU wheel then loses to the PyPI copy.
+          if [ "$RC" -eq 0 ]; then
+            bash "$CI_SCRIPTS/torch_guard.sh" verify --file /tmp/torch-before.env || RC=1
+          fi
 
           python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
             --name '③ torchturbo `-e .[dev]`' --seconds "$ELAPSED" --rc "$RC"
@@ -285,6 +314,13 @@ jobs:
                   print(f"{n}=MISSING({type(e).__name__})")
           PROBE
           cat /tmp/after.txt
+
+          # The repo's install script is the other place torch can be swapped:
+          # it pip-installs fla-npu / triton-ascend, which have torch in their
+          # metadata. Same failure, same silence.
+          if [ "$RC" -eq 0 ]; then
+            bash "$CI_SCRIPTS/torch_guard.sh" verify --file /tmp/torch-before.env || RC=1
+          fi
 
           python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
             --name "④ \`$INSTALL_SCRIPT\`" --seconds "$ELAPSED" --rc "$RC"
