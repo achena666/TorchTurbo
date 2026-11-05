@@ -1,0 +1,315 @@
+name: pytest
+
+# CPU 与 NPU 两条泳道的唯一实现，同时也是**手动入口**。差别只在「在哪跑」，不在「跑什么」：
+#   container 任务：NPU pod / 自托管池，镜像里已经装好整套栈
+#   hosted 任务：GH 托管 arm64，裸机 pip install
+# 两者都调用 scripts/ci/pytest.sh —— 分片、marker 过滤、junit、汇总只写一份。
+#
+# 两种触发：
+#   workflow_call      被 ci-gate-pr / ci-full 调用（默认值都是「CI 想耍的」）
+#   workflow_dispatch  手动点名跑一个路径 / node id（默认值换成为「排查」方便的）
+# 拆成两个文件时这两个默认值会互相打架，所以合成一个：dispatch 的默认只影响
+# 手动跑，调用方永远显式传值。
+#
+# mode 只控制 marker：
+#   cpu -> -m "not npu"
+#   npu -> -m npu
+# 没装 torch_npu 时 tests/conftest.py 会直接不收集那些文件（marker 过滤发生在
+# 收集之后，光靠 -m 挡不住 import 期就崩的文件）。
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: 'cpu 或 npu；只影响 marker 过滤'
+        required: false
+        default: 'cpu'
+        type: string
+      runner_label:
+        description: 'Runner 标签；尾缀数字是卡数'
+        required: true
+        type: string
+      use_container:
+        description: 'true = 用镜像（NPU 必开）；false = 裸机 pip'
+        required: false
+        default: true
+        type: boolean
+      image:
+        description: 'use_container=true 时必填'
+        required: false
+        default: ''
+        type: string
+      test_files:
+        description: 'JSON 数组；空 = 全量'
+        required: false
+        default: '[]'
+        type: string
+      test_path:
+        description: '单个 path / node id；非空则忽略 test_files 与 shard（手动排查用）'
+        required: false
+        default: ''
+        type: string
+      shard:
+        description: '"0/3" 形式；空 = 不切'
+        required: false
+        default: ''
+        type: string
+      pytest_args:
+        description: '额外 pytest 参数（按空格拆是有意的）'
+        required: false
+        default: '-v --durations=20'
+        type: string
+      transformers_spec:
+        description: '额外的 transformers 约束；空则用镜像里的版本'
+        required: false
+        default: ''
+        type: string
+      timeout_minutes:
+        description: 'job 硬上限，只拦卡死'
+        required: false
+        default: 60
+        type: number
+    secrets:
+      SWR_USERNAME:
+        required: false
+      SWR_PASSWORD:
+        required: false
+
+  # 手动入口。不写 test_files / shard：手动跑的意义就是「点名一个路径」或者
+  # 「全跑一遍」，不是重现某次分片。
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '跑哪一类：npu 需要真实卡，cpu 是纯 python 逻辑'
+        required: true
+        default: 'npu'
+        type: choice
+        options:
+          - npu
+          - cpu
+      test_path:
+        description: 'pytest 目标：目录 / 文件 / node id；留空 = 全部'
+        required: false
+        default: 'tests/ops/npu'
+        type: string
+      runner_label:
+        description: 'Runner 标签（尾缀数字是卡数）'
+        required: true
+        default: 'linux-aarch64-a3-800i-2'
+        type: choice
+        options:
+          - linux-aarch64-a3-800i-2
+          - linux-aarch64-a3-800i-4
+          - linux-aarch64-a3-800i-8
+          - linux-aarch64-a3-800i-16
+      image:
+        description: 'L1 基础镜像；用 repo@sha256:... 可严格复现'
+        required: true
+        default: 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest'
+        type: string
+      use_container:
+        description: 'true = 用镜像（NPU 必开）；false = 裸机 pip'
+        required: true
+        default: true
+        type: boolean
+      pytest_args:
+        description: '额外 pytest 参数（按空格拆）'
+        required: false
+        default: '-v --durations=20'
+        type: string
+      transformers_spec:
+        description: '额外的 transformers 约束；留空则用镜像里的版本'
+        required: false
+        default: ''
+        type: string
+      timeout_minutes:
+        description: 'job 硬上限（手动跑给宽一点）'
+        required: false
+        default: 90
+        type: number
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  CI_SCRIPTS: ${{ github.workspace }}/scripts/ci
+  RESULT_JSON: /tmp/ci-result.json
+
+jobs:
+  # ---------------------------------------------------------------- 容器内
+  container:
+    name: pytest-${{ inputs.mode }}（容器 · ${{ inputs.runner_label }}）
+    if: ${{ inputs.use_container }}
+    runs-on: ${{ inputs.runner_label }}
+    # `|| 60` 是兜底：见 ci-train.yml 里同一处注释。
+    timeout-minutes: ${{ inputs.timeout_minutes || 60 }}
+    # NPU 池不可共享，按池名串行。写在 job 级而不是 workflow 级，是为了让
+    # 调用路径与手动路径排同一个队 —— 旧版两个入口各用自己的组，手动跑会和
+    # PR 的 L2a 同时抢同一个 pod。cancel-in-progress 必须为 false：这里要的是
+    # 排队，而不是把正在跑的 job 砍掉。
+    concurrency:
+      group: ci-pytest-${{ inputs.runner_label }}
+      cancel-in-progress: false
+
+    container:
+      image: ${{ inputs.image }}
+      credentials:
+        username: ${{ secrets.SWR_USERNAME }}
+        password: ${{ secrets.SWR_PASSWORD }}
+      options: --user root
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: ① 检出
+        uses: actions/checkout@v4
+
+      # 结果文件在任何可能失败的步骤之前就建好，这样「② 就挂了」的 run 也有摘要。
+      - name: ② 先行校验
+        env:
+          MODE: ${{ inputs.mode }}
+          RUNNER_LABEL: ${{ inputs.runner_label }}
+          IMAGE: ${{ inputs.image }}
+          TEST_FILES: ${{ inputs.test_files }}
+        run: |
+          set -uo pipefail
+          python3 "$CI_SCRIPTS/result.py" init --file "$RESULT_JSON" \
+            kind=pytest model_type="pytest-$MODE" mode="$MODE" \
+            runner_label="$RUNNER_LABEL" image="$IMAGE"
+
+          # 装上之前先记一份 torch，装完比对：被换掉的 torch 会让测试全红，
+          # 而且看起来像代码 bug。
+          python3 "$CI_SCRIPTS/env.py" capture --file /tmp/torch-before.json || true
+
+          uname -m; nproc; free -h | head -2; df -h / | tail -1; python -V
+          echo "files: ${TEST_FILES}"
+
+      - name: ②b NPU 自检（仅 npu 泳道）
+        if: ${{ inputs.mode == 'npu' }}
+        run: |
+          set -uo pipefail
+          ls /dev/davinci* >/dev/null 2>&1 \
+            || { echo "::error::no /dev/davinci*, NPUs not mapped into the pod"; exit 1; }
+          echo "davinci count: $(ls /dev/davinci* | wc -l)"
+          npu-smi info 2>/dev/null | head -12 || true
+          START=$(date +%s); set +e
+          python3 "$CI_SCRIPTS/env.py" verify
+          RC=$?
+          python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
+            --name '②b NPU 自检' --seconds "$(( $(date +%s) - START ))" --rc "$RC"
+          exit "$RC"
+
+      - name: ③ 安装 torchturbo
+        env:
+          TRANSFORMERS_SPEC: ${{ inputs.transformers_spec }}
+        run: |
+          set -uo pipefail
+          ARGS=(-e ".[dev]")
+          [ -n "${TRANSFORMERS_SPEC}" ] && ARGS+=("${TRANSFORMERS_SPEC}")
+          START=$(date +%s)
+          # --no-build-isolation：[build-system].requires 里有 torch，
+          # 不开这个 pip 会为了跑 setuptools 再下一个完整 torch。
+          python -m pip install --no-cache-dir --no-build-isolation "${ARGS[@]}" 2>&1 \
+            | tee /tmp/turbo.log
+          RC=${PIPESTATUS[0]}
+          ELAPSED=$(( $(date +%s) - START ))
+          [ "$RC" -eq 0 ] && { python3 "$CI_SCRIPTS/env.py" check --file /tmp/torch-before.json || RC=1; }
+          python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
+            --name '③ torchturbo 安装' --seconds "$ELAPSED" --rc "$RC"
+          exit "$RC"
+
+      - name: ④ pytest
+        env:
+          MODE: ${{ inputs.mode }}
+          TEST_FILES: ${{ inputs.test_files }}
+          TEST_PATH: ${{ inputs.test_path }}
+          SHARD: ${{ inputs.shard }}
+          PYTEST_ARGS: ${{ inputs.pytest_args }}
+        run: bash "$CI_SCRIPTS/pytest.sh"
+
+      - name: ⑤ 摘要
+        if: always()
+        run: |
+          set -uo pipefail
+          python3 "$CI_SCRIPTS/result.py" report --file "$RESULT_JSON" \
+            --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
+          python3 "$CI_SCRIPTS/result.py" notice --file "$RESULT_JSON" \
+            --model-type "pytest-${{ inputs.mode }}" || true
+
+  # ---------------------------------------------------------------- 裸机
+  hosted:
+    name: pytest-${{ inputs.mode }}（裸机 · ${{ inputs.runner_label }}）
+    if: ${{ !inputs.use_container }}
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: ${{ inputs.timeout_minutes || 60 }}
+    # 容器与裸机共用同一个组名：同一个 runner 池上只能有一个 pytest 在跑，
+    # 与「在哪跑」无关。
+    concurrency:
+      group: ci-pytest-${{ inputs.runner_label }}
+      cancel-in-progress: false
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: ① 检出
+        uses: actions/checkout@v4
+
+      - name: ② 准备 python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: ③ 安装 torchturbo
+        env:
+          TRANSFORMERS_SPEC: ${{ inputs.transformers_spec }}
+        run: |
+          set -uo pipefail
+          python3 "$CI_SCRIPTS/result.py" init --file "$RESULT_JSON" \
+            kind=pytest model_type="pytest-${{ inputs.mode }}" \
+            mode='${{ inputs.mode }}' runner_label='${{ inputs.runner_label }}'
+
+          START=$(date +%s)
+          # 这里刻意不用 `-e ".[dev]"`：pyproject 里钉的是 NPU 镜像里那套
+          # (torch>=2.10.0)，而 GH 托管机只能从 PyPI 拿 arm64 CPU wheel。
+          # 钉死了装不上，放开了又和镜像不一致 —— 所以裸机泳道只保证
+          # 「纯 python 逻辑能跑」，精度相关的验证交给容器泳道。
+          python -m pip install torch numpy omegaconf PyYAML safetensors pytest 2>&1 \
+            | tee /tmp/turbo.log
+          RC=${PIPESTATUS[0]}
+          [ -n "${TRANSFORMERS_SPEC}" ] && python -m pip install "${TRANSFORMERS_SPEC}" 2>&1 | tee -a /tmp/turbo.log
+          # --no-deps：依赖已经在上面按可用版本装好了。
+          # --no-build-isolation：否则 pip 会为了跑 setuptools 再下一个完整 torch。
+          if [ "$RC" -eq 0 ]; then
+            python -m pip install --no-deps --no-build-isolation -e . 2>&1 | tee -a /tmp/turbo.log
+            RC=${PIPESTATUS[0]}
+          fi
+
+          python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
+            --name '③ torchturbo 安装' --seconds "$(( $(date +%s) - START ))" --rc "$RC"
+          exit "$RC"
+
+      - name: ④ pytest
+        env:
+          MODE: ${{ inputs.mode }}
+          TEST_FILES: ${{ inputs.test_files }}
+          TEST_PATH: ${{ inputs.test_path }}
+          SHARD: ${{ inputs.shard }}
+          PYTEST_ARGS: ${{ inputs.pytest_args }}
+        run: bash "$CI_SCRIPTS/pytest.sh"
+
+      - name: ⑤ 摘要
+        if: always()
+        run: |
+          set -uo pipefail
+          python3 "$CI_SCRIPTS/result.py" report --file "$RESULT_JSON" \
+            --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
+          python3 "$CI_SCRIPTS/result.py" notice --file "$RESULT_JSON" \
+            --model-type "pytest-${{ inputs.mode }}" || true

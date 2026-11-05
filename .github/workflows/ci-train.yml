@@ -1,0 +1,333 @@
+name: 训练
+
+# 「装一套真实的训练栈，然后跑一步」的唯一实现，同时也是**手动入口**。
+# 调用方只描述自己的模型差异（下哪个仓库、留几层、用哪个数据集），
+# 其余全部在 scripts/ci，修一处对所有调用方生效：
+#
+#   train.sh      编排：prepare / probe / install / run / report
+#   model.py      取模型：probe / find / mark / fetch / trim
+#   env.py        环境：verify / capture / check / cleanup
+#   parallel_plan.py     卡数 -> sp/ep               （仓库 yaml 按满卡写）
+#   train_supervisor.sh  看门狗 + 进程组清理         （tee 卡死、step 被取消）
+#   diag/sitecustomize.py 异常捕获与 NaN 探针
+#   result.py            事实 -> 摘要 markdown      （失败的 run 也要有报告）
+#
+# 两种触发：
+#   workflow_call      被 ci-gate-pr / ci-full 调用：45 min 硬上限，超时即跳过
+#   workflow_dispatch  手动跑：300 min 上限，超时必须当失败（全量权重要下 255 GB）
+# 拆成两个文件时这两套默认值会互相打架（手动跑被 45 min 截断 / PR 被 300 min
+# 拖死），所以合成一个：dispatch 的默认只影响手动跑，调用方永远显式传值。
+#
+# 时间预算：不追求极限，只要求「不失控」。step 硬超时给到实测值的 3~4 倍 ——
+# 超时的职责是拦住卡死，不是卡住正常但较慢的运行。
+
+on:
+  workflow_call:
+    inputs:
+      runner_label:
+        description: 'Runner 标签；尾缀数字是卡数'
+        required: true
+        type: string
+      image:
+        description: 'L1 基础镜像；用 repo@sha256:... 可严格复现'
+        required: true
+        type: string
+      model_type:
+        description: '@register_model 的名字，model_map.tsv 的键'
+        required: true
+        type: string
+      framework:
+        description: 'lf 或 swift'
+        required: true
+        type: string
+      train_model_path:
+        description: '显式模型目录；留空则按 hf_repo 查找'
+        required: false
+        default: ''
+        type: string
+      hf_repo_override:
+        description: '覆盖 model_map.tsv 第 5 列的 hf_repo'
+        required: false
+        default: ''
+        type: string
+      trim_layers:
+        description: '只保留前 N 层；0 = 全量下载'
+        required: false
+        default: 0
+        type: number
+      train_seq_len:
+        required: false
+        default: '1024'
+        type: string
+      train_dataset:
+        required: false
+        default: 'gsm8k'
+        type: string
+      train_finetuning_type:
+        required: false
+        default: 'full'
+        type: string
+      train_sp_size:
+        description: 'auto = 按卡数收敛仓库里的值'
+        required: false
+        default: 'auto'
+        type: string
+      train_ep_size:
+        required: false
+        default: 'auto'
+        type: string
+      diag:
+        description: '把 scripts/ci/diag 装进 PYTHONPATH'
+        required: false
+        default: true
+        type: boolean
+      strict:
+        description: 'true = 模型获取超时判红；false = 跳过并判绿（PR 默认）'
+        required: false
+        default: false
+        type: boolean
+      timeout_minutes:
+        description: 'job 硬上限'
+        required: false
+        default: 45
+        type: number
+      train_timeout_minutes:
+        description: '单步训练的硬上限（实测 163 s，默认 10 min 只拦卡死）'
+        required: false
+        default: 10
+        type: number
+      fetch_timeout_seconds:
+        description: '模型获取硬超时；超时即跳过'
+        required: false
+        default: 600
+        type: number
+    secrets:
+      SWR_USERNAME:
+        required: true
+      SWR_PASSWORD:
+        required: true
+    outputs:
+      skip_reason:
+        description: '非空表示这次没真的训练（超时/跳过），gate 据此判 skipped-reason'
+        value: ${{ jobs.sft.outputs.skip_reason }}
+
+  # 手动入口。默认值换成为「排查 / 跑全量」方便的那一套：超时给满、
+  # 模型获取超时当失败（strict），并允许直接覆盖 hf_repo 与数据集。
+  workflow_dispatch:
+    inputs:
+      model_type:
+        description: '模型：@register_model 的名字，映射表见 .github/workflows/model_map.tsv'
+        required: true
+        default: 'bailing_hybrid'
+        type: choice
+        options:
+          - bailing_hybrid
+          - qwen3_5
+          - qwen3_5_moe
+          - qwen3_5_moe_text
+          - qwen4_exp
+      framework:
+        description: '训练框架；决定用 lf_* 还是 swift_* 启动脚本'
+        required: true
+        default: 'lf'
+        type: choice
+        options:
+          - lf
+          - swift
+      runner_label:
+        description: 'Runner 标签（尾缀数字是卡数）'
+        required: true
+        default: 'linux-aarch64-a3-800i-2'
+        type: choice
+        options:
+          - linux-aarch64-a3-800i-2
+          - linux-aarch64-a3-800i-4
+          - linux-aarch64-a3-800i-8
+          - linux-aarch64-a3-800i-16
+      image:
+        description: 'L1 基础镜像；用 repo@sha256:... 可严格复现'
+        required: true
+        default: 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest'
+        type: string
+      train_model_path:
+        description: '显式模型目录；留空则按映射表第 5 列的 hf_repo 找 / 下载'
+        required: false
+        default: ''
+        type: string
+      hf_repo_override:
+        description: '覆盖映射表第 5 列的 hf_repo（flash 配方：inclusionAI/Ling-3.0-flash）'
+        required: false
+        default: ''
+        type: string
+      trim_layers:
+        description: '只保留前 N 层，0 = 全量。flash 用 6（约一个周期）'
+        required: false
+        default: 0
+        type: number
+      train_dataset:
+        description: '数据集名（必须是 dataset/dataset_info.json 里的 key）'
+        required: false
+        default: 'gsm8k'
+        type: string
+      train_seq_len:
+        description: 'cutoff_len'
+        required: false
+        default: '1024'
+        type: string
+      train_finetuning_type:
+        description: '微调方式'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - lora
+      train_sp_size:
+        description: '序列并行度；“auto” = 按卡数收敛（不整除则减半）'
+        required: false
+        default: 'auto'
+        type: string
+      train_ep_size:
+        description: '专家并行度；“auto” = min(yaml 值, 卡数/sp)'
+        required: false
+        default: 'auto'
+        type: string
+      diag:
+        description: '装 scripts/ci/diag（异常捕获 + NaN 定位）'
+        required: false
+        default: true
+        type: boolean
+      strict:
+        description: 'true = 模型获取超时判红（手动跑建议开）'
+        required: false
+        default: true
+        type: boolean
+      # 下面三个只有手动跑才需要露出来。调用方永远显式传，所以调用走不到这里；
+      # 但它们必须在 dispatch 里声明 —— 否则按 dispatch 触发时 inputs 里根本没有
+      # 这三个键，job 的 timeout-minutes 会拿到空值而校验失败。
+      timeout_minutes:
+        description: 'job 硬上限（手动跑给满：全量权重要下 255 GB）'
+        required: false
+        default: 300
+        type: number
+      train_timeout_minutes:
+        description: '单步训练的硬上限'
+        required: false
+        default: 240
+        type: number
+      fetch_timeout_seconds:
+        description: '模型获取硬超时；超时即跳过（strict=true 时判红）'
+        required: false
+        default: 7200
+        type: number
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  # pod 内能到 hf-mirror，huggingface.co 返回 503。
+  HF_ENDPOINT: 'https://hf-mirror.com'
+  HF_HOME: '/root/.cache/huggingface'
+  # HF_HOME 在共享 SFS 上，但 trust_remote_code 的副本不能放那儿：
+  # 多个 pod 同时写同一目录会留下半个 .py，而 transformers 只查 exists()。
+  HF_MODULES_CACHE: '/tmp/hf-modules'
+  # 默认 10 s，繁忙镜像会超；下载超时是「每次读」的超时，卡住就抛且不重试。
+  HF_HUB_ETAG_TIMEOUT: '30'
+  HF_HUB_DOWNLOAD_TIMEOUT: '120'
+  # hf_xet 会去 cas-server.xethub.hf.co，HF_ENDPOINT 不代理它，
+  # 且会把跨境的短暂读失败当成永久的大小不符。
+  HF_HUB_DISABLE_XET: '1'
+  CI_SCRIPTS: ${{ github.workspace }}/scripts/ci
+  RESULT_JSON: /tmp/ci-result.json
+
+jobs:
+  sft:
+    name: 训练（${{ inputs.model_type }}/${{ inputs.framework }} · ${{ inputs.runner_label }}）
+    runs-on: ${{ inputs.runner_label }}
+    # `|| 45` 是兜底：万一以后有人用 dispatch 触发却没在 dispatch inputs 里声明
+    # timeout_minutes，空值会让 job 直接校验失败；空字符串在表达式里是 falsy。
+    timeout-minutes: ${{ inputs.timeout_minutes || 45 }}
+    # NPU 池不可共享，按池名串行。写在 job 级而不是 workflow 级，是为了让
+    # 调用路径与手动路径排同一个队 —— 旧版两个入口各用自己的组，手动跑会和
+    # PR 的 E2E 同时抢同一个 pod。cancel-in-progress 必须为 false：要的是排队。
+    concurrency:
+      group: ci-train-${{ inputs.runner_label }}
+      cancel-in-progress: false
+    outputs:
+      skip_reason: ${{ steps.run.outputs.skip_reason }}
+
+    container:
+      image: ${{ inputs.image }}
+      credentials:
+        username: ${{ secrets.SWR_USERNAME }}
+        password: ${{ secrets.SWR_PASSWORD }}
+      options: --user root
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ② 在所有可能失败的步骤之前建好结果文件：② 就挂掉的 run 也要能出摘要。
+      - name: ② 校验映射表 + 定位启动脚本
+        id: resolve
+        env:
+          MODEL_TYPE: ${{ inputs.model_type }}
+          FRAMEWORK: ${{ inputs.framework }}
+          RUNNER_LABEL: ${{ inputs.runner_label }}
+          IMAGE: ${{ inputs.image }}
+          LAYERS: ${{ inputs.trim_layers }}
+          DATASET: ${{ inputs.train_dataset }}
+        run: bash "$CI_SCRIPTS/train.sh" prepare
+
+      # 花 20 s 发现「没有 NPU」，比装完两套依赖再发现省一整轮超时。
+      - name: ②b NPU / 栈自检
+        run: bash "$CI_SCRIPTS/train.sh" probe
+
+      # 两个安装点在踩同一个坑：pip 解依赖时会用 PyPI 的 torch 覆盖自建的
+      # NPU wheel，过程一声不响。所以每次装完都回头验一遍 torch 的来源。
+      - name: ③ 安装 torchturbo + 模型依赖
+        id: deps
+        env:
+          INSTALL_SCRIPT: ${{ steps.resolve.outputs.install_script }}
+        run: bash "$CI_SCRIPTS/train.sh" install
+
+      - name: ⑤ 训练（${{ inputs.model_type }} / ${{ inputs.framework }}）
+        id: run
+        timeout-minutes: ${{ inputs.train_timeout_minutes || 10 }}
+        env:
+          MODEL_HINT: ${{ inputs.train_model_path }}
+          REPO_MAP: ${{ steps.resolve.outputs.hf_repo }}
+          REPO_IN: ${{ inputs.hf_repo_override }}
+          SP_IN: ${{ inputs.train_sp_size }}
+          EP_IN: ${{ inputs.train_ep_size }}
+          SEQ_LEN: ${{ inputs.train_seq_len }}
+          FINETUNING_TYPE: ${{ inputs.train_finetuning_type }}
+          RUNNER_LABEL: ${{ inputs.runner_label }}
+          MODEL_TYPE: ${{ inputs.model_type }}
+          TRAIN_SCRIPT: ${{ steps.resolve.outputs.train_script }}
+          DATASET_IN: ${{ inputs.train_dataset }}
+          LAYERS: ${{ inputs.trim_layers }}
+          DIAG: ${{ inputs.diag }}
+          FETCH_TIMEOUT: ${{ inputs.fetch_timeout_seconds || 600 }}
+          STRICT: ${{ inputs.strict }}
+        run: bash "$CI_SCRIPTS/train.sh" run
+
+      # 摘要放在收尾之前：收尾会清掉 /tmp 里的派生配置和半个 checkpoint。
+      - name: ⑥ 摘要
+        if: always()
+        env:
+          MODEL_TYPE: ${{ inputs.model_type }}
+        run: bash "$CI_SCRIPTS/train.sh" report
+
+      # timeout-minutes 只杀进程，不负责收尾。被杀的训练会留下占卡的子进程、
+      # 没释放的显存和半个 checkpoint，下个 job 会以完全无关的方式失败。
+      # 必须是最后一步且 if: always()：取消、超时、成功都要跑。
+      - name: ⑦ 收尾
+        if: always()
+        continue-on-error: true
+        run: python3 "$CI_SCRIPTS/env.py" cleanup

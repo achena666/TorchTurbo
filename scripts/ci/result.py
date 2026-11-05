@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 DIAG_PREFIX = "[ttdiag]"
@@ -219,16 +220,35 @@ def _render_pytest(doc: dict, *, log: Path, versions: Path, junit: Path) -> str:
 
 
 def _junit_stats(path: Path) -> dict | None:
-    """Reuse the same parser the table renderer uses, so counts cannot disagree."""
+    """JUnit 统计。缺文件或解析失败都返回 None —— 汇总是报告步骤，
+    永远不能反过来掩盖真实的测试结果。"""
     if not path.is_file():
         return None
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from junit_summary import parse  # noqa: PLC0415 - optional dependency
-
-        return parse(str(path))
-    except Exception:
+        root = ET.parse(str(path)).getroot()
+    except (ET.ParseError, OSError):
         return None
+
+    suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+    total = sum(int(s.get("tests", 0)) for s in suites)
+    failed = sum(int(s.get("failures", 0)) for s in suites)
+    errors = sum(int(s.get("errors", 0)) for s in suites)
+    skipped = sum(int(s.get("skipped", 0)) for s in suites)
+    names = [
+        f"{case.get('classname', '')}::{case.get('name', '')}"
+        for suite in suites
+        for case in suite.iter("testcase")
+        if case.find("failure") is not None or case.find("error") is not None
+    ]
+    return {
+        "total": total,
+        "passed": total - failed - errors - skipped,
+        "failed": failed,
+        "errors": errors,
+        "skipped": skipped,
+        "seconds": sum(float(s.get("time", 0) or 0) for s in suites),
+        "failed_cases": names,
+    }
 
 
 def render(
@@ -296,9 +316,10 @@ def notice(doc: dict, model_type: str) -> str:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
-        "command", choices=["init", "set", "phase", "report", "notice", "migrate-map"]
+        "command",
+        choices=["init", "set", "phase", "report", "notice", "migrate-map", "junit"],
     )
-    parser.add_argument("--file", required=True)
+    parser.add_argument("--file", default="", help="事实文件；除 junit 外都必填")
     parser.add_argument("--model-type", default="")
     parser.add_argument("--name", default="")
     parser.add_argument("--seconds", default="")
@@ -314,9 +335,22 @@ def main(argv: list[str]) -> int:
 
     path = Path(args.file)
 
-    if args.command == "init":
-        _save(path, _pairs(args.values))
+    if args.command == "junit":
+        # 在日志里留一行可 grep 的计数。缺文件不是错误：测试可能根本没跑到。
+        stats = _junit_stats(Path(args.junit))
+        if stats is None:
+            print(f"junit: 没有可读的报告（{args.junit}）")
+            return 0
+        print(
+            "junit: total={total} passed={passed} failed={failed} "
+            "errors={errors} skipped={skipped} {seconds:.1f}s".format(**stats)
+        )
+        for name in stats["failed_cases"][:20]:
+            print(f"  failed: {name}")
         return 0
+
+    if not args.file:
+        parser.error(f"{args.command} 需要 --file")
 
     if args.command == "set":
         doc = _load(path)
@@ -334,6 +368,10 @@ def main(argv: list[str]) -> int:
 
     if args.command == "notice":
         print(notice(_load(path), args.model_type or str(_load(path).get("model_type", "?"))))
+        return 0
+
+    if args.command == "init":
+        _save(path, _pairs(args.values))
         return 0
 
     if args.command == "migrate-map":

@@ -50,3 +50,7 @@ logs/
 # OS generated files
 **/.DS_Store
 Thumbs.db
+
+# 本地留的 workflow 备份（含空格，是整目录 copy 出来的）。
+# 单独写一条而不是 *.bak：它是目录，且名字里有空格，用通配符容易漏。
+.github/workflows copy/

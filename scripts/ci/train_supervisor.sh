@@ -20,7 +20,7 @@
 # keep holding the NPUs until the pod is recycled. The EXIT/INT/TERM trap tears the
 # group down on every path.
 #
-# Output convention matches model_cache.sh: logs on stderr, `KEY=value` to --output.
+# Output convention matches model.py: logs on stderr, `KEY=value` to --output.
 
 set -uo pipefail
 
