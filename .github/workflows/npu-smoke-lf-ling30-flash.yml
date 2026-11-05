@@ -560,14 +560,16 @@ jobs:
           # native 都写完之后才炸在 `_save_checkpoint` 里：
           #   if not self.args.save_only_model:
           #       self._save_optimizer_and_scheduler(...)      # trainer.py:3068
-          # AdamW 的 exp_avg/exp_avg_sq 是 fp32 的 2 × 4 × 7.9B ≈ 63 GB，/tmp 与 /
-          # 是同一个 50 GB overlay，装不下。
+          # /tmp 与 / 是同一个 50 GB overlay，装不下「原生 checkpoint + HF 导出」两份。
           #
-          # 这里把 _save_checkpoint 整个改成 no-op。裁到 6 层后模型是 26.7 GB
-          # （13.35 B 参数，按 safetensors header 实测），而流程会写两份：
-          # 训练结束时的 checkpoint-187/huggingface 和 run_sft 里随后的
-          # trainer.save_model()，内容完全相同，两份就是 53 GB，超了 50 GB。
-          # 关掉前者，只留后者，落盘降到 ~27 GB。
+          # 这里把 _save_checkpoint 整个改成 no-op，只留 run_sft 里随后的
+          # trainer.save_model()。6 层的实测值：
+          #   · 单份 HF 导出 9 个 shard，是 13.4 B 参数的 bf16，du 报 25 GiB
+          #   · 流程本来会写两份完全相同的（checkpoint-187/huggingface 和随后的
+          #     save_model），25 GiB × 2 = 50 GiB 正好压满 overlay —— 这就是上面那次崩
+          #   · 关掉前者后 $OUT 只剩一份，实测 overlay 用 27/50 G
+          # 别把「下载体积」当作模型体积：3 个 shard 一共 31.77 GB，是因为 shard 按整块
+          # 下载，文件里混着 >= layers 的张量用不上；模型本身只有 13.4 B 参数。
           #
           # inject 点选在 _save_checkpoint 而不是 __init__，就不会触发 trainer 初始化
           # 时对 load_best_model_at_end / FSDP SHARDED_STATE_DICT 的那些兼容性检查。
@@ -601,7 +603,7 @@ jobs:
               pass
 
 
-          def _install(module):
+          def _install_skip_ckpt(module):
               """中间 checkpoint 全跳过，只留最终 trainer.save_model() 的一份 HF 权重。"""
               # 取刚执行完的模块对象本身：此刻父包 __init__ 还没跑完，
               # `from transformers import Trainer` 可能拿不到属性。
@@ -625,9 +627,204 @@ jobs:
               print("[ttcatch] checkpoint patch on: final HF export only", flush=True)
 
 
+          # --- loss 诊断 ------------------------------------------------------
+          # 4k 那一轮第一步就 `Non-finite loss`，但 assert_finite 在第一次 log()
+          # 之前就抛，日志里一个数字都没有，只能看到结论看不到输入。这里在
+          # chunk_loss 的入口（也就是主干输出）和 assert_finite 两处打点，一次
+          # 就能分清是「主干已经坏了」还是「CE/分母坏了」。
+          #
+          # 只看前几次调用：每个 .item() 都会同步设备，调用多了会拖慢训练。
+          _DIAG_LIMIT = int(os.environ.get("TT_DIAG_CALLS", "2"))
+
+
+          def _to_local(tensor):
+              """DTensor 只取本 rank 那份，和 distributed.assert_finite 一致。"""
+              try:
+                  from torch.distributed.tensor import DTensor
+
+                  if isinstance(tensor, DTensor):
+                      return tensor.to_local()
+              except Exception:
+                  pass
+              return tensor
+
+
+          def _scalar_str(value):
+              """nan / inf / 6 位有效数字；非标量只报形状。"""
+              import torch
+
+              try:
+                  if torch.is_tensor(value):
+                      value = _to_local(value)
+                      if value.numel() != 1:
+                          return f"tensor(numel={value.numel()})"
+                      item = float(value.detach().float().item())
+                  else:
+                      item = float(value)
+              except Exception as exc:
+                  return f"?({type(exc).__name__})"
+              if item != item:
+                  return "nan"
+              if item == float("inf"):
+                  return "inf"
+              if item == float("-inf"):
+                  return "-inf"
+              return f"{item:.6g}"
+
+
+          def _health(tensor):
+              """(非有限元素数, absmax, shape, dtype)，不改动原张量。"""
+              import torch
+
+              t = _to_local(tensor).detach()
+              bad = int((~torch.isfinite(t)).sum().item())
+              try:
+                  absmax = float(t.float().abs().max().item())
+              except Exception:
+                  absmax = float("nan")
+              return bad, absmax, tuple(t.shape), t.dtype
+
+
+          def _report_loss_inputs(call_no, hidden_states, labels, normalizers,
+                                  loss_scales, chunk_size, num_chunks):
+              """hidden_states 就是主干输出 —— 它坏不坏直接决定往哪查。"""
+              # 每条独立 try：某一项算不出来不该把整段诊断吞掉。
+              print(
+                  f"[ttdiag] chunk_loss#{call_no} rank={os.environ.get('RANK', '?')}"
+                  f" chunk_size={chunk_size} chunks={num_chunks}",
+                  flush=True,
+              )
+              for i, hidden in enumerate(hidden_states):
+                  try:
+                      bad, absmax, shape, dtype = _health(hidden)
+                      verdict = "主干输出已经有非有限值" if bad else "主干输出干净"
+                      print(
+                          f"[ttdiag]   hidden[{i}] shape={shape} dtype={dtype}"
+                          f" nonfinite={bad} absmax={absmax:.6g} -> {verdict}",
+                          flush=True,
+                      )
+                  except Exception as exc:
+                      print(f"[ttdiag]   hidden[{i}] 报告失败: {exc}", flush=True)
+                  try:
+                      label = labels[i]
+                      valid = int((label.detach() != -100).sum().item())
+                      print(
+                          f"[ttdiag]   labels[{i}] shape={tuple(label.shape)}"
+                          f" valid={valid} masked={label.numel() - valid}",
+                          flush=True,
+                      )
+                  except Exception as exc:
+                      print(f"[ttdiag]   labels[{i}] 报告失败: {exc}", flush=True)
+              for i, norm in enumerate(normalizers):
+                  print(
+                      f"[ttdiag]   normalizer[{i}]={_scalar_str(norm)}",
+                      flush=True,
+                  )
+              try:
+                  print(
+                      "[ttdiag]   loss_scales="
+                      f"{tuple(float(s) for s in loss_scales)}",
+                      flush=True,
+                  )
+              except Exception as exc:
+                  print(f"[ttdiag]   loss_scales 报告失败: {exc}", flush=True)
+
+
+          def _install_loss_diag(module):
+              """包一层 chunk_loss：打印入参健康度与返回值。"""
+              import functools
+
+              original = getattr(module, "chunk_loss", None)
+              if original is None or getattr(original, "_tt_diag", False):
+                  return
+
+              seen = {"n": 0}
+
+              @functools.wraps(original)
+              def wrapper(hidden_states, labels, **kwargs):
+                  seen["n"] += 1
+                  call_no = seen["n"]
+                  if call_no <= _DIAG_LIMIT:
+                      try:
+                          chunk_size = int(kwargs.get("chunk_size", 1024))
+                          num_chunks = -(-hidden_states[0].numel()
+                                         // (hidden_states[0].shape[-1]
+                                            * chunk_size))
+                          _report_loss_inputs(
+                              call_no,
+                              hidden_states,
+                              labels,
+                              kwargs.get("normalizers") or (),
+                              kwargs.get("loss_scales") or (),
+                              chunk_size,
+                              num_chunks,
+                          )
+                      except Exception as exc:   # 诊断不能弄坏训练
+                          print(f"[ttdiag] 入参报告失败: {exc}", flush=True)
+
+                  result = original(hidden_states, labels, **kwargs)
+
+                  if call_no <= _DIAG_LIMIT:
+                      try:
+                          total, raw = result
+                          raw_list = [
+                              _scalar_str(v) for v in raw.reshape(-1)
+                          ]
+                          print(
+                              f"[ttdiag] chunk_loss#{call_no} -> "
+                              f"total={_scalar_str(total)} raw={raw_list}",
+                              flush=True,
+                          )
+                      except Exception as exc:
+                          print(f"[ttdiag] 结果报告失败: {exc}", flush=True)
+                  return result
+
+              wrapper._tt_diag = True
+              module.chunk_loss = wrapper
+              print("[ttdiag] chunk_loss probe on", flush=True)
+
+
+          def _install_assert_diag(module):
+              """包一层 assert_finite：抛之前把实际数值打出来。"""
+              import functools
+
+              original = getattr(module, "assert_finite", None)
+              if original is None or getattr(original, "_tt_diag", False):
+                  return
+
+              @functools.wraps(original)
+              def wrapper(value, name):
+                  try:
+                      bad, absmax, shape, dtype = _health(value)
+                      print(
+                          f"[ttdiag] assert {name}"
+                          f" rank={os.environ.get('RANK', '?')}"
+                          f" value={_scalar_str(value)}"
+                          f" nonfinite={bad} absmax={absmax:.6g}"
+                          f" shape={shape} dtype={dtype}",
+                          flush=True,
+                      )
+                  except Exception as exc:
+                      print(f"[ttdiag] assert 报告失败: {exc}", flush=True)
+                  return original(value, name)
+
+              wrapper._tt_diag = True
+              module.assert_finite = wrapper
+              print("[ttdiag] assert_finite probe on", flush=True)
+
+
+          # 模块名 -> 装补丁的函数。只在模块真正加载完之后动手，避免过早 import。
+          _INSTALLERS = {
+              "transformers.trainer": _install_skip_ckpt,
+              "torchturbo.engine.backends.fsdp2.backend": _install_loss_diag,
+              "torchturbo.adapters.llamafactory_v0.trainer": _install_assert_diag,
+          }
+
+
           class _After:
-              def __init__(self, loader):
+              def __init__(self, loader, installer):
                   self._loader = loader
+                  self._installer = installer
 
               def create_module(self, spec):
                   return self._loader.create_module(spec)
@@ -635,23 +832,28 @@ jobs:
               def exec_module(self, module):
                   self._loader.exec_module(module)
                   try:
-                      _install(module)
+                      self._installer(module)
                   except Exception as exc:      # 装不上就退回原行为，别弄坏训练
-                      print(f"[ttcatch] patch failed: {exc}", flush=True)
+                      print(f"[ttcatch] patch failed ({module.__name__}): {exc}",
+                            flush=True)
 
 
           class _Finder(importlib.abc.MetaPathFinder):
-              """只在 transformers.trainer 加载完成后动手，避免过早 import。"""
+              """只拦 _INSTALLERS 里点名的模块。"""
 
               def find_spec(self, fullname, path=None, target=None):
-                  if fullname != "transformers.trainer":
+                  installer = _INSTALLERS.get(fullname)
+                  if installer is None:
                       return None
                   for finder in sys.meta_path:
                       if finder is self:
                           continue
-                      spec = finder.find_spec(fullname, path, target)
+                      try:
+                          spec = finder.find_spec(fullname, path, target)
+                      except Exception:
+                          continue
                       if spec is not None and spec.loader is not None:
-                          spec.loader = _After(spec.loader)
+                          spec.loader = _After(spec.loader, installer)
                           return spec
                   return None
 
@@ -712,13 +914,17 @@ jobs:
           wait "$TAILPID" 2>/dev/null
           ELAPSED=$(( $(date +%s) - START ))
 
-          LAST=$(grep -oE "'loss': [0-9.]+" /tmp/train.log | tail -1)
+          # 训练日志里是 {'loss': '1.225', ...} —— 数字带单引号，旧正则只能匹配
+          # 不带引号的写法，于是每次都用 "no loss logged" 盖掉真实结果。
+          LAST=$(grep -oE "'loss': '?[0-9.]+" /tmp/train.log | tail -1 | tr -d "'")
           echo "::notice::train rc=${RC} in ${ELAPSED}s; hit=${HIT}; ${LAST:-no loss logged}"
 
           # 训练后看盘：ckpt 目录有多大、还剩多少空间、真正写下了哪些子目录。
-          # 上次就是在这里才需要这些数字。
+          # 上次就是在这里才需要这些数字。子目录也要细分，否则「一份还是两份」
+          # 只能靠推：25 GiB 到底是 huggingface/ 还是也包含别的，得看见才知道。
           df -h "$OUT" | sed 's/^/  df: /'
           du -sh "$OUT" 2>/dev/null | sed 's/^/  used: /'
+          du -sh "$OUT"/* 2>/dev/null | sed 's/^/    /'
           for d in "$OUT"/checkpoint-* ; do
             [ -d "$d" ] || continue
             echo "  ckpt $(basename "$d")"
@@ -727,6 +933,11 @@ jobs:
           if [ -s /tmp/tt_traceback.log ] ; then
             echo "--- 捕获到的 Python 异常（torchrun 转发时会截断） ---"
             tail -40 /tmp/tt_traceback.log
+          fi
+          # loss 诊断：NaN 出在哪一段，这几行就是答案。
+          if grep -q '\[ttdiag\]' /tmp/train.log 2>/dev/null ; then
+            echo "--- loss 诊断（chunk_loss 入参 / assert_finite） ---"
+            grep '\[ttdiag\]' /tmp/train.log | head -60
           fi
 
           printf 'rc=%s\nelapsed=%s\ncache_hit=%s\nsfs_uuid=%s\nshards=%s\nmodel_size=%s\nsp_size=%s\nep_size=%s\nlayers=%s\noutput_dir=%s\n' \
@@ -806,6 +1017,12 @@ jobs:
             echo ""
             echo '```'
             tail -60 /tmp/tt_traceback.log 2>/dev/null || echo "(none)"
+            echo '```'
+            echo ""
+            echo "### loss 诊断（NaN 出在哪一段）"
+            echo ""
+            echo '```'
+            grep '\[ttdiag\]' /tmp/train.log 2>/dev/null | head -60 || echo "(none)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
