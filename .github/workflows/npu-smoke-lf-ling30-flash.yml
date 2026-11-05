@@ -635,6 +635,8 @@ jobs:
           #
           # 只看前几次调用：每个 .item() 都会同步设备，调用多了会拖慢训练。
           _DIAG_LIMIT = int(os.environ.get("TT_DIAG_CALLS", "2"))
+          # 按层诊断只看第一遍前向（激活重算那遍没意义）。
+          _LAYER_PASSES = int(os.environ.get("TT_LAYER_PASSES", "1"))
 
 
           def _to_local(tensor):
@@ -685,6 +687,37 @@ jobs:
               return bad, absmax, tuple(t.shape), t.dtype
 
 
+          def _row_summary(tensor):
+              """一行健康状况 + 坏 token 的连续区间。
+
+              每行（最后一个维度以外的所有下标）只要有一个非有限就算坏。
+              区间连着 = 某个样本整体坏掉（它的所有 token 全 NaN）；区间散着
+              = 内存被写脏或者随机溢出。
+              """
+              import torch
+
+              t = _to_local(tensor).detach()
+              bad = ~torch.isfinite(t)
+              n_bad = int(bad.sum().item())
+              try:
+                  absmax = f"{float(t.float().abs().max().item()):.6g}"
+              except Exception:
+                  absmax = "?"
+              if n_bad == 0:
+                  return f"ok absmax={absmax}"
+              if t.dim() < 2:
+                  return f"BAD nonfinite={n_bad} absmax={absmax}"
+              rows = bad.reshape(-1, t.shape[-1]).any(-1)
+              nz = rows.nonzero().reshape(-1)
+              lo = int(nz[0].item())
+              hi = int(nz[-1].item()) + 1
+              n_rows = int(rows.sum().item())
+              return (
+                  f"BAD nonfinite={n_bad} rows={n_rows}/{rows.numel()}"
+                  f" span=[{lo},{hi}) absmax={absmax}"
+              )
+
+
           def _report_loss_inputs(call_no, hidden_states, labels, normalizers,
                                   loss_scales, chunk_size, num_chunks):
               """hidden_states 就是主干输出 —— 它坏不坏直接决定往哪查。"""
@@ -696,11 +729,9 @@ jobs:
               )
               for i, hidden in enumerate(hidden_states):
                   try:
-                      bad, absmax, shape, dtype = _health(hidden)
-                      verdict = "主干输出已经有非有限值" if bad else "主干输出干净"
                       print(
-                          f"[ttdiag]   hidden[{i}] shape={shape} dtype={dtype}"
-                          f" nonfinite={bad} absmax={absmax:.6g} -> {verdict}",
+                          f"[ttdiag]   rank={os.environ.get('RANK', '?')}"
+                          f" hidden[{i}] {_row_summary(hidden)}",
                           flush=True,
                       )
                   except Exception as exc:
@@ -813,11 +844,88 @@ jobs:
               print("[ttdiag] assert_finite probe on", flush=True)
 
 
+          # --- 按层定位 NaN -----------------------------------------------------
+          # 上一轮（log 6）拿到了关键结论：rank 6 / 7 的**主干输出**已经是 NaN，
+          # 其余 6 个 rank 干净（absmax ≈ 45），且坏的是 264 / 273 个整 token
+          # 行（sum = 537，正好是一个样本被 sp=2 切开的两半）。所以问题在模型
+          # 内部、而且是**样本相关**的，不在 CE。这里再往前一层：看坏值最早出
+          # 现在哪一层的 attention 还是 mlp。
+          #
+          # 只统计第一遍前向（TT_LAYER_PASSES 可调）：激活重算会再跑一遍，那遍
+          # 对我们没意义，反而把日志刷两倍。
+          _probe_state = {"pass": 0, "off": False}
+
+
+          def _wrap_class_forward(cls, label, mark_pass=False):
+              import functools
+
+              if cls is None:
+                  return False
+              original = getattr(cls, "forward", None)
+              if original is None or getattr(original, "_tt_layer_probe", False):
+                  return False
+
+              @functools.wraps(original)
+              def forward(self, *args, **kwargs):
+                  if _probe_state["off"]:
+                      return original(self, *args, **kwargs)
+                  layer_idx = getattr(self, "layer_idx", "?")
+                  if mark_pass and layer_idx == 0:
+                      _probe_state["pass"] += 1
+                      if _probe_state["pass"] > _LAYER_PASSES:
+                          _probe_state["off"] = True
+                          return original(self, *args, **kwargs)
+                  out = original(self, *args, **kwargs)
+                  try:
+                      tensor = out[0] if isinstance(out, (tuple, list)) else out
+                      print(
+                          f"[ttdiag] fwd#{_probe_state['pass']}"
+                          f" rank={os.environ.get('RANK', '?')}"
+                          f" L{layer_idx} {label} {_row_summary(tensor)}",
+                          flush=True,
+                      )
+                  except Exception as exc:
+                      print(f"[ttdiag] L{layer_idx} {label} 报告失败: {exc}",
+                            flush=True)
+                  return out
+
+              forward._tt_layer_probe = True
+              cls.forward = forward
+              return True
+
+
+          def _install_layer_probe(module):
+              """模型模块：decoder 层 + 两种 attention。"""
+              installed = False
+              for name in ("BailingMoeV3DecoderLayer",):
+                  installed |= _wrap_class_forward(
+                      getattr(module, name, None), "layer", mark_pass=True
+                  )
+              for name in (
+                  "BailingMoeV3KimiDeltaAttention",
+                  "BailingMoeV3MultiLatentAttention",
+              ):
+                  installed |= _wrap_class_forward(getattr(module, name, None),
+                                                  "attn")
+              if installed:
+                  print("[ttdiag] layer probe on", flush=True)
+
+
+          def _install_moe_probe(module):
+              """MoE 是通用 MoELayer（parallel_plan 里 mlp 被整体替换掉了），
+              所以 BailingMoeV3SparseMoeBlock.forward 在运行时不走。"""
+              if _wrap_class_forward(getattr(module, "MoELayer", None), "mlp"):
+                  print("[ttdiag] moe probe on", flush=True)
+
+
           # 模块名 -> 装补丁的函数。只在模块真正加载完之后动手，避免过早 import。
           _INSTALLERS = {
               "transformers.trainer": _install_skip_ckpt,
               "torchturbo.engine.backends.fsdp2.backend": _install_loss_diag,
               "torchturbo.adapters.llamafactory_v0.trainer": _install_assert_diag,
+              "torchturbo.models.modules.moe.moe_layer": _install_moe_probe,
+              "torchturbo.models.bailing_hybrid.modeling_bailing_moe_v3":
+                  _install_layer_probe,
           }
 
 
@@ -934,10 +1042,11 @@ jobs:
             echo "--- 捕获到的 Python 异常（torchrun 转发时会截断） ---"
             tail -40 /tmp/tt_traceback.log
           fi
-          # loss 诊断：NaN 出在哪一段，这几行就是答案。
+          # loss 诊断：NaN 出在哪一层、哪一段，这几行就是答案。
+          # 8 个 rank × 6 层 × 3 个阶段，别只抓 60 行。
           if grep -q '\[ttdiag\]' /tmp/train.log 2>/dev/null ; then
-            echo "--- loss 诊断（chunk_loss 入参 / assert_finite） ---"
-            grep '\[ttdiag\]' /tmp/train.log | head -60
+            echo "--- loss 诊断（按层 / chunk_loss 入参 / assert_finite） ---"
+            grep '\[ttdiag\]' /tmp/train.log | head -400
           fi
 
           printf 'rc=%s\nelapsed=%s\ncache_hit=%s\nsfs_uuid=%s\nshards=%s\nmodel_size=%s\nsp_size=%s\nep_size=%s\nlayers=%s\noutput_dir=%s\n' \
@@ -1019,10 +1128,10 @@ jobs:
             tail -60 /tmp/tt_traceback.log 2>/dev/null || echo "(none)"
             echo '```'
             echo ""
-            echo "### loss 诊断（NaN 出在哪一段）"
+            echo "### loss 诊断（NaN 出在哪一层）"
             echo ""
             echo '```'
-            grep '\[ttdiag\]' /tmp/train.log 2>/dev/null | head -60 || echo "(none)"
+            grep '\[ttdiag\]' /tmp/train.log 2>/dev/null | head -400 || echo "(none)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
