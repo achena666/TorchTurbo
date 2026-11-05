@@ -14,9 +14,8 @@ pull_request ──► ci-gate-pr.yml
 
 push main / 每晚 ─► ci-full.yml（全量，不选测）
 
-每晚 ─────────────► ci-image.yml   构建基础镜像（内容没变就跳过）
-
-手动 ─────────────► ci-pytest.yml  跑指定 pytest 路径
+手动 ─────────────► ci-image.yml   构建基础镜像（**只手动**，不挂 schedule）
+                    ci-pytest.yml  跑指定 pytest 路径
                     ci-train.yml   训练一个模型
 ```
 
@@ -58,7 +57,7 @@ push main / 每晚 ─► ci-full.yml（全量，不选测）
 
 | | 做法 | 为什么 |
 |---|---|---|
-| 触发 | 每晚 `schedule` + 手动 dispatch + `workflow_call` | 手工点不是自动化 |
+| 触发 | **只手动 dispatch**（`schedule` 已注释掉） | 一次 4~5 h / 几十 GB；镜像变了是最难排查的问题，先不给它自动改的机会 |
 | 要不要建 | 内容指纹 tag 已存在 → 跳过 | 没改动时整轮 2~3 分钟，而不是 5 小时 |
 | tag | `base-<年周>-c<docker/npu 内容哈希 8 位>` | 同名同内容，不靠外部状态就能判断「建过没」 |
 | 年周 | `2026w45` | 每周强制重建一次，才能发现 cann / pip 上游漂移 |
