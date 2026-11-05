@@ -1,0 +1,471 @@
+name: NPU SFT (reusable)
+
+# The shared body of every "install an SFT stack and train one step" job.
+#
+# Callers only describe what makes their model different -- which repo to fetch,
+# how many layers to keep, which dataset. Everything that has cost a run before
+# lives in scripts/ci and is invoked from here, so a fix reaches every caller:
+#
+#   model_cache.sh       probe / find / mark        (cache correctness)
+#   hf_fetch.py          download with retries      (mirror 5xx)
+#   flash_trim.py        fetch N layers + trim index (CheckpointInfo opens every
+#                                                     file listed in weight_map)
+#   parallel_plan.py     card count -> sp/ep        (repo yaml assumes a full node)
+#   train_supervisor.sh  watchdog + group cleanup   (stalled tee, cancelled step)
+#   diag/sitecustomize.py  exceptions and NaN probes
+#   result.py            facts -> summary markdown  (failing runs still report)
+#
+# Concurrency is deliberately *not* declared here: a called workflow cannot express
+# it per input, so each caller keeps its own serialisation group.
+
+on:
+  workflow_call:
+    inputs:
+      runner_label:
+        description: 'Runner label; the trailing number is the card count'
+        required: true
+        type: string
+      image:
+        description: 'L1 base image; pin with repo@sha256:... for reproducibility'
+        required: true
+        type: string
+      model_type:
+        description: '@register_model name, key of model_map.tsv'
+        required: true
+        type: string
+      framework:
+        description: 'lf or swift'
+        required: true
+        type: string
+      train_model_path:
+        description: 'Explicit model directory; empty means look up hf_repo'
+        required: false
+        default: ''
+        type: string
+      hf_repo_override:
+        description: 'Repo to download instead of model_map.tsv column 5'
+        required: false
+        default: ''
+        type: string
+      trim_layers:
+        description: 'Keep only the first N layers; 0 downloads in full'
+        required: false
+        default: 0
+        type: number
+      train_seq_len:
+        required: false
+        default: '1024'
+        type: string
+      train_dataset:
+        required: false
+        default: 'gsm8k'
+        type: string
+      train_finetuning_type:
+        required: false
+        default: 'full'
+        type: string
+      train_sp_size:
+        description: 'auto = narrow the repo value to the card count'
+        required: false
+        default: 'auto'
+        type: string
+      train_ep_size:
+        required: false
+        default: 'auto'
+        type: string
+      diag:
+        description: 'Install scripts/ci/diag on PYTHONPATH'
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      SWR_USERNAME:
+        required: true
+      SWR_PASSWORD:
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  # hf-mirror is reachable from inside the pod; huggingface.co answers 503.
+  HF_ENDPOINT: 'https://hf-mirror.com'
+  HF_HOME: '/root/.cache/huggingface'
+  # HF_HOME is on the shared SFS, but trust_remote_code copies must not be: several
+  # pods writing the same directory leave half-written .py files behind, and
+  # transformers only checks exists(), so every later run would read the broken one.
+  HF_MODULES_CACHE: '/tmp/hf-modules'
+  # Defaults are 10 s (constants.py:37). A busy mirror blows through that, and the
+  # download timeout is a per-read httpx timeout -- any stall longer than it raises,
+  # and http_get's retry_on_exceptions=() means it is not retried.
+  HF_HUB_ETAG_TIMEOUT: '30'
+  HF_HUB_DOWNLOAD_TIMEOUT: '120'
+  # hf_xet would fetch from cas-server.xethub.hf.co, which HF_ENDPOINT does not
+  # proxy, and treats a short cross-border read as a permanent size mismatch.
+  HF_HUB_DISABLE_XET: '1'
+  CI_SCRIPTS: ${{ github.workspace }}/scripts/ci
+  RESULT_JSON: /tmp/ci-result.json
+
+jobs:
+  sft:
+    name: sft (${{ inputs.model_type }}/${{ inputs.framework }} on ${{ inputs.runner_label }})
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 300
+
+    container:
+      image: ${{ inputs.image }}
+      credentials:
+        username: ${{ secrets.SWR_USERNAME }}
+        password: ${{ secrets.SWR_PASSWORD }}
+      options: --user root
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: ① Checkout
+        uses: actions/checkout@v4
+
+      # Everything downstream reads /tmp/ci-result.json, so it is seeded before the
+      # first thing that can fail. A run that dies in ② still produces a summary.
+      - name: ② 先行校验 + model_type → 启动脚本映射
+        id: resolve
+        env:
+          MODEL_TYPE: ${{ inputs.model_type }}
+          FRAMEWORK: ${{ inputs.framework }}
+          RUNNER_LABEL: ${{ inputs.runner_label }}
+          IMAGE: ${{ inputs.image }}
+          LAYERS: ${{ inputs.trim_layers }}
+          DATASET: ${{ inputs.train_dataset }}
+        run: |
+          set -uo pipefail
+          MAP=.github/workflows/model_map.tsv
+          test -f "$MAP" || { echo "::error::missing $MAP"; exit 1; }
+
+          python3 "$CI_SCRIPTS/result.py" init --file "$RESULT_JSON" \
+            model_type="$MODEL_TYPE" framework="$FRAMEWORK" \
+            runner_label="$RUNNER_LABEL" image="$IMAGE" \
+            layers="$LAYERS" dataset="$DATASET"
+
+          # 先确认这个 model_type 真的能跑，再去装依赖；否则白等几十分钟。
+          # 列：1=model_type  2=run_dir  3=lf 脚本  4=swift 脚本  5=hf_repo
+          ROW=$(awk -v m="$MODEL_TYPE" '$1==m && $0 !~ /^\s*#/ {print; exit}' "$MAP")
+          if [ -z "$ROW" ]; then
+            echo "::error::model_type '$MODEL_TYPE' 不在 $MAP 里；可选项："
+            awk '$0 !~ /^\s*#/ && NF {printf "  %s\n", $1}' "$MAP"
+            exit 1
+          fi
+          set -- $ROW
+          RUN_DIR=$2
+          case "$FRAMEWORK" in
+            lf)    LAUNCHERS=$3 ;;
+            swift) LAUNCHERS=$4 ;;
+            *)     echo "::error::未知 framework '$FRAMEWORK'（只支持 lf / swift）"; exit 1 ;;
+          esac
+          REPO=${5:--}
+          echo "model_type=$MODEL_TYPE framework=$FRAMEWORK run_dir=$RUN_DIR launchers=$LAUNCHERS repo=$REPO"
+
+          if [ "$RUN_DIR" = "-" ] || [ ! -d "scripts/runs/$RUN_DIR" ]; then
+            echo "::error::$MODEL_TYPE 没有可用的 run_dir：scripts/runs/$RUN_DIR"
+            ls -1 scripts/runs | sed 's/^/             /'
+            exit 1
+          fi
+
+          if [ "$LAUNCHERS" = "-" ] || [ -z "$LAUNCHERS" ]; then
+            echo "::error::$MODEL_TYPE 在 $FRAMEWORK 下没有启动脚本（第 3/4 列为 '-'）"
+            echo "            同一行：run_dir=$RUN_DIR lf=[$3] swift=[$4]"
+            exit 1
+          fi
+          TRAIN=""
+          for l in $(echo "$LAUNCHERS" | tr ',' ' '); do
+            [ -f "scripts/runs/$RUN_DIR/$l" ] && { TRAIN="scripts/runs/$RUN_DIR/$l"; break; }
+          done
+          if [ -z "$TRAIN" ]; then
+            echo "::error::$MODEL_TYPE/$FRAMEWORK 的 launchers 一个都不存在：$LAUNCHERS"
+            ls -1 "scripts/runs/$RUN_DIR" | sed 's/^/             /'
+            exit 1
+          fi
+
+          # 注册表漂移：映射表必须覆盖代码里 @register_model 的全部名字。
+          # 只用标准库，不依赖三方包（这张表要在装依赖之前就能读）。
+          python3 - "$MAP" <<'PY' || exit 1
+          import glob, re, sys
+
+          registered = set()
+          for path in glob.glob("src/torchturbo/models/*/model.py"):
+              src = open(path, encoding="utf-8").read()
+              registered.update(re.findall(r'@register_model\(\s*["\']([^"\']+)["\']', src))
+
+          mapped = set()
+          for line in open(sys.argv[1], encoding="utf-8"):
+              line = line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              mapped.add(line.split()[0])
+
+          missing = sorted(registered - mapped)
+          unknown = sorted(mapped - registered)
+          print(f"registered={len(registered)} mapped={len(mapped)}")
+          if missing:
+              print("::error::注册了但映射表未收录:", ", ".join(missing))
+          if unknown:
+              print("::warning::映射表里有未注册的名字:", ", ".join(unknown))
+          sys.exit(1 if missing else 0)
+          PY
+
+          # 依赖安装脚本：优先按框架选，退回到通用的 install_lf_deps.sh
+          INSTALL=""
+          for c in "scripts/runs/$RUN_DIR/install_${FRAMEWORK}_deps.sh" \
+                   "scripts/runs/$RUN_DIR/install_lf_deps.sh"; do
+            [ -f "$c" ] && { INSTALL="$c"; break; }
+          done
+          if [ -z "$INSTALL" ]; then
+            echo "::error::$MODEL_TYPE 没有可用的依赖安装脚本（install_*.sh 都不存在）"
+            ls -1 "scripts/runs/$RUN_DIR" | sed 's/^/             /'
+            exit 1
+          fi
+
+          echo "校验通过：train=$TRAIN install=$INSTALL"
+          python3 "$CI_SCRIPTS/result.py" set --file "$RESULT_JSON" \
+            run_dir="$RUN_DIR" install_script="$INSTALL" train_script="$TRAIN"
+
+          printf 'run_dir=%s\ninstall_script=%s\ntrain_script=%s\nhf_repo=%s\n' \
+            "$RUN_DIR" "$INSTALL" "$TRAIN" "$REPO" >> "$GITHUB_OUTPUT"
+
+      - name: ③ Install torchturbo
+        id: torchturbo
+        run: |
+          set -uo pipefail
+
+          # ARG PIP_INDEX_URL 不固化进镜像，pod 里实际用的源取决于 pip 配置/环境变量。
+          python -m pip config list 2>/dev/null || true
+          env | grep -iE '^(PIP_|.*_PROXY=)' || true
+
+          START=$(date +%s)
+          # 不加 -q：Collecting/Downloading 行是「到底有没有重新下载」的唯一直接证据。
+          # --no-build-isolation：否则 pip 会为了跑 setuptools 额外下一个完整 torch。
+          python -m pip install --no-cache-dir --no-build-isolation -e ".[dev]" 2>&1 \
+            | tee /tmp/turbo.log
+          RC=${PIPESTATUS[0]}
+          ELAPSED=$(( $(date +%s) - START ))
+
+          grep -E '^(Collecting|Downloading|Using cached|Installing collected|Requirement already satisfied)' \
+            /tmp/turbo.log | sed 's/ (from .*//' || true
+
+          python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
+            --name '③ torchturbo `-e .[dev]`' --seconds "$ELAPSED" --rc "$RC"
+          echo "::notice::torchturbo install took ${ELAPSED}s (rc=${RC})"
+          exit "$RC"
+
+      - name: ④ Install deps (${{ inputs.model_type }} / ${{ inputs.framework }})
+        id: deps
+        env:
+          INSTALL_SCRIPT: ${{ steps.resolve.outputs.install_script }}
+        run: |
+          set -uo pipefail
+          test -f "$INSTALL_SCRIPT" || { echo "::error::missing $INSTALL_SCRIPT"; exit 1; }
+          cat "$INSTALL_SCRIPT"
+
+          START=$(date +%s)
+          bash "$INSTALL_SCRIPT" 2>&1 | tee /tmp/deps.log
+          RC=${PIPESTATUS[0]}
+          ELAPSED=$(( $(date +%s) - START ))
+
+          # 装完实际落了什么版本。故意放在计时区间外，且永不致命。
+          python - <<'PROBE' > /tmp/after.txt 2>&1 || true
+          import importlib
+          names = "torch torch_npu numpy triton fla fla_npu transformers llamafactory deepspeed omegaconf pytest".split()
+          for n in names:
+              try:
+                  print(f"{n}={getattr(importlib.import_module(n), '__version__', 'unknown')}")
+              except Exception as e:
+                  print(f"{n}=MISSING({type(e).__name__})")
+          PROBE
+          cat /tmp/after.txt
+
+          python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
+            --name "④ \`$INSTALL_SCRIPT\`" --seconds "$ELAPSED" --rc "$RC"
+          echo "::notice::${INSTALL_SCRIPT} took ${ELAPSED}s (rc=${RC})"
+          exit "$RC"
+
+      - name: ⑤ Train (${{ inputs.model_type }} / ${{ inputs.framework }})
+        id: train
+        timeout-minutes: 240
+        env:
+          MODEL_HINT: ${{ inputs.train_model_path }}
+          REPO_MAP: ${{ steps.resolve.outputs.hf_repo }}
+          REPO_IN: ${{ inputs.hf_repo_override }}
+          SP_IN: ${{ inputs.train_sp_size }}
+          EP_IN: ${{ inputs.train_ep_size }}
+          SEQ_LEN: ${{ inputs.train_seq_len }}
+          FINETUNING_TYPE: ${{ inputs.train_finetuning_type }}
+          RUNNER_LABEL: ${{ inputs.runner_label }}
+          MODEL_TYPE: ${{ inputs.model_type }}
+          TRAIN_SCRIPT: ${{ steps.resolve.outputs.train_script }}
+          DATASET_IN: ${{ inputs.train_dataset }}
+          LAYERS: ${{ inputs.trim_layers }}
+          DIAG: ${{ inputs.diag }}
+        run: |
+          set -uo pipefail
+          set +e
+
+          # 卡数直接取 runner 标签的尾缀（-2 / -4 / -8），避免与 yaml 里的 sp_size 不匹配。
+          NPUS_PER_NODE="${RUNNER_LABEL##*-}"
+          case "$NPUS_PER_NODE" in
+            ''|*[!0-9]*) NPUS_PER_NODE=2 ;;
+          esac
+          export NPUS_PER_NODE
+          echo "cards=${NPUS_PER_NODE} (from ${RUNNER_LABEL})"
+
+          # 卷身份：不同 run 会落到不同的 SFS，命中与否取决于它。
+          uuid=$(findmnt -nT /root/.cache -o SOURCE 2>/dev/null | sed -n '1p' | cut -d. -f1)
+          echo "sfs_uuid=${uuid:-?}"
+
+          HF_REPO="${REPO_IN:-$REPO_MAP}"
+          if [ -z "$MODEL_HINT" ] && [ "$HF_REPO" = "-" ]; then
+            echo "::error::$MODEL_TYPE 没登记 hf_repo（映射表第 5 列为 '-'），必须显式传 train_model_path"
+            exit 1
+          fi
+
+          # ---- 模型获取 --------------------------------------------------
+          # 缓存键带上层数：改了裁剪口径必须重下，否则会加载形状不对的模型。
+          MARKER="repo=${HF_REPO} layers=${LAYERS}"
+          CACHE_OUT=/tmp/cache.out
+          : > "$CACHE_OUT"
+
+          if [ -n "$MODEL_HINT" ]; then
+            if r=$(bash "$CI_SCRIPTS/model_cache.sh" probe --dir "$MODEL_HINT"); then
+              MODEL=$MODEL_HINT; BYTES=${r% *}; SHARDS=${r#* }; HIT=yes
+              echo "use explicit model: $MODEL  bytes=$BYTES shards=$SHARDS"
+            else
+              echo "::error::train_model_path 不完整：$MODEL_HINT"; exit 1
+            fi
+          else
+            bash "$CI_SCRIPTS/model_cache.sh" find --repo "$HF_REPO" \
+              --marker "$MARKER" --output "$CACHE_OUT"
+            # shellcheck disable=SC1090
+            . "$CACHE_OUT"
+            if [ "${HIT:-no}" = yes ]; then
+              echo "cache HIT: $MODEL"
+            else
+              if [ -z "${LAYERS:-0}" ] || [ "${LAYERS:-0}" -eq 0 ]; then
+                MODEL="/root/.cache/models/$HF_REPO"
+                echo "::notice::model MISS on sfs=${uuid:-?}; downloading $HF_REPO"
+                python3 "$CI_SCRIPTS/hf_fetch.py" --repo "$HF_REPO" --dir "$MODEL" \
+                  || { echo "::error::下载 $HF_REPO 失败"; exit 1; }
+              else
+                MODEL="/root/.cache/models/$(basename "$HF_REPO")-L${LAYERS}"
+                echo "::notice::model MISS on sfs=${uuid:-?}; trimming $HF_REPO to $LAYERS layers"
+                python3 "$CI_SCRIPTS/flash_trim.py" --repo "$HF_REPO" --dir "$MODEL" \
+                  --layers "$LAYERS" \
+                  || { echo "::error::裁剪下载 $HF_REPO 失败"; exit 1; }
+              fi
+              if ! r=$(bash "$CI_SCRIPTS/model_cache.sh" probe --dir "$MODEL"); then
+                echo "::error::model incomplete at $MODEL"; exit 1
+              fi
+              BYTES=${r% *}; SHARDS=${r#* }
+              bash "$CI_SCRIPTS/model_cache.sh" mark --dir "$MODEL" --text "$MARKER"
+            fi
+          fi
+          echo "model: $MODEL  bytes=$BYTES shards=$SHARDS  layers=${LAYERS:-0}"
+
+          # ---- 并行策略 --------------------------------------------------
+          # 仓库里的 yaml 是按满卡写的，不能改（CI 要测的就是仓库里那份），
+          # 所以按实际卡数收敛出一份派生配置写到 /tmp，其余字段原样保留。
+          test -f "$TRAIN_SCRIPT" || { echo "::error::missing $TRAIN_SCRIPT"; exit 1; }
+          D=$(dirname "$TRAIN_SCRIPT")
+          # 取脚本里 TT_CONFIG 的默认表达式，把 $(dirname "$0") / ${SCRIPT_DIR} 展开。
+          SRC=$(sed -n 's/^TT_CONFIG=${TT_CONFIG:-\(.*\)}$/\1/p' "$TRAIN_SCRIPT" | head -1)
+          SRC=$(printf '%s' "$SRC" | sed -e "s|\$(dirname \"\$0\")|$D|g" \
+                                        -e "s|\${SCRIPT_DIR}|$D|g" -e 's|^"||; s|"$||')
+          [ -f "$SRC" ] || SRC=""
+          [ -n "$SRC" ] || echo "::warning::$TRAIN_SCRIPT 没有配套 yaml，将生成最小配置"
+
+          PLAN_OUT=/tmp/plan.out
+          : > "$PLAN_OUT"
+          python3 "$CI_SCRIPTS/parallel_plan.py" \
+            --yaml "$SRC" --cards "$NPUS_PER_NODE" \
+            --sp "$SP_IN" --ep "$EP_IN" --layers "${LAYERS:-0}" \
+            --out "/tmp/tt_${MODEL_TYPE}.yaml" --output "$PLAN_OUT"
+          # shellcheck disable=SC1090
+          . "$PLAN_OUT"
+          [ -n "${SP:-}" ] && [ -n "${EP:-}" ] \
+            || { echo "::error::并行策略推导失败（见上面的 parallel_plan.py 输出）"; exit 1; }
+          echo "train script: $TRAIN_SCRIPT"
+          echo "tt_config: $TT_CONFIG"
+
+          # ---- 启动 ------------------------------------------------------
+          # 启动脚本都是 DATASET=${DATASET:-<各自的默认>}，从外面指定即可。
+          export DATASET="$DATASET_IN"
+          export MODEL NPUS_PER_NODE SEQ_LEN FINETUNING_TYPE TT_CONFIG
+
+          # 诊断包：sitecustomize 在每个 python 进程启动时装钩子。
+          if [ "$DIAG" = "true" ]; then
+            mkdir -p /tmp/diag
+            ln -sfn "$CI_SCRIPTS/diag/sitecustomize.py" /tmp/diag/sitecustomize.py
+            # 不能写成 ":/tmp/diag:$PYTHONPATH"：空段等于把 cwd 塞进 sys.path。
+            export PYTHONPATH="/tmp/diag${PYTHONPATH:+:$PYTHONPATH}"
+            # 单份 HF 导出：裸的 _save_checkpoint 会先把优化器状态写满 overlay。
+            export TT_SKIP_CHECKPOINT=1
+            echo "diag on (TT_DIAG_CALLS=${TT_DIAG_CALLS:-2})"
+          fi
+
+          TRAIN_OUT=/tmp/train_meta.out
+          : > "$TRAIN_OUT"
+          bash "$CI_SCRIPTS/train_supervisor.sh" \
+            --script "$TRAIN_SCRIPT" --log /tmp/train.log --output "$TRAIN_OUT"
+          RC=$?
+          # shellcheck disable=SC1090
+          . "$TRAIN_OUT"
+          ELAPSED=${ELAPSED:-0}
+          LAST_LOSS=${LAST_LOSS:-}
+          WATCHDOG=${WATCHDOG:-no}
+          STUCK=${STUCK:-no}
+
+          echo "::notice::train rc=${RC} in ${ELAPSED}s; hit=${HIT:-?}; ${LAST_LOSS:-no loss logged}"
+
+          # 训练后看盘：子目录也要细分，否则「一份还是两份」只能靠推。
+          OUT="${OUTPUT_DIR:-/tmp/tblf-sft/$(basename "$MODEL")}"
+          df -h "$OUT" 2>/dev/null | sed 's/^/  df: /'
+          du -sh "$OUT" 2>/dev/null | sed 's/^/  used: /'
+          du -sh "$OUT"/* 2>/dev/null | sed 's/^/    /'
+          if [ -s /tmp/tt_traceback.log ]; then
+            echo "--- 捕获到的 Python 异常（torchrun 转发时会截断） ---"
+            tail -40 /tmp/tt_traceback.log
+          fi
+          if grep -q '\[ttdiag\]' /tmp/train.log 2>/dev/null; then
+            echo "--- loss 诊断（按层 / chunk_loss 入参 / assert_finite） ---"
+            grep '\[ttdiag\]' /tmp/train.log | head -400
+          fi
+
+          python3 "$CI_SCRIPTS/result.py" set --file "$RESULT_JSON" \
+            cache_hit="${HIT:-no}" sfs_uuid="${uuid:-?}" \
+            shards="${SHARDS:-?}" model_size="$(( ${BYTES:-0} / 1048576 )) MiB" \
+            sp="$SP" ep="$EP" output_dir="$OUT" model_path="$MODEL" \
+            last_loss="$LAST_LOSS" watchdog="$WATCHDOG" \
+            stalled="$STUCK"
+          python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
+            --name '⑤ train' --seconds "${ELAPSED:-0}" --rc "$RC"
+
+          # 结果文件在 failure 路径上也必须存在；⑥ 直接读它，不读 step outputs。
+          exit "$RC"
+
+      - name: ⑥ Summary
+        if: always()
+        env:
+          MODEL_TYPE: ${{ inputs.model_type }}
+        run: |
+          set -uo pipefail
+          python3 "$CI_SCRIPTS/result.py" migrate-map --file "$RESULT_JSON" \
+            --map .github/workflows/model_map.tsv
+          python3 "$CI_SCRIPTS/result.py" report --file "$RESULT_JSON" \
+            --train-log /tmp/train.log \
+            --traceback /tmp/tt_traceback.log \
+            --versions /tmp/after.txt >> "$GITHUB_STEP_SUMMARY"
+
+          # 注解是唯一匿名可读的输出通道，关键数字也放这里。
+          python3 "$CI_SCRIPTS/result.py" notice --file "$RESULT_JSON" \
+            --model-type "$MODEL_TYPE" || true
