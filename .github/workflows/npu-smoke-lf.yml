@@ -88,6 +88,10 @@ env:
   # hf-mirror 在 pod 内可达（200），huggingface.co 是 503，必须走镜像。
   HF_ENDPOINT: 'https://hf-mirror.com'
   HF_HOME: '/root/.cache/huggingface'
+  # HF_HOME 在共享 SFS 上，但 trust_remote_code 的代码副本不该放那儿：多个 pod
+  # 并发写同一个目录会留下半截 .py，而 transformers 只按 exists() 判缓存，之后
+  # 所有 run 都读坏文件。放到 pod 本地的 /tmp（与 / 同 overlay，随 pod 销毁）。
+  HF_MODULES_CACHE: '/tmp/hf-modules'
 
 jobs:
   lf-env:

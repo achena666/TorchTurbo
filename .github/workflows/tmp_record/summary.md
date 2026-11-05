@@ -203,3 +203,23 @@ NPU 节点（镜像命中率 >80%）。届时做 2 个框架镜像，而非每�
 **注意**：L2 唯一不可替代的价值是"版本冲突在构建期暴露"（如 `ms_swift 4.4.2` 要求
 `datasets<4.8.5`，而 `swift_deps.sh` 装 `5.0.1`，pip 只警告不失败）。但这可以在运行期
 用 `python -m pip check` 拿到，不需要为此建镜像。
+
+---
+
+# 七、事故：`rm -rf ~/.cache` 在 SFS 上不可行
+
+`bailing_v3/install_{lf,swift}_deps.sh` 末行 `rm -rf ~/.cache/ ~/.triton/`，而
+`/root/.cache` 在 NPU runner 上就是 SFS Turbo 的 NFS 挂载点。`rm -rf` 先删光内容、
+最后再 `rmdir` 挂载点，后者必然 `EBUSY`：实测删了 7 min 24 s 后失败，脚本退出 1，
+④ 挂掉、⑤ 训练一次都没跑。更严重的是它真删掉了共享盘上并发 job 共用的数据，
+含 `models/Qwen/Qwen3.5-2B`（4.5 GB）和 `gsm8k`。
+
+改法：
+
+1. 两个脚本删掉该行（`~/.triton` 不在挂载点、镜像未预置、装依赖时还不存在，同样无意义）。
+2. workflow 加 `HF_MODULES_CACHE: '/tmp/hf-modules'`，把 `trust_remote_code` 的代码副本
+   挪到 pod 本地。共享 SFS 上多 pod 并发拷贝会留下半截 `.py`，而 transformers 只按
+   `exists()` 判缓存，坏文件将永久保留。
+
+效果：安装脚本正常退出、⑤ 能跑到训练；其余 6 个脚本的 `rm` 目标目录不再被创建，
+自动变成空操作。
