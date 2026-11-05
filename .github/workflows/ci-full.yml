@@ -18,10 +18,13 @@ on:
         default: true
         type: boolean
 
-# 全量不取消：中途取消会留下半个 checkpoint，下一轮还要重新下模型。
-concurrency:
-  group: ci-full-${{ github.ref }}
-  cancel-in-progress: false
+# 全量**不设 workflow 级 concurrency**。
+# 初衷是「新 push 不打断正在跑的全量」（中途取消会留下半个 checkpoint）。
+# 但 cancel-in-progress: false 会把它排成 pending，而实测这条队列会***锁死***：
+# 连续 push 几下之后，run 一直是 pending、jobs=0，前面那些 pending 已被 cancel，
+# 组里已经没有任何在跑的 run 也不会恢复；再 dispatch 一个新 run 同样卡住。
+# 「不取消」这个目标不需要 concurrency —— 没有 concurrency 就不会有 cancel。
+# 代价是两次全量可能并行，但 L2b 的 8 卡 pod 本来就会被 runner 队列拦住。
 
 permissions:
   contents: read
