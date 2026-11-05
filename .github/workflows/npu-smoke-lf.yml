@@ -97,6 +97,11 @@ env:
   # 且 http_get 的 retry_on_exceptions=() 不会重试，只能靠外层循环从头再来。
   HF_HUB_ETAG_TIMEOUT: '30'
   HF_HUB_DOWNLOAD_TIMEOUT: '120'
+  # hf_xet 装了就会走 Xet CAS 通道，但 CAS 域名（cas-server.xethub.hf.co）
+  # 不走 HF_ENDPOINT，镜像站不代理它。实测下 3.5 GB 的 science.jsonl 只收到
+  # 1.5 GB 就报 "File size mismatch"，直接炸掉训练。关掉后回退成普通 HTTP
+  # GET，走 hf-mirror，带 expected_size 校验。
+  HF_HUB_DISABLE_XET: '1'
 
 jobs:
   lf-env:
