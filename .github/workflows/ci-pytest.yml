@@ -145,13 +145,12 @@ jobs:
     runs-on: ${{ inputs.runner_label }}
     # `|| 60` 是兜底：见 ci-train.yml 里同一处注释。
     timeout-minutes: ${{ inputs.timeout_minutes || 60 }}
-    # NPU 池不可共享，按池名串行。写在 job 级而不是 workflow 级，是为了让
-    # 调用路径与手动路径排同一个队 —— 旧版两个入口各用自己的组，手动跑会和
-    # PR 的 L2a 同时抢同一个 pod。cancel-in-progress 必须为 false：这里要的是
-    # 排队，而不是把正在跑的 job 砍掉。
-    concurrency:
-      group: ci-pytest-${{ inputs.runner_label }}
-      cancel-in-progress: false
+    # 这里**不要**加 job 级 concurrency。曾经按 runner_label 分过组，结果
+    # cancel-in-progress: false 并没带来排队：「同一个组里 pending 的 job
+    # 只保留最后一个」。ci-full 的 5 个 L1 分片中 2/3/4 在创建 1 s 后全部
+    # cancelled，只剩 2 个在跑 —— group 必须按「能不能共用»划，而分片恰恰
+    # 是要并行的。串行本来就不需要它：self-hosted runner 忙时，下一个 job
+    # 天然在 queued 里等。
 
     container:
       image: ${{ inputs.image }}
@@ -192,9 +191,16 @@ jobs:
         if: ${{ inputs.mode == 'npu' }}
         run: |
           set -uo pipefail
-          ls /dev/davinci* >/dev/null 2>&1 \
-            || { echo "::error::no /dev/davinci*, NPUs not mapped into the pod"; exit 1; }
-          echo "davinci count: $(ls /dev/davinci* | wc -l)"
+          # 用 bash 通配数设备，不用 `ls | wc -l`：actionlint 会按 shellcheck
+          # SC2012 判红（ls 解析文件名不安全），而设备名恰恰是安全的 —— 与其
+          # 加一行 disable，不如直接不用 ls。
+          shopt -s nullglob
+          davinci=(/dev/davinci*)
+          if [ "${#davinci[@]}" -eq 0 ]; then
+            echo "::error::no /dev/davinci*, NPUs not mapped into the pod"
+            exit 1
+          fi
+          echo "davinci count: ${#davinci[@]}"
           npu-smi info 2>/dev/null | head -12 || true
           START=$(date +%s); set +e
           python3 "$CI_SCRIPTS/env.py" verify
@@ -246,11 +252,7 @@ jobs:
     if: ${{ !inputs.use_container }}
     runs-on: ${{ inputs.runner_label }}
     timeout-minutes: ${{ inputs.timeout_minutes || 60 }}
-    # 容器与裸机共用同一个组名：同一个 runner 池上只能有一个 pytest 在跑，
-    # 与「在哪跑」无关。
-    concurrency:
-      group: ci-pytest-${{ inputs.runner_label }}
-      cancel-in-progress: false
+    # concurrency 与上面的容器 job 同理：会杀掉并行的分片，不加。
 
     defaults:
       run:

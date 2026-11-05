@@ -249,12 +249,9 @@ jobs:
     # `|| 45` 是兜底：万一以后有人用 dispatch 触发却没在 dispatch inputs 里声明
     # timeout_minutes，空值会让 job 直接校验失败；空字符串在表达式里是 falsy。
     timeout-minutes: ${{ inputs.timeout_minutes || 45 }}
-    # NPU 池不可共享，按池名串行。写在 job 级而不是 workflow 级，是为了让
-    # 调用路径与手动路径排同一个队 —— 旧版两个入口各用自己的组，手动跑会和
-    # PR 的 E2E 同时抢同一个 pod。cancel-in-progress 必须为 false：要的是排队。
-    concurrency:
-      group: ci-train-${{ inputs.runner_label }}
-      cancel-in-progress: false
+    # 这里**不要**加 job 级 concurrency：同组 pending 的 job 只保留最后一个，
+    # 会把排在前面的 run 静默取消（ci-pytest.yml 里踩过，5 个分片剩 2 个）。
+    # NPU 池的串行由 runner 自己保证 —— runner 忙的时候 job 就在 queued 里等。
     outputs:
       skip_reason: ${{ steps.run.outputs.skip_reason }}
 

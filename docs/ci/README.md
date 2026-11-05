@@ -131,14 +131,25 @@ gh workflow run ci-gate-pr.yml -F ref=ci/pr-123
 超时之后一定有收尾（`if: always()` → `scripts/ci/env.py cleanup`）：被杀掉的训练会
 留下占卡的子进程、没释放的显存和半个 checkpoint，下个 job 会以完全无关的方式失败。
 
-## NPU 池串行
+## NPU 池串行：不要用 job 级 `concurrency`
 
-`ci-pytest.yml` 与 `ci-train.yml` 的 job 级 `concurrency` 按 runner 标签分组成
-`ci-pytest-<label>` / `ci-train-<label>`，`cancel-in-progress: false`。
+第一版在 `ci-pytest.yml` / `ci-train.yml` 里按 runner 标签分过组
+（`ci-pytest-<label>`，`cancel-in-progress: false`），想的是"让手动跑和 PR 排同一个队"。
+实测**这个做法会吃掉分片**：
 
-写在被调用的文件里而不是调用方，是因为要**让手动跑和 PR 排同一个队**：旧版两个
-手动入口各自用自己的组名，手动跑一个训练会和 PR 的 L2b 同时抢同一个 pod，
-然后两边都变慢、都以为是性能问题。
+> 同一个 concurrency group 里，GitHub 只保留**一个** pending 的 job；
+> 新排进来的会把前一个 pending 的 cancel 掉（`cancel-in-progress: false` 只保证
+> 不打断 *正在跑* 的那个）。
+
+`ci-full` 第一次 run 就是这么挂的：5 个 L1 分片在 12:19:20 同时入队，
+2/3/4 在 1 秒后全部变成 `cancelled`，只剩 0 和 1 真的跑了。
+
+所以现在两个可复用泳道里**没有任何 `concurrency`**。串行本来就由 runner 提供：
+self-hosted runner 忙着的时候，下一个 job 天然停在 `queued`。要给某个池限并发，
+应该去 ARC / runner group 那一层做，而不是在被调用的 workflow 里。
+
+workflow 级 `concurrency` 仍然保留在三个入口文件里（`ci-pr-*` / `ci-full-*` /
+`image-ci-base`），那里语义是"同一条 ref 的新 run 顶掉旧的"，是对的。
 
 ## 需要配的东西
 

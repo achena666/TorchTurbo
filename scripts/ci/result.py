@@ -331,7 +331,17 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--junit", default="/tmp/pytest.xml")
     parser.add_argument("--map", default=".github/workflows/model_map.tsv")
     parser.add_argument("values", nargs="*")
-    args = parser.parse_args(argv)
+    # Python 3.10 / 3.11 的 argparse 不允许「选项之后跟位置参数」：
+    # `init --file X k=v` 会把 k=v 判成 unrecognized arguments（3.12 起才放宽）。
+    # 而 CI 里两个 python 都可能是 3.11（镜像与 GH 托管机），所以这里不靠版本：
+    # 用 parse_known_args 兜住尾巴，只认 k=v，其他（比如拼错的 --flag）照样报错，
+    # 免得选项被静默吞掉。
+    args, extra = parser.parse_known_args(argv)
+    for token in extra:
+        if "=" in token and not token.startswith("-"):
+            args.values.append(token)
+        else:
+            parser.error(f"unrecognized argument: {token}")
 
     path = Path(args.file)
 
