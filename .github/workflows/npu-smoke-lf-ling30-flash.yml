@@ -526,7 +526,120 @@ jobs:
           # 不用改 scripts/runs 下的上游文件。
           export DATASET="$DATASET_IN"
           export MODEL NPUS_PER_NODE SEQ_LEN FINETUNING_TYPE TT_CONFIG="$TT"
-          echo "dataset=$DATASET"
+          # 只读地复用启动脚本里的同一套表达式，仅用于下面的盘监控。
+          OUT="${OUTPUT_DIR:-/tmp/tblf-sft/$(basename "$MODEL")}"
+          echo "dataset=$DATASET  output=$OUT"
+
+          # torchrun 会把子进程的 stderr 重定向并按 [rankN]: 前缀转发，子进程退出时
+          # 末尾几行常常被丢掉 —— 上次丢掉的正好是异常类型和消息，只留下 traceback
+          # 的帧和 ^ 光标。用 sitecustomize 在每个 python 进程里装 excepthook，
+          # 把完整 traceback 写到文件，之后无论怎么截断都还能拿到。
+          #
+          # 顺便解决训练后的落盘问题。上次（run 41961230370）187 步跑完、HF 导出和
+          # native 都写完之后才炸在 `_save_checkpoint` 里：
+          #   if not self.args.save_only_model:
+          #       self._save_optimizer_and_scheduler(...)      # trainer.py:3068
+          # AdamW 的 exp_avg/exp_avg_sq 是 fp32 的 2 × 4 × 7.9B ≈ 63 GB，/tmp 与 /
+          # 是同一个 50 GB overlay，装不下。
+          #
+          # 这里把 _save_checkpoint 整个改成 no-op。裁到 6 层后模型是 26.7 GB
+          # （13.35 B 参数，按 safetensors header 实测），而流程会写两份：
+          # 训练结束时的 checkpoint-187/huggingface 和 run_sft 里随后的
+          # trainer.save_model()，内容完全相同，两份就是 53 GB，超了 50 GB。
+          # 关掉前者，只留后者，落盘降到 ~27 GB。
+          #
+          # inject 点选在 _save_checkpoint 而不是 __init__，就不会触发 trainer 初始化
+          # 时对 load_best_model_at_end / FSDP SHARDED_STATE_DICT 的那些兼容性检查。
+          # 启动脚本会 export PYTHONPATH=$REPO_ROOT/src:$PYTHONPATH，前缀得以保留。
+          mkdir -p /tmp/ttcatch
+          cat > /tmp/ttcatch/sitecustomize.py <<'PY'
+          import faulthandler
+          import importlib.abc
+          import os
+          import sys
+          import traceback
+
+          _path = os.environ.get("TT_TRACEBACK_FILE", "/tmp/tt_traceback.log")
+
+
+          def _hook(exc_type, exc, tb):
+              try:
+                  with open(_path, "a", encoding="utf-8") as f:
+                      f.write(f"\n===== excepthook pid={os.getpid()} =====\n")
+                      traceback.print_exception(exc_type, exc, tb, file=f)
+              except Exception:
+                  pass
+              if sys.__excepthook__ is not None:
+                  sys.__excepthook__(exc_type, exc, tb)
+
+
+          sys.excepthook = _hook
+          try:
+              faulthandler.enable(open(_path + ".fault", "a"))
+          except Exception:
+              pass
+
+
+          def _install(module):
+              """中间 checkpoint 全跳过，只留最终 trainer.save_model() 的一份 HF 权重。"""
+              # 取刚执行完的模块对象本身：此刻父包 __init__ 还没跑完，
+              # `from transformers import Trainer` 可能拿不到属性。
+              Trainer = getattr(module, "Trainer", None)
+              if Trainer is None:
+                  from transformers import Trainer      # pragma: no cover
+
+              if getattr(Trainer, "_tt_skip_ckpt", False):
+                  return
+
+              def _save_checkpoint(self, model, trial=None):
+                  step = getattr(self.state, "global_step", "?")
+                  print(
+                      f"[ttcatch] checkpoint at step {step} skipped; "
+                      "the final save_model exports the single HF copy",
+                      flush=True,
+                  )
+
+              Trainer._save_checkpoint = _save_checkpoint
+              Trainer._tt_skip_ckpt = True
+              print("[ttcatch] checkpoint patch on: final HF export only", flush=True)
+
+
+          class _After:
+              def __init__(self, loader):
+                  self._loader = loader
+
+              def create_module(self, spec):
+                  return self._loader.create_module(spec)
+
+              def exec_module(self, module):
+                  self._loader.exec_module(module)
+                  try:
+                      _install(module)
+                  except Exception as exc:      # 装不上就退回原行为，别弄坏训练
+                      print(f"[ttcatch] patch failed: {exc}", flush=True)
+
+
+          class _Finder(importlib.abc.MetaPathFinder):
+              """只在 transformers.trainer 加载完成后动手，避免过早 import。"""
+
+              def find_spec(self, fullname, path=None, target=None):
+                  if fullname != "transformers.trainer":
+                      return None
+                  for finder in sys.meta_path:
+                      if finder is self:
+                          continue
+                      spec = finder.find_spec(fullname, path, target)
+                      if spec is not None and spec.loader is not None:
+                          spec.loader = _After(spec.loader)
+                          return spec
+                  return None
+
+
+          sys.meta_path.insert(0, _Finder())
+          PY
+          # 不要写成 ":/tmp/ttcatch:$PYTHONPATH" 那种带空段的写法：空段等于把 cwd
+          # （仓库根）塞进 sys.path，容易让同名目录抢先被导入。
+          export PYTHONPATH="/tmp/ttcatch${PYTHONPATH:+:$PYTHONPATH}"
 
           START=$(date +%s)
           # 启动脚本里是 `torchrun ... | tee $LOG_FILE`。trainer 异常退出时，它 fork
@@ -581,8 +694,22 @@ jobs:
           LAST=$(grep -oE "'loss': [0-9.]+" /tmp/train.log | tail -1)
           echo "::notice::train rc=${RC} in ${ELAPSED}s; hit=${HIT}; ${LAST:-no loss logged}"
 
-          printf 'rc=%s\nelapsed=%s\ncache_hit=%s\nsfs_uuid=%s\nshards=%s\nmodel_size=%s\nsp_size=%s\nep_size=%s\nlayers=%s\n' \
-            "$RC" "$ELAPSED" "$HIT" "${uuid:-?}" "$SHARDS" "$(( BYTES / 1048576 )) MiB" "$SP" "$EP" "$LAYERS" >> "$GITHUB_OUTPUT"
+          # 训练后看盘：ckpt 目录有多大、还剩多少空间、真正写下了哪些子目录。
+          # 上次就是在这里才需要这些数字。
+          df -h "$OUT" | sed 's/^/  df: /'
+          du -sh "$OUT" 2>/dev/null | sed 's/^/  used: /'
+          for d in "$OUT"/checkpoint-* ; do
+            [ -d "$d" ] || continue
+            echo "  ckpt $(basename "$d")"
+            du -sh "$d"/* 2>/dev/null | sed 's/^/    /'
+          done
+          if [ -s /tmp/tt_traceback.log ] ; then
+            echo "--- 捕获到的 Python 异常（torchrun 转发时会截断） ---"
+            tail -40 /tmp/tt_traceback.log
+          fi
+
+          printf 'rc=%s\nelapsed=%s\ncache_hit=%s\nsfs_uuid=%s\nshards=%s\nmodel_size=%s\nsp_size=%s\nep_size=%s\nlayers=%s\noutput_dir=%s\n' \
+            "$RC" "$ELAPSED" "$HIT" "${uuid:-?}" "$SHARDS" "$(( BYTES / 1048576 )) MiB" "$SP" "$EP" "$LAYERS" "$OUT" >> "$GITHUB_OUTPUT"
           exit "$RC"
 
 
@@ -608,6 +735,7 @@ jobs:
           TRAIN_SIZE: ${{ steps.train.outputs.model_size }}
           TRAIN_SP: ${{ steps.train.outputs.sp_size }}
           TRAIN_EP: ${{ steps.train.outputs.ep_size }}
+          TRAIN_OUT: ${{ steps.train.outputs.output_dir }}
         run: |
           set -uo pipefail
           TOTAL=$(( ${TORCHTURBO_S:-0} + ${LF_DEPS_S:-0} + ${TRAIN_S:-0} ))
@@ -626,6 +754,7 @@ jobs:
             echo "| dataset | \`${TRAIN_DATASET:-?}\` |"
             echo "| shards / size | ${TRAIN_SHARDS:-?} / ${TRAIN_SIZE:-?} |"
             echo "| parallel (sp/ep) | \`${TRAIN_SP:-?}/${TRAIN_EP:-?}\` |"
+            echo "| output_dir | \`${TRAIN_OUT:-?}\` |"
             echo ""
             echo "| phase | seconds | human | rc |"
             echo "|---|---|---|---|"
@@ -650,6 +779,12 @@ jobs:
             echo ""
             echo '```'
             tail -40 /tmp/train.log 2>/dev/null || echo "(no train log)"
+            echo '```'
+            echo ""
+            echo "### Python 异常（excepthook 捕获，torchrun 转发会截断）"
+            echo ""
+            echo '```'
+            tail -60 /tmp/tt_traceback.log 2>/dev/null || echo "(none)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
