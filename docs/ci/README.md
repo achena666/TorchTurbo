@@ -12,9 +12,10 @@ pull_request ──► ci-gate-pr.yml
                    ├─ L2b      E2E：一个族内小模型跑一步
                    └─ gate     唯一 required check
 
-push main / 每晚 ─► ci-full.yml（全量，不选测）
+每晚 ─────────────► ci-full.yml（全量，不选测；**push 不触发**）
 
-手动 ─────────────► ci-image.yml   构建基础镜像（**只手动**，不挂 schedule）
+手动 ─────────────► ci-full.yml    要看结果时手动跑一次全量
+                    ci-image.yml   构建基础镜像（**只手动**，不挂 schedule）
                     ci-pytest.yml  跑指定 pytest 路径
                     ci-train.yml   训练一个模型
 ```
@@ -80,7 +81,7 @@ push main / 每晚 ─► ci-full.yml（全量，不选测）
 1. 选择器异常 / 非 0 退出
 2. 改动文件为空（`merge-base` 失败、浅克隆没历史……）
 3. `ci:full` 标签（或 `workflow_dispatch` 的 `force_all`）
-4. `push main` / nightly
+4. nightly / 手动全量（`ci-full.yml` 本来就只走全量）；`push` 不再触发 CI
 5. 改动 **> 300 文件**
 
 第 5 条的方向是审过的：**大 PR 该跑更多测试，不是更少**。改 1000 个文件的 PR
