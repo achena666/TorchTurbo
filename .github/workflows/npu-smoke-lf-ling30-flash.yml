@@ -370,7 +370,10 @@ jobs:
             MODEL="/root/.cache/models/$(basename "$FLASH_REPO")-L${LAYERS}"
             # 标记文件记录这次裁剪的口径；层数改了就得重下，不能复用旧目录。
             MARK="$MODEL/.trim"
-            if [ -f "$MARK" ] && [ "$(cat "$MARK")" = "repo=${FLASH_REPO} layers=${LAYERS}" ] \
+            # 带上 index 版本：上一轮只裁了 config、没裁 index，目录里少 21 个 shard，
+            # 直接复用会继续报 FileNotFoundError，所以这里换口径让它重跑一遍。
+            WANT="repo=${FLASH_REPO} layers=${LAYERS} index=trimmed"
+            if [ -f "$MARK" ] && [ "$(cat "$MARK")" = "$WANT" ] \
                && r=$(probe "$MODEL") ; then
               BYTES=${r% *}; SHARDS=${r#* }; HIT=yes
               echo "HIT  $MODEL  bytes=$BYTES shards=$SHARDS"
@@ -406,9 +409,9 @@ jobs:
                   "*.py",
               ],
           )
-          weight_map = json.loads(
-              (dst / "model.safetensors.index.json").read_text()
-          )["weight_map"]
+          index_path = dst / "model.safetensors.index.json"
+          index_doc = json.loads(index_path.read_text())
+          weight_map = index_doc["weight_map"]
 
           # ② 按层算 shard 清单。非层张量（word_embeddings / norm / lm_head）必带；
           #    层号 >= layers 的张量全部跳过，它们所在的 shard 也就不下。
@@ -424,7 +427,25 @@ jobs:
 
           snapshot_download(repo_id=repo, local_dir=dst, allow_patterns=sorted(need))
 
-          # ③ 裁层。建几层完全由 num_hidden_layers 决定（modeling_*.py:1324）。
+          # ③ index.json 也必须跟着裁。BaseWeightConverter 构造时会建
+          #    CheckpointInfo，它把 weight_map 里的**每一个**文件都 open 一遍读
+          #    safetensors header（weight_converter.py:29-40），跟模型建了几层无关。
+          #    留着 24 个条目就会去 open 没下载的 shard，报
+          #      FileNotFoundError: .../model-00008-of-00024.safetensors
+          #    —— 上一轮（logs 3）就是这么挂的。只留 need 里的条目后，它只 open
+          #    这 3 个文件；真正按参数取舍的是 weight_loader，那边本来就只看
+          #    model.named_parameters() 反查到的文件。
+          kept = {name: shard for name, shard in weight_map.items() if shard in need}
+          index_doc["weight_map"] = kept
+          index_doc.setdefault("metadata", {})["tt_trimmed_layers"] = layers
+          index_path.write_text(json.dumps(index_doc, indent=2) + "\n")
+          print(
+              f"index: kept {len(kept)}/{len(weight_map)} entries "
+              f"({len(need)} shards)",
+              flush=True,
+          )
+
+          # ④ 裁层。建几层完全由 num_hidden_layers 决定（modeling_*.py:1324）。
           #    MTP 层建在 layers[num_hidden_layers]，全量 ckpt 里是 layers[42]，
           #    裁完编号对不上，只能关掉；对应的 mtp.enabled 在派生配置里置 false。
           cfg_path = dst / "config.json"
@@ -450,7 +471,7 @@ jobs:
               echo "::error::裁剪下载 $FLASH_REPO 连续失败 3 次（镜像侧 5xx 时重跑即可）"
               exit 1
             fi
-            printf 'repo=%s layers=%s\n' "$FLASH_REPO" "$LAYERS" > "$MARK"
+            printf '%s\n' "$WANT" > "$MARK"
             r=$(probe "$MODEL") || { echo "::error::model incomplete at $MODEL"; exit 1; }
             BYTES=${r% *}; SHARDS=${r#* }
           fi
