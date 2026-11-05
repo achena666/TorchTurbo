@@ -12,13 +12,15 @@ pull_request ──► ci-gate-pr.yml
                    ├─ L2b      E2E：一个族内小模型跑一步
                    └─ gate     唯一 required check
 
-每晚 ─────────────► ci-full.yml（全量，不选测；**push 不触发**）
-
-手动 ─────────────► ci-full.yml    要看结果时手动跑一次全量
-                    ci-image.yml   构建基础镜像（**只手动**，不挂 schedule）
+手动 ─────────────► ci-full.yml    全量（不选测；调试期唯一入口）
+                    ci-image.yml   构建基础镜像
                     ci-pytest.yml  跑指定 pytest 路径
                     ci-train.yml   训练一个模型
 ```
+
+**调试期所有自动触发都已注释掉**（`push` / `schedule`），只留手动 —— 一次全量
+要占 1 个 2 卡 + 1 个 8 卡十几分钟，而 CI 本身还在改。恢复时解开原处注释即可，
+`ci-full.yml` 与 `ci-image.yml` 里都写清了那几行该写什么。
 
 后两个同时是 `workflow_call`（给门禁调用）与 `workflow_dispatch`（给自己排查用）。
 合成一个文件而不是维护两个入口，是因为**两边的默认值刚好相反**：
@@ -65,7 +67,7 @@ pull_request ──► ci-gate-pr.yml
 | PR 用哪个镜像 | **固定链接 `…:base-latest`**（暂不接 artifact） | 「PR 悄悄换了一个镜像」是最难排查的一类问题 |
 
 构建成功后会把 `{ref, tag, digest}` 写成 `base-image-ref` artifact（保留 90 天）。
-**生产开着、消费暂关**：`ci-image.yml` 照旧发布，但 PR / nightly 的 `select`
+**生产开着、消费暂关**：`ci-image.yml` 照旧发布，但 PR / 全量的 `select`
 不读它，只用上面的固定链接。要接上时把 `--repo "$GITHUB_REPOSITORY"` 加回
 `image.py resolve` 那一行即可（解析顺序：人工覆盖 → artifact → 固定链接）。
 **整条链路不需要任何长期凭据** —— `gh variable set` 对 `GITHUB_TOKEN` 是 403，
@@ -81,7 +83,7 @@ pull_request ──► ci-gate-pr.yml
 1. 选择器异常 / 非 0 退出
 2. 改动文件为空（`merge-base` 失败、浅克隆没历史……）
 3. `ci:full` 标签（或 `workflow_dispatch` 的 `force_all`）
-4. nightly / 手动全量（`ci-full.yml` 本来就只走全量）；`push` 不再触发 CI
+4. 手动全量（`ci-full.yml` 只走全量）；`push` / `schedule` 当前都不触发 CI
 5. 改动 **> 300 文件**
 
 第 5 条的方向是审过的：**大 PR 该跑更多测试，不是更少**。改 1000 个文件的 PR

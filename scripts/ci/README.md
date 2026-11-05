@@ -24,7 +24,7 @@
 
 ```
 ci-gate-pr.yml   PR 门禁        select -> L0 / L1 / L2a / L2b -> gate
-ci-full.yml      main / nightly 全量
+ci-full.yml      main 全量（当前只手动）
 ci-image.yml     构建 L1 基础镜像（**只手动 dispatch**）
 ci-pytest.yml    pytest 的唯一实现（workflow_call + dispatch）
 ci-train.yml     训练的唯一实现（workflow_call + dispatch）
