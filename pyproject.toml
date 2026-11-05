@@ -20,6 +20,16 @@ dependencies = [
 dev = [
     "pytest>=7.0",
 ]
+test = [
+    "pytest>=7.0",
+    # 测试里直接 import 的。把它们写在这里而不是散在 workflow 的 pip 列表里，
+    # 是因为 CI 两条泳道（镜像 / 裸机）必须装同一套，漏一个就是 collection error。
+    "einops",
+    "transformers",
+    "huggingface_hub",
+    "pillow",
+    "peft",
+]
 
 # 只做三件事：限定测试根、声明 marker、让「没装包也能跑」。
 # 不设 addopts 里的 -m：NPU 泳道要跑的就是被打上 npu 的那些。

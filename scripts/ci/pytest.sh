@@ -39,6 +39,19 @@ mode, raw, shard = sys.argv[1], sys.argv[2], sys.argv[3]
 files = json.loads(raw) if raw.strip() else []
 if not files:
     files = sorted(glob.glob("tests/**/test_*.py", recursive=True))
+    if mode == "npu":
+        # npu 泳道只收真用到 torch_npu 的文件。否则 collection 会把整个
+        # tests/ 导一遍，缺 peft / PIL 这类可选依赖的模块会直接变成
+        # collection error，看起来像 NPU 坏了。判断方式与 tests/conftest.py
+        # 完全一致（同一个字符串特征）。
+        kept = []
+        for path in files:
+            try:
+                if "torch_npu" in open(path, encoding="utf-8").read():
+                    kept.append(path)
+            except OSError:
+                pass
+        files = kept
 if shard:
     i, n = (int(x) for x in shard.split("/"))
     files = [f for k, f in enumerate(files) if k % n == i]
