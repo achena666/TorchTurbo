@@ -1,15 +1,8 @@
 name: CI
 
-# One entry point, two modes, one job per lane.
-#
-#   mode=pr     pull request gate; selection from the diff, sole required check: gate
-#   mode=full   everything; selection forced, no sharding
-#
-# Lanes are inlined, not called as reusable workflows: a `uses:` job always
-# displays as "<caller name> / <callee name>", which cannot be collapsed into
-# the single label we want on the graph. Job keys carry an l1_/l2_/l3_ prefix
-# because the graph orders sibling jobs by key -- that is what keeps cpu-unit
-# first, npu-unit second, npu-model last.
+# Sole entry point: mode=pr (gate a PR on the diff) or mode=full.
+# Lanes are inlined -- a `uses:` job renders as "caller / callee" on the graph.
+# l1_/l2_/l3_ prefixes pin the order (jobs sort by key, not by position).
 
 on:
   pull_request:
@@ -34,19 +27,14 @@ on:
         required: false
         default: false
         type: boolean
-      # Smoke switch: one dir / file / node id instead of the whole selection.
-      # '-' keeps the normal selection. Takes precedence over everything else
-      # in pytest.sh, which is what makes a flow check take minutes, not hours.
       test_path:
         description: "unit lanes only: dir / file / node id; '-' = normal selection"
         required: false
         default: '-'
         type: string
 
-# PR runs cancel the previous run of the same PR. Full runs get a per-run group
-# on purpose: a shared group with cancel-in-progress: false still cancels
-# *pending* jobs, and repeated dispatches left the queue stuck at pending
-# forever. No shared group, no queue, nothing to get stuck.
+# A shared group with cancel-in-progress: false still cancels *pending* jobs and
+# once wedged this queue. So: PRs cancel per PR, full runs never queue.
 concurrency:
   group: ci-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('full-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -57,14 +45,10 @@ permissions:
   actions: read          # gate timing reads created_at / run_started_at
 
 env:
-  # Two triggers, one body: pull_request is always pr mode.
-  # Named CI_MODE because MODE is what pytest.sh reads (cpu / npu).
+  # Not MODE: pytest.sh reads MODE as cpu/npu.
   CI_MODE: ${{ github.event_name == 'pull_request' && 'pr' || inputs.mode }}
 
 jobs:
-  # Static checks and planning share one runner: they are strictly sequential,
-  # so step failure already means "no plan". The trailing always() step reports
-  # which stage broke, since a red job alone cannot tell them apart.
   select:
     name: Lint_Select
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
@@ -102,8 +86,6 @@ jobs:
       - name: hadolint
         run: bash scripts/ci/lint.sh hadolint docker/npu/Dockerfile_aarch64
 
-      # The image ref is resolved, not hardcoded: vars.BASE_IMAGE_TAG wins,
-      # otherwise the pinned base tag.
       - name: resolve image
         id: image
         env:
@@ -114,8 +96,8 @@ jobs:
           echo "image=$REF" >> "$GITHUB_OUTPUT"
           echo "image: $REF"
 
-      # Label semantics live inside affected.py (flags_from_event): if they lived
-      # here too, "what does ci:e2e mean" would have two implementations.
+      # Labels -> flags live in affected.py; a copy here would be a second
+      # definition of what ci:e2e means.
       - name: resolve plan
         id: pick
         env:
@@ -124,7 +106,7 @@ jobs:
           FORCE_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.force_all }}
         run: |
           set -uo pipefail
-          # An empty diff means "not enough information" -> full run (fail-open).
+          # Empty diff (no history / no info) -> full run: fail-open on purpose.
           python3 scripts/ci/affected.py --changed-from git \
             --dump-changed /tmp/changed.txt \
             --mode "$CI_MODE" --labels "$LABELS" \
@@ -133,12 +115,9 @@ jobs:
             --summary-file "$GITHUB_STEP_SUMMARY" \
             --image-ref '${{ steps.image.outputs.image }}'
 
-          # The selector is gated too: a silent algorithm regression would
-          # quietly drop test coverage.
           python3 scripts/ci/affected.py --self-test
 
-      # Must be last and always(): earlier steps stop on failure, and job
-      # outputs are still published when the job fails.
+      # Last and always(): outputs are still published when the job fails.
       - name: record stage
         id: stage
         if: always()
@@ -148,8 +127,7 @@ jobs:
           PICK_OUTCOME: ${{ steps.pick.outcome }}
         run: bash scripts/ci/lint.sh stage
 
-  # Bare metal, no sharding: one job, one box. Sharding would put one box per
-  # shard on the graph, and 5 shards was slower end to end than one job.
+  # No matrix, no shards: either would put one box per entry on the graph.
   l1_cpu_unit:
     name: cpu-unit-tests
     needs: select
@@ -202,12 +180,12 @@ jobs:
           python3 scripts/ci/result.py notice --file "$RESULT_JSON" \
             --model-type pytest-cpu-unit || true
 
-  # Containerised; once it starts, the whole lane runs (the operator and image
-  # surface is repo-wide, so running only the selected files proves nothing).
+  # Containerised, and the whole lane runs once it starts: operators and images
+  # are repo-wide, so running only the selected files proves nothing.
   l2_npu_unit:
     name: npu-unit-tests
     needs: select
-    # Fork PRs get no secrets, and passing secrets to fork code is RCE.
+    # Fork PRs get no secrets, and handing secrets to fork code is RCE.
     if: |
       always() && needs.select.result == 'success' &&
       needs.select.outputs.npu_unit_run == 'true' &&
@@ -230,8 +208,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Build the result file before anything can fail, so a run that dies in
-      # this step still renders a summary.
       - name: preflight
         env:
           RESULT_JSON: /tmp/ci-result.json
@@ -242,13 +218,11 @@ jobs:
             runner_label="${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}" \
             image="${{ needs.select.outputs.image }}"
 
-          # Snapshot torch before installing; a swapped torch turns every test
-          # red and looks like a code bug.
+          # Snapshot torch first; a swapped torch looks like a code bug.
           python3 scripts/ci/env.py capture --file /tmp/torch-before.json || true
 
           uname -m; nproc; free -h | head -2; df -h / | tail -1; python -V
 
-      # Same check as the model lane: 20 s to detect "no NPU" beats failing later.
       - name: npu self-check
         run: bash scripts/ci/train.sh probe
 
@@ -277,8 +251,8 @@ jobs:
           python3 scripts/ci/result.py notice --file "$RESULT_JSON" \
             --model-type pytest-npu-unit || true
 
-  # N profiles in one job. A matrix would put one box per profile on the graph,
-  # so the loop lives in train.sh lane instead.
+  # Profiles loop inside the job (train.sh lane): a matrix would put one box per
+  # profile on the graph.
   l3_npu_model:
     name: npu-model-tests
     needs: select
@@ -288,8 +262,6 @@ jobs:
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
-    # fromJSON is not needed here (no inputs), but keep the literal in sync with
-    # the lane timeout below.
     timeout-minutes: 45
     outputs:
       skip_reason: ${{ steps.lane.outputs.skip_reason }}
@@ -308,11 +280,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 20 s to detect "no NPU" beats discovering it after installing deps.
+      # 20 s to find "no NPU" beats discovering it after installing deps.
       - name: npu and stack self-check
         run: bash scripts/ci/train.sh probe
 
-      # prepare / install / run / report per profile, aggregated into one rc.
       - name: train
         id: lane
         timeout-minutes: 25
@@ -329,21 +300,14 @@ jobs:
           RESULT_JSON: /tmp/ci-result.json
         run: bash scripts/ci/train.sh lane
 
-      # Cleanup removes derived config and half a checkpoint, so it runs last.
-      # timeout-minutes only kills the process: a killed training leaves child
-      # processes holding cards and HBM, which makes the next job fail for
-      # unrelated reasons.
+      # timeout-minutes only kills the process; children would keep the cards.
       - name: cleanup
         if: always()
         continue-on-error: true
         run: python3 scripts/ci/env.py cleanup
 
-  # Sole required check. Rules live in scripts/ci/gate.py so pr and full modes
-  # cannot drift apart.
-  #
-  # select is a direct dependency: when planning fails the lanes skip
-  # immediately (their if requires select to succeed) and gate still runs,
-  # reporting the result in seconds instead of minutes.
+  # Sole required check; the rules live in gate.py so pr/full cannot drift.
+  # select is a direct dep: a failed plan skips the lanes in seconds.
   gate:
     name: gate
     needs: [select, l1_cpu_unit, l2_npu_unit, l3_npu_model]
@@ -351,7 +315,7 @@ jobs:
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4        # gate.py lives in scripts/ci
+      - uses: actions/checkout@v4
 
       - name: timing
         env:
