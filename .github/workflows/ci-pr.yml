@@ -34,6 +34,14 @@ on:
         required: false
         default: true
         type: boolean
+      # Smoke switch: one dir / file / node id instead of the whole selection.
+      # '-' keeps the normal selection. Takes precedence over everything else
+      # in pytest.sh, which is what makes a flow check take minutes, not hours.
+      test_path:
+        description: "unit lanes only: dir / file / node id; '-' = normal selection"
+        required: false
+        default: '-'
+        type: string
 
 # PR runs cancel the previous run of the same PR. Full runs get a per-run group
 # on purpose: a shared group with cancel-in-progress: false still cancels
@@ -126,7 +134,9 @@ jobs:
               *,ci:e2e,*)      EXTRA+=(--e2e-force) ;;
               *,ci:skip-npu,*) EXTRA+=(--no-npu) ;;
             esac
-            [ "${FORCE_INPUT}" = "true" ] && EXTRA+=(--force-all --e2e-all)
+            # force_all means "all unit tests", not "all e2e as well": the
+            # 8-card lane is the expensive part and stays opt-in.
+            [ "${FORCE_INPUT}" = "true" ] && EXTRA+=(--force-all)
           fi
 
           # An empty diff means "not enough information" -> full run (fail-open).
@@ -245,6 +255,7 @@ jobs:
         env:
           MODE: cpu
           TEST_FILES: ${{ needs.select.outputs.cpu_unit_files }}
+          TEST_PATH: ${{ inputs.test_path }}
           RESULT_JSON: /tmp/ci-result.json
         run: bash scripts/ci/pytest.sh
 
@@ -348,6 +359,7 @@ jobs:
         env:
           MODE: npu
           TEST_FILES: '[]'
+          TEST_PATH: ${{ inputs.test_path }}
           RESULT_JSON: /tmp/ci-result.json
         run: bash scripts/ci/pytest.sh
 
