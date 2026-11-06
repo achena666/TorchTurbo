@@ -60,9 +60,9 @@ on:
         default: '-v --durations=20'
         type: string
       transformers_spec:
-        description: '额外的 transformers 约束；空则用镜像里的版本'
+        description: '额外的 transformers 约束；默认钉住 5.5.4（见下方注释）'
         required: false
-        default: ''
+        default: 'transformers==5.5.4'
         type: string
       timeout_minutes:
         description: 'job 硬上限，只拦卡死'
@@ -122,9 +122,9 @@ on:
         default: '-v --durations=20'
         type: string
       transformers_spec:
-        description: '额外的 transformers 约束；留空则用镜像里的版本'
+        description: '额外的 transformers 约束；默认钉住 5.5.4（见下方注释）'
         required: false
-        default: ''
+        default: 'transformers==5.5.4'
         type: string
       timeout_minutes:
         description: 'job 硬上限（手动跑给宽一点）'
@@ -220,18 +220,27 @@ jobs:
           TRANSFORMERS_SPEC: ${{ inputs.transformers_spec }}
         run: |
           set -uo pipefail
+          START=$(date +%s)
           # `.[test]`：extras 里是测试真正 import 的那几个包（einops /
           # transformers / huggingface_hub / pillow / peft）。它们必须在
           # pyproject 里写一份，否则两条泳道迟早装成两套。
-          ARGS=(-e ".[test]")
-          [ -n "${TRANSFORMERS_SPEC}" ] && ARGS+=("${TRANSFORMERS_SPEC}")
-          START=$(date +%s)
           # --no-build-isolation：[build-system].requires 里有 torch，
           # 不开这个 pip 会为了跑 setuptools 再下一个完整 torch。
-          python -m pip install --no-cache-dir --no-build-isolation "${ARGS[@]}" 2>&1 \
+          python -m pip install --no-cache-dir --no-build-isolation -e ".[test]" 2>&1 \
             | tee /tmp/turbo.log
           RC=${PIPESTATUS[0]}
+          # pin 必须放在 `.[test]` **之后**：extras 里 transformers 无约束，
+          # 跟它一起解会装到最新版（镜像里就是这么漂到 5.22 的）。
+          # 单独再装一次才能真的把它拉回来。
+          if [ "$RC" -eq 0 ] && [ -n "${TRANSFORMERS_SPEC}" ]; then
+            python -m pip install --no-cache-dir "${TRANSFORMERS_SPEC}" 2>&1 \
+              | tee -a /tmp/turbo.log
+            RC=${PIPESTATUS[0]}
+          fi
           ELAPSED=$(( $(date +%s) - START ))
+          # 把装完的实际版本打出来：这一行是「pin 到底生没生效」的唯一证据，
+          # 没有它就只能等到 26 个用例变红才发现又漂了。
+          python -c "import transformers; print('transformers =', transformers.__version__)" || true
           [ "$RC" -eq 0 ] && { python3 "$CI_SCRIPTS/env.py" check --file /tmp/torch-before.json || RC=1; }
           python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
             --name '③ torchturbo 安装' --seconds "$ELAPSED" --rc "$RC"
@@ -291,15 +300,18 @@ jobs:
           # 先单独装 torch：GH 托管机没有预装，而下面 extras 里好几个包会
           # 声明对 torch 的依赖，一起解会让 pip 顺带装一份 GPU 版（几百 MB）。
           python -m pip install torch 2>&1 | tee /tmp/turbo.log
-          RC=${PIPESTATUS[0]}
-          [ -n "${TRANSFORMERS_SPEC}" ] && python -m pip install "${TRANSFORMERS_SPEC}" 2>&1 | tee -a /tmp/turbo.log
           # `-e ".[test]"`：extras 里是测试真正 import 的那几个包，两条泳道
           # （镜像 / 裸机）必须装同一套，否则同一个测试一边绿一边红。
           # pyproject 里的 torch>=2.10.0 刚才已满足，不会重新下载。
-          if [ "$RC" -eq 0 ]; then
-            python -m pip install --no-build-isolation -e ".[test]" 2>&1 | tee -a /tmp/turbo.log
+          python -m pip install --no-build-isolation -e ".[test]" 2>&1 | tee -a /tmp/turbo.log
+          RC=${PIPESTATUS[0]}
+          # pin 放在 `.[test]` 之后（与容器泳道同理）：extras 里 transformers
+          # 无约束，一起解会装到最新版。
+          if [ "$RC" -eq 0 ] && [ -n "${TRANSFORMERS_SPEC}" ]; then
+            python -m pip install "${TRANSFORMERS_SPEC}" 2>&1 | tee -a /tmp/turbo.log
             RC=${PIPESTATUS[0]}
           fi
+          python -c "import transformers; print('transformers =', transformers.__version__)" || true
 
           python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
             --name '③ torchturbo 安装' --seconds "$(( $(date +%s) - START ))" --rc "$RC"
