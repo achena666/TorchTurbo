@@ -1,100 +1,94 @@
-name: CI · 测试（三条泳道入口）
+name: CI / tests
 
-# **所有测试的唯一入口**：三条泳道共用一份输入声明、一份结果解析、一个手动入口。
+# Single entry point for all test lanes. One input set, one dispatch form.
 #
-#   kind=cpu-unit    cpu-unit-tests    GH 托管 arm64 · 裸机 pip         0 卡
-#   kind=npu-unit    npu-unit-tests    自托管 NPU 池 · 基础镜像          2 卡
-#   kind=npu-model   npu-model-tests   自建训练栈 + 跑一步              8 卡
+#   kind=cpu-unit    cpu-unit-tests   hosted arm64, bare metal       0 cards
+#   kind=npu-unit    npu-unit-tests   self-hosted pool, image        2 cards
+#   kind=npu-model   npu-model-tests  training stack + one step      8 cards
 #
-# 为什么合成一个文件而不是三个：
-#   · **两条 unit 泳道的差别只在「在哪跑」**，跑什么（分片 / marker / junit）
-#     完全一样。拆开就要么复制一份 step，要么再抽一层——前者必然漂，后者
-#     等于把这一层又写回来。
-#   · **手动入口只能有一个**。早先拆成「pytest」「train」两个文件时，两套默认值互相
-#     打架（手动跑被 45 min 截断 / PR 被 300 min 拖死），只能靠「dispatch 的
-#     默认值不影响调用方」这种口头约定，而约定不会报错。
+# The two unit lanes differ only in where they run, not in what they run, so
+# they share this file. kind replaces the old use_container flag: cpu-unit is
+# always bare metal, npu-unit always containerised, so the invalid pairing
+# cannot be expressed.
 #
-# npu-model 的实现体很复杂（取权重 / 减层 / sp-ep 收敛 / 看门狗 / 收尾），
-# 所以它**不在本文件里**：这里只保留一个 `uses:` 转发到 ci-tests-model.yml。
-# 本文件负责「选哪条泳道」，复杂度留在各自的实现里。
-#
-# kind 同时承担了原来的 `use_container`：cpu-unit 一定裸机、npu-unit 一定容器。
-# 少一个布尔输入，就少一类「cpu-unit 却给了镜像」的无效组合。
+# npu-model only forwards to ci-tests-model.yml. That file has no dispatch --
+# keeping a single manual entry point is what stops the two default sets from
+# drifting apart.
 
 on:
   workflow_call:
     inputs:
-      # ---------------------------------------------------------------- 通用
+      # ---------------------------------------------------------------- common
       kind:
         description: 'cpu-unit / npu-unit / npu-model'
         required: false
         default: 'npu-unit'
         type: string
       runner_label:
-        description: 'Runner 标签；尾缀数字是卡数'
+        description: 'Runner label; trailing number is the card count'
         required: true
         type: string
       image:
-        description: '单位测试的容器镜像 / 模型测试的基础镜像'
+        description: 'Image for unit lanes / base image for the model lane'
         required: false
         default: ''
         type: string
       timeout_minutes:
-        description: 'job 硬上限，只拦卡死'
+        description: 'Job hard limit'
         required: false
         default: 60
         type: number
 
-      # ------------------------------------------------------------ unit 专用
+      # ------------------------------------------------------------------ unit
       test_files:
-        description: 'JSON 数组；空 = 全量'
+        description: 'JSON array; empty = everything'
         required: false
         default: '[]'
         type: string
       test_path:
-        description: '单个 path / node id；非空则忽略 test_files 与 shard（手动排查用）'
+        description: 'Single path / node id; overrides test_files and shard'
         required: false
         default: ''
         type: string
       shard:
-        description: '"0/3" 形式；空 = 不切'
+        description: '"0/3" form; empty = no sharding'
         required: false
         default: ''
         type: string
       pytest_args:
-        description: '额外 pytest 参数（按空格拆是有意的）'
+        description: 'Extra pytest args (split on spaces on purpose)'
         required: false
         default: '-v --durations=20'
         type: string
       transformers_spec:
-        description: '额外的 transformers 约束；空则用镜像里的版本'
+        description: 'Extra transformers constraint; empty = image default'
         required: false
         default: ''
         type: string
 
-      # ----------------------------------------------------------- model 专用
+      # ----------------------------------------------------------------- model
       model_type:
-        description: '@register_model 的名字，model_map.json 里 models 的键'
+        description: '@register_model name, key of model_map.json models'
         required: false
         default: 'qwen3_5'
         type: string
       framework:
-        description: 'lf 或 swift'
+        description: 'lf or swift'
         required: false
         default: 'lf'
         type: string
       train_model_path:
-        description: '显式模型目录；留空则按 hf_repo 查找'
+        description: 'Explicit model dir; empty = look up hf_repo'
         required: false
         default: ''
         type: string
       hf_repo_override:
-        description: '覆盖 model_map.json 里的 hf_repo 字段'
+        description: 'Override the hf_repo field of model_map.json'
         required: false
         default: ''
         type: string
       trim_layers:
-        description: '只保留前 N 层；0 = 全量下载'
+        description: 'Keep the first N layers; 0 = full download'
         required: false
         default: 0
         type: number
@@ -111,7 +105,7 @@ on:
         default: 'full'
         type: string
       train_sp_size:
-        description: 'auto = 按卡数收敛仓库里的值'
+        description: 'auto = narrow the repo value to the card count'
         required: false
         default: 'auto'
         type: string
@@ -120,22 +114,22 @@ on:
         default: 'auto'
         type: string
       diag:
-        description: '把 scripts/ci/diag 装进 PYTHONPATH'
+        description: 'Put scripts/ci/diag on PYTHONPATH'
         required: false
         default: true
         type: boolean
       strict:
-        description: 'true = 模型获取超时判红；false = 跳过并判绿（PR 默认）'
+        description: 'true = model fetch timeout fails; false = skip and pass'
         required: false
         default: false
         type: boolean
       train_timeout_minutes:
-        description: '单步训练的硬上限（实测 163 s，默认 10 min 只拦卡死）'
+        description: 'Hard limit for one training step'
         required: false
         default: 10
         type: number
       fetch_timeout_seconds:
-        description: '模型获取硬超时；超时即跳过'
+        description: 'Model fetch timeout; on timeout the lane is skipped'
         required: false
         default: 600
         type: number
@@ -146,14 +140,14 @@ on:
         required: false
     outputs:
       skip_reason:
-        description: 'npu-model 没真的训练（超时/跳过）时的原因，gate 据此判 skipped-reason'
+        description: 'Non-empty when npu-model did not really train'
         value: ${{ jobs.npu_model_tests.outputs.skip_reason }}
 
-  # 手动入口。默认值换成「排查 / 跑全量」方便的那一套，调用方永远显式传值。
+  # Manual entry. Defaults favour debugging; callers always pass values explicitly.
   workflow_dispatch:
     inputs:
       kind:
-        description: '跑哪条泳道'
+        description: 'Which lane'
         required: true
         default: 'npu-unit'
         type: choice
@@ -162,7 +156,7 @@ on:
           - npu-unit
           - npu-model
       runner_label:
-        description: 'Runner 标签（尾缀数字是卡数）'
+        description: 'Runner label (trailing number is the card count)'
         required: true
         default: 'linux-aarch64-a3-800i-2'
         type: choice
@@ -175,27 +169,27 @@ on:
           - linux-aarch64-cpu-24
           - ubuntu-22.04-arm
       image:
-        description: '基础镜像；用 repo@sha256:... 可严格复现'
+        description: 'Base image; use repo@sha256:... for an exact repro'
         required: false
         default: 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest'
         type: string
       test_path:
-        description: 'unit 专用：目录 / 文件 / node id；填 - 表示整条泳道（留空会回落到默认值）'
+        description: 'unit only: dir / file / node id; "-" means the whole lane'
         required: false
         default: '-'
         type: string
       pytest_args:
-        description: 'unit 专用：额外 pytest 参数（按空格拆）'
+        description: 'unit only: extra pytest args'
         required: false
         default: '-v --durations=20'
         type: string
       transformers_spec:
-        description: 'unit 专用：额外的 transformers 约束；留空则用镜像里的版本'
+        description: 'unit only: extra transformers constraint'
         required: false
         default: ''
         type: string
       model_type:
-        description: 'model 专用：@register_model 的名字'
+        description: 'model only: @register_model name'
         required: false
         default: 'qwen3_5'
         type: choice
@@ -212,7 +206,7 @@ on:
           - qwen3_moe
           - glm_moe_dsa
       framework:
-        description: 'model 专用：训练框架；决定用 lf_* 还是 swift_* 启动脚本'
+        description: 'model only: lf or swift launch scripts'
         required: false
         default: 'lf'
         type: choice
@@ -220,22 +214,22 @@ on:
           - lf
           - swift
       trim_layers:
-        description: 'model 专用：只保留前 N 层，0 = 全量。flash 用 6（约一个周期）'
+        description: 'model only: keep the first N layers, 0 = full'
         required: false
         default: 0
         type: number
       train_dataset:
-        description: 'model 专用：数据集名（dataset/dataset_info.json 里的 key）'
+        description: 'model only: dataset key from dataset/dataset_info.json'
         required: false
         default: 'gsm8k'
         type: string
       train_seq_len:
-        description: 'model 专用：cutoff_len'
+        description: 'model only: cutoff_len'
         required: false
         default: '1024'
         type: string
       train_finetuning_type:
-        description: 'model 专用：微调方式'
+        description: 'model only: finetuning type'
         required: false
         default: 'full'
         type: choice
@@ -243,12 +237,12 @@ on:
           - full
           - lora
       strict:
-        description: 'model 专用：true = 模型获取超时判红（手动跑建议开）'
+        description: 'model only: true = model fetch timeout fails'
         required: false
         default: true
         type: boolean
       timeout_minutes:
-        description: 'job 硬上限（手动跑给宽一点）'
+        description: 'Job hard limit (manual runs get more room)'
         required: false
         default: 300
         type: number
@@ -263,34 +257,30 @@ env:
   RESULT_JSON: /tmp/ci-result.json
 
 jobs:
-  # ---------------------------------------------------------- cpu-unit-tests
   cpu_unit_tests:
-    name: cpu-unit-tests（裸机 · ${{ inputs.runner_label }}）
+    name: cpu-unit-tests (bare metal / ${{ inputs.runner_label }})
     if: ${{ inputs.kind == 'cpu-unit' }}
     runs-on: ${{ inputs.runner_label }}
-    # `|| 60` 是兜底；外面必须包 fromJSON：dispatch 触发的 number 输入实际是
-    # 字符串（"30"），直接给 timeout-minutes 会让 GitHub **静默丢弃整个 job**
-    # （不是报错，是 run 里看不到这个 job）。详见 docs/ci/README.md。
+    # fromJSON is required: a number input arrives as a string and GitHub
+    # silently drops the whole job if timeout-minutes gets one.
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
-    # concurrency 一律不加：曾经按 runner_label 分过组，结果同组 pending 的
-    # job 只保留最后一个，5 个分片剩 2 个。串行由 runner 忙时天然排队提供。
+    # No job-level concurrency: within a group only the last pending job is
+    # kept, which cancelled 3 of 5 shards in an earlier run.
 
     defaults:
       run:
         shell: bash
 
     steps:
-      - name: ① 检出
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: ② 准备 python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
           cache-dependency-path: pyproject.toml
 
-      - name: ③ 安装 torchturbo
+      - name: install
         env:
           TRANSFORMERS_SPEC: ${{ inputs.transformers_spec }}
         run: |
@@ -300,30 +290,29 @@ jobs:
             mode='${{ inputs.kind }}' runner_label='${{ inputs.runner_label }}'
 
           START=$(date +%s)
-          # 先单独装 torch：GH 托管机没有预装，而下面 extras 里好几个包会
-          # 声明对 torch 的依赖，一起解会让 pip 顺带装一份 GPU 版（几百 MB）。
+          # Install torch first: the extras below declare torch deps, and
+          # resolving them together pulls a full CUDA build.
           python -m pip install torch 2>&1 | tee /tmp/turbo.log
           RC=${PIPESTATUS[0]}
-          # `-e ".[test]"`：extras 里是测试真正 import 的那几个包，两条 unit
-          # 泳道（镜像 / 裸机）必须装同一套，否则同一个测试一边绿一边红。
-          # pyproject 里的 torch>=2.10.0 刚才已满足，不会重新下载。
+          # Same extras as the container lane, otherwise the same test is green
+          # on one lane and red on the other.
           if [ "$RC" -eq 0 ]; then
             python -m pip install --no-build-isolation -e ".[test]" 2>&1 | tee -a /tmp/turbo.log
             RC=${PIPESTATUS[0]}
           fi
-          # 手动覆盖版本时才装。默认留空 = 完全跟随 extras 解出来的版本。
           if [ "$RC" -eq 0 ] && [ -n "${TRANSFORMERS_SPEC}" ]; then
             python -m pip install "${TRANSFORMERS_SPEC}" 2>&1 | tee -a /tmp/turbo.log
             RC=${PIPESTATUS[0]}
           fi
-          # 装完打一行实际版本：这是「两条 unit 泳道是否同一个 transformers」的唯一证据。
+          # Print the real version: the image gets transformers transitively,
+          # so without this line drift only shows up as a batch of red tests.
           python -c "import transformers; print('transformers =', transformers.__version__)" || true
 
           python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
-            --name '③ torchturbo 安装' --seconds "$(( $(date +%s) - START ))" --rc "$RC"
+            --name 'install' --seconds "$(( $(date +%s) - START ))" --rc "$RC"
           exit "$RC"
 
-      - name: ④ pytest
+      - name: pytest
         env:
           MODE: cpu
           TEST_FILES: ${{ inputs.test_files }}
@@ -332,7 +321,7 @@ jobs:
           PYTEST_ARGS: ${{ inputs.pytest_args }}
         run: bash "$CI_SCRIPTS/pytest.sh"
 
-      - name: ⑤ 摘要
+      - name: summary
         if: always()
         run: |
           set -uo pipefail
@@ -341,9 +330,8 @@ jobs:
           python3 "$CI_SCRIPTS/result.py" notice --file "$RESULT_JSON" \
             --model-type "pytest-${{ inputs.kind }}" || true
 
-  # ---------------------------------------------------------- npu-unit-tests
   npu_unit_tests:
-    name: npu-unit-tests（容器 · ${{ inputs.runner_label }}）
+    name: npu-unit-tests (container / ${{ inputs.runner_label }})
     if: ${{ inputs.kind == 'npu-unit' }}
     runs-on: ${{ inputs.runner_label }}
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
@@ -360,11 +348,11 @@ jobs:
         shell: bash
 
     steps:
-      - name: ① 检出
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # 结果文件在任何可能失败的步骤之前就建好，这样「② 就挂了」的 run 也有摘要。
-      - name: ② 先行校验
+      # Build the result file before anything can fail, so a run that dies in
+      # this step still renders a summary.
+      - name: preflight
         env:
           KIND: ${{ inputs.kind }}
           RUNNER_LABEL: ${{ inputs.runner_label }}
@@ -376,19 +364,17 @@ jobs:
             kind=pytest model_type="pytest-$KIND" mode="$KIND" \
             runner_label="$RUNNER_LABEL" image="$IMAGE"
 
-          # 装上之前先记一份 torch，装完比对：被换掉的 torch 会让测试全红，
-          # 而且看起来像代码 bug。
+          # Snapshot torch before installing; a swapped torch turns every test
+          # red and looks like a code bug.
           python3 "$CI_SCRIPTS/env.py" capture --file /tmp/torch-before.json || true
 
           uname -m; nproc; free -h | head -2; df -h / | tail -1; python -V
           echo "files: ${TEST_FILES}"
 
-      - name: ②b NPU 自检
+      - name: npu self-check
         run: |
           set -uo pipefail
-          # 用 bash 通配数设备，不用 `ls | wc -l`：actionlint 会按 shellcheck
-          # SC2012 判红（ls 解析文件名不安全），而设备名恰恰是安全的 —— 与其
-          # 加一行 disable，不如直接不用 ls。
+          # Glob instead of `ls | wc -l`: shellcheck SC2012 flags ls parsing.
           shopt -s nullglob
           davinci=(/dev/davinci*)
           if [ "${#davinci[@]}" -eq 0 ]; then
@@ -401,36 +387,30 @@ jobs:
           python3 "$CI_SCRIPTS/env.py" verify
           RC=$?
           python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
-            --name '②b NPU 自检' --seconds "$(( $(date +%s) - START ))" --rc "$RC"
+            --name 'npu self-check' --seconds "$(( $(date +%s) - START ))" --rc "$RC"
           exit "$RC"
 
-      - name: ③ 安装 torchturbo
+      - name: install
         env:
           TRANSFORMERS_SPEC: ${{ inputs.transformers_spec }}
         run: |
           set -uo pipefail
-          # `.[test]`：extras 里是测试真正 import 的那几个包（einops /
-          # transformers / huggingface_hub / pillow / peft）。它们必须在
-          # pyproject 里写一份，否则两条泳道迟早装成两套。
           ARGS=(-e ".[test]")
           [ -n "${TRANSFORMERS_SPEC}" ] && ARGS+=("${TRANSFORMERS_SPEC}")
           START=$(date +%s)
-          # --no-build-isolation：[build-system].requires 里有 torch，
-          # 不开这个 pip 会为了跑 setuptools 再下一个完整 torch。
+          # --no-build-isolation: [build-system].requires contains torch, and
+          # pip would otherwise download a full torch just to run setuptools.
           python -m pip install --no-cache-dir --no-build-isolation "${ARGS[@]}" 2>&1 \
             | tee /tmp/turbo.log
           RC=${PIPESTATUS[0]}
           ELAPSED=$(( $(date +%s) - START ))
-          # 把装完的实际版本打出来。基础镜像里的 transformers 是
-          # `pip install flash-linear-attention` 带进来的、无版本约束，
-          # 已经漂过两次；没有这一行，环境漂移只能等一堆用例变红才发现。
           python -c "import transformers; print('transformers =', transformers.__version__)" || true
           [ "$RC" -eq 0 ] && { python3 "$CI_SCRIPTS/env.py" check --file /tmp/torch-before.json || RC=1; }
           python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
-            --name '③ torchturbo 安装' --seconds "$ELAPSED" --rc "$RC"
+            --name 'install' --seconds "$ELAPSED" --rc "$RC"
           exit "$RC"
 
-      - name: ④ pytest
+      - name: pytest
         env:
           MODE: npu
           TEST_FILES: ${{ inputs.test_files }}
@@ -439,7 +419,7 @@ jobs:
           PYTEST_ARGS: ${{ inputs.pytest_args }}
         run: bash "$CI_SCRIPTS/pytest.sh"
 
-      - name: ⑤ 摘要
+      - name: summary
         if: always()
         run: |
           set -uo pipefail
@@ -448,11 +428,9 @@ jobs:
           python3 "$CI_SCRIPTS/result.py" notice --file "$RESULT_JSON" \
             --model-type "pytest-${{ inputs.kind }}" || true
 
-  # --------------------------------------------------------- npu-model-tests
-  # 只做转发。实现体（取权重 / 减层 / 看门狗 / 收尾）在 ci-tests-model.yml，
-  # 那里没有手动入口 —— 手动入口只在本文件，避免两套默认值再次分叉。
+  # Forwarding only; the implementation lives in ci-tests-model.yml.
   npu_model_tests:
-    name: npu-model-tests（${{ inputs.model_type }}/${{ inputs.framework }}）
+    name: npu-model-tests (${{ inputs.model_type }}/${{ inputs.framework }})
     if: ${{ inputs.kind == 'npu-model' }}
     uses: ./.github/workflows/ci-tests-model.yml
     with:

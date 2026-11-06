@@ -1,55 +1,53 @@
-name: CI · 模型测试（实现体）
+name: CI / model tests
 
-# 「装一套真实的训练栈，然后跑一步」的唯一实现。
-# 调用方是 ci-tests.yml（kind=npu-model）—— 全仓**只有一个手动入口**，
-# 就是 ci-tests.yml。这里不单独开 workflow_dispatch，否则同一套输入要
-# 在两个文件里各维护一份，默认值迟早打架（这正是当初 pytest/train
-# 分成两个文件时踩过的坑）。
+# "Install a real training stack, then run one step."
+# Called by ci-tests.yml with kind=npu-model. No dispatch here on purpose: the
+# single manual entry point stays ci-tests.yml, so the two default sets cannot
+# drift apart.
 #
-# 编排全在 scripts/ci，修一处对所有调用方生效：
+# All orchestration lives in scripts/ci:
+#   train.sh             prepare / probe / install / run / report
+#   model.py             probe / find / mark / fetch / trim
+#   env.py               verify / capture / check / cleanup
+#   parallel_plan.py     cards -> sp/ep
+#   train_supervisor.sh  watchdog + process-group cleanup
+#   diag/                exception capture and NaN probes
+#   result.py            facts -> summary markdown
 #
-#   train.sh      编排：prepare / probe / install / run / report
-#   model.py      取模型：probe / find / mark / fetch / trim
-#   env.py        环境：verify / capture / check / cleanup
-#   parallel_plan.py     卡数 -> sp/ep               （仓库 yaml 按满卡写）
-#   train_supervisor.sh  看门狗 + 进程组清理         （tee 卡死、step 被取消）
-#   diag/sitecustomize.py 异常捕获与 NaN 探针
-#   result.py            事实 -> 摘要 markdown      （失败的 run 也要有报告）
-#
-# 时间预算：不追求极限，只要求「不失控」。step 硬超时给到实测值的 3~4 倍 ——
-# 超时的职责是拦住卡死，不是卡住正常但较慢的运行。
+# Step timeouts are 3~4x the measured value: their job is to catch a hang, not
+# to bound a slow but healthy run.
 
 on:
   workflow_call:
     inputs:
       runner_label:
-        description: 'Runner 标签；尾缀数字是卡数'
+        description: 'Runner label; trailing number is the card count'
         required: true
         type: string
       image:
-        description: 'L1 基础镜像；用 repo@sha256:... 可严格复现'
+        description: 'Base image; use repo@sha256:... for an exact repro'
         required: true
         type: string
       model_type:
-        description: '@register_model 的名字，model_map.json 里 models 的键'
+        description: '@register_model name, key of model_map.json models'
         required: true
         type: string
       framework:
-        description: 'lf 或 swift'
+        description: 'lf or swift'
         required: true
         type: string
       train_model_path:
-        description: '显式模型目录；留空则按 hf_repo 查找'
+        description: 'Explicit model dir; empty = look up hf_repo'
         required: false
         default: ''
         type: string
       hf_repo_override:
-        description: '覆盖 model_map.json 里的 hf_repo 字段'
+        description: 'Override the hf_repo field of model_map.json'
         required: false
         default: ''
         type: string
       trim_layers:
-        description: '只保留前 N 层；0 = 全量下载'
+        description: 'Keep the first N layers; 0 = full download'
         required: false
         default: 0
         type: number
@@ -66,7 +64,7 @@ on:
         default: 'full'
         type: string
       train_sp_size:
-        description: 'auto = 按卡数收敛仓库里的值'
+        description: 'auto = narrow the repo value to the card count'
         required: false
         default: 'auto'
         type: string
@@ -75,27 +73,27 @@ on:
         default: 'auto'
         type: string
       diag:
-        description: '把 scripts/ci/diag 装进 PYTHONPATH'
+        description: 'Put scripts/ci/diag on PYTHONPATH'
         required: false
         default: true
         type: boolean
       strict:
-        description: 'true = 模型获取超时判红；false = 跳过并判绿（PR 默认）'
+        description: 'true = model fetch timeout fails; false = skip and pass'
         required: false
         default: false
         type: boolean
       timeout_minutes:
-        description: 'job 硬上限'
+        description: 'Job hard limit'
         required: false
         default: 45
         type: number
       train_timeout_minutes:
-        description: '单步训练的硬上限（实测 163 s，默认 10 min 只拦卡死）'
+        description: 'Hard limit for one training step'
         required: false
         default: 10
         type: number
       fetch_timeout_seconds:
-        description: '模型获取硬超时；超时即跳过'
+        description: 'Model fetch timeout; on timeout the lane is skipped'
         required: false
         default: 600
         type: number
@@ -106,7 +104,7 @@ on:
         required: true
     outputs:
       skip_reason:
-        description: '非空表示这次没真的训练（超时/跳过），gate 据此判 skipped-reason'
+        description: 'Non-empty when this run did not really train'
         value: ${{ jobs.npu_model_tests.outputs.skip_reason }}
 
 permissions:
@@ -115,31 +113,28 @@ permissions:
 env:
   PYTHONUNBUFFERED: '1'
   PIP_DISABLE_PIP_VERSION_CHECK: '1'
-  # pod 内能到 hf-mirror，huggingface.co 返回 503。
   HF_ENDPOINT: 'https://hf-mirror.com'
   HF_HOME: '/root/.cache/huggingface'
-  # HF_HOME 在共享 SFS 上，但 trust_remote_code 的副本不能放那儿：
-  # 多个 pod 同时写同一目录会留下半个 .py，而 transformers 只查 exists()。
+  # HF_HOME sits on shared SFS; trust_remote_code copies must not, because
+  # several pods writing one file leaves half a .py and transformers only
+  # checks exists().
   HF_MODULES_CACHE: '/tmp/hf-modules'
-  # 默认 10 s，繁忙镜像会超；下载超时是「每次读」的超时，卡住就抛且不重试。
   HF_HUB_ETAG_TIMEOUT: '30'
   HF_HUB_DOWNLOAD_TIMEOUT: '120'
-  # hf_xet 会去 cas-server.xethub.hf.co，HF_ENDPOINT 不代理它，
-  # 且会把跨境的短暂读失败当成永久的大小不符。
+  # hf_xet talks to cas-server.xethub.hf.co, which HF_ENDPOINT does not proxy,
+  # and turns a transient read failure into a permanent size mismatch.
   HF_HUB_DISABLE_XET: '1'
   CI_SCRIPTS: ${{ github.workspace }}/scripts/ci
   RESULT_JSON: /tmp/ci-result.json
 
 jobs:
   npu_model_tests:
-    name: npu-model-tests（${{ inputs.model_type }}/${{ inputs.framework }} · ${{ inputs.runner_label }}）
+    name: npu-model-tests (${{ inputs.model_type }}/${{ inputs.framework }} / ${{ inputs.runner_label }})
     runs-on: ${{ inputs.runner_label }}
-    # fromJSON 不能省：inputs 里的 number 经 workflow_call 传进来仍可能是字符串，
-    # 直接给 timeout-minutes 会让 GitHub 静默丢弃整个 job。见 ci-tests.yml。
+    # fromJSON is required; see ci-tests.yml.
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 45) }}
-    # 这里**不要**加 job 级 concurrency：同组 pending 的 job 只保留最后一个，
-    # 会把排在前面的 run 静默取消（ci-tests.yml 里踩过，5 个分片剩 2 个）。
-    # NPU 池的串行由 runner 自己保证 —— runner 忙的时候 job 就在 queued 里等。
+    # No job-level concurrency: serial access to the NPU pool is provided by
+    # the runner queue itself.
     outputs:
       skip_reason: ${{ steps.run.outputs.skip_reason }}
 
@@ -157,8 +152,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ② 在所有可能失败的步骤之前建好结果文件：② 就挂掉的 run 也要能出摘要。
-      - name: ② 校验映射表 + 定位启动脚本
+      # First, so a run that dies here still has a result file.
+      - name: resolve map and launch script
         id: resolve
         env:
           MODEL_TYPE: ${{ inputs.model_type }}
@@ -169,19 +164,19 @@ jobs:
           DATASET: ${{ inputs.train_dataset }}
         run: bash "$CI_SCRIPTS/train.sh" prepare
 
-      # 花 20 s 发现「没有 NPU」，比装完两套依赖再发现省一整轮超时。
-      - name: ②b NPU / 栈自检
+      # 20 s to detect "no NPU" beats discovering it after installing deps.
+      - name: npu and stack self-check
         run: bash "$CI_SCRIPTS/train.sh" probe
 
-      # 两个安装点在踩同一个坑：pip 解依赖时会用 PyPI 的 torch 覆盖自建的
-      # NPU wheel，过程一声不响。所以每次装完都回头验一遍 torch 的来源。
-      - name: ③ 安装 torchturbo + 模型依赖
+      # pip resolving deps can silently replace the self-built NPU torch with
+      # the PyPI one, so the source is verified after every install.
+      - name: install
         id: deps
         env:
           INSTALL_SCRIPT: ${{ steps.resolve.outputs.install_script }}
         run: bash "$CI_SCRIPTS/train.sh" install
 
-      - name: ⑤ 训练（${{ inputs.model_type }} / ${{ inputs.framework }}）
+      - name: train
         id: run
         timeout-minutes: ${{ fromJSON(inputs.train_timeout_minutes || 10) }}
         env:
@@ -202,17 +197,17 @@ jobs:
           STRICT: ${{ inputs.strict }}
         run: bash "$CI_SCRIPTS/train.sh" run
 
-      # 摘要放在收尾之前：收尾会清掉 /tmp 里的派生配置和半个 checkpoint。
-      - name: ⑥ 摘要
+      # Summary before cleanup: cleanup removes derived config and half a checkpoint.
+      - name: summary
         if: always()
         env:
           MODEL_TYPE: ${{ inputs.model_type }}
         run: bash "$CI_SCRIPTS/train.sh" report
 
-      # timeout-minutes 只杀进程，不负责收尾。被杀的训练会留下占卡的子进程、
-      # 没释放的显存和半个 checkpoint，下个 job 会以完全无关的方式失败。
-      # 必须是最后一步且 if: always()：取消、超时、成功都要跑。
-      - name: ⑦ 收尾
+      # timeout-minutes only kills the process. A killed training leaves child
+      # processes holding cards, unreleased HBM and a partial checkpoint, which
+      # makes the next job fail for unrelated reasons. Must be last and always().
+      - name: cleanup
         if: always()
         continue-on-error: true
         run: python3 "$CI_SCRIPTS/env.py" cleanup
