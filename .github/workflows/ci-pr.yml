@@ -105,8 +105,7 @@ jobs:
             --dump-changed /tmp/changed.txt \
             "${EXTRA[@]}" --explain --output /tmp/sel.json --github-output "$GITHUB_OUTPUT"
 
-          echo "changed files: $(wc -l < /tmp/changed.txt)"
-          head -40 /tmp/changed.txt
+          wc -l < /tmp/changed.txt
 
           # The selector is gated too: a silent algorithm regression would
           # quietly drop test coverage.
@@ -120,30 +119,29 @@ jobs:
           OVERRIDE: ${{ vars.BASE_IMAGE_TAG }}
         run: |
           set -uo pipefail
-          REF=$(python3 scripts/ci/image.py resolve \
-            --override "$OVERRIDE" \
+          REF=$(python3 scripts/ci/image.py resolve --override "$OVERRIDE" \
             --fallback 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest')
           echo "image=$REF" >> "$GITHUB_OUTPUT"
-          echo "image: $REF"
-          {
-            echo "## Plan"
-            echo ""
-            echo '| item | value |'
-            echo '|---|---|'
-            echo "| mode | \`${{ steps.pick.outputs.mode }}\` |"
-            echo "| cpu-unit / npu-unit / npu-model | \`${{ steps.pick.outputs.cpu_unit_run }} / ${{ steps.pick.outputs.npu_unit_run }} / ${{ steps.pick.outputs.npu_model_run }}\` |"
-            echo "| e2e | \`${{ steps.pick.outputs.e2e }}\` |"
-            echo "| shards | \`${{ steps.pick.outputs.shard_list }}\` |"
-            echo "| image | \`$REF\` |"
-            echo "| summary | \`${{ steps.pick.outputs.summary }}\` |"
-            echo ""
-            echo "<details><summary>changed files</summary>"
-            echo ""
-            echo '```'
-            head -100 /tmp/changed.txt || true
-            echo '```'
-            echo "</details>"
-          } >> "$GITHUB_STEP_SUMMARY"
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Plan
+
+          | item | value |
+          |---|---|---|
+          | mode | \`${{ steps.pick.outputs.mode }}\` |
+          | lanes | \`${{ steps.pick.outputs.cpu_unit_run }} / ${{ steps.pick.outputs.npu_unit_run }} / ${{ steps.pick.outputs.npu_model_run }}\` |
+          | e2e | \`${{ steps.pick.outputs.e2e }}\` |
+          | shards | \`${{ steps.pick.outputs.shard_list }}\` |
+          | image | \`$REF\` |
+          | summary | \`${{ steps.pick.outputs.summary }}\` |
+
+          <details><summary>changed files</summary>
+
+          \`\`\`
+          $(head -100 /tmp/changed.txt || true)
+          \`\`\`
+          </details>
+          EOF
 
       # Must be last and always(): earlier steps stop on failure, and job
       # outputs are still published when the job fails.
