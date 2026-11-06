@@ -5,9 +5,10 @@
 
 ```
 pull_request ──► ci-gate-pr.yml
-                   ├─ lint     编译 / workflow 解析 / 映射表 / 决策层契约 / 选择器防篡改
-                   │           (+actionlint +hadolint)   ← 链头，先跑
-                   ├─ select   算改动 → 出计划（四个泳道开关 + 文件清单）
+                   ├─ select   静态检查（编译 / workflow / 映射表 / 契约 / 选择器防篡改
+                   │           + actionlint + hadolint）
+                   │           然后算改动 → 出计划（泳道开关 + 文件清单）
+                   │           两者**同一个 job、同一个 runner**
                    ├─ L1       CPU pytest（affected 选中的文件 ×N 片）
                    ├─ L2a      NPU pytest（一旦开跑就泳道内全跑）
                    ├─ L2b      E2E：一个族内小模型跑一步
@@ -19,38 +20,44 @@ pull_request ──► ci-gate-pr.yml
                     ci-train.yml   训练一个模型
 ```
 
-## 拓扑：lint 前置闸 + 三条泳道串行
+## 拓扑：静态检查 + 计划算好，再开泳道
 
 ```
-lint ─► select ─► L1(CPU) ─► L2a(NPU 特性) ─► L2b(NPU 端到端)
+select（静态检查 → 算计划） ─► L1(CPU) ─► L2a(NPU 特性) ─► L2b(NPU 端到端)
 ```
 
-### 为什么 lint 在 select **前面**
+### 静态检查与算计划为什么在**同一个 job** 里
 
-`select` 本身就是要跑的一段 Python（`affected.py`）。先跑 `check_static.py`，
-等于先验证「算计划的那个脚本能跑」，再拿它算计划；反过来写，语法错会先以一个
-难读的 traceback 冒出来，而且是在一个本该只负责"算计划"的 job 里。
+它们是严格串行的两个步骤：静态没过就不该算计划。拆成两个 job 只会：
 
-代价是 `lint` 读不到 `needs.select.outputs`（那时还没有 select）。所以：
+- 白占一个 runner 名额（`CI_CPU_RUNNER` 是稀缺资源）；
+- 多一次 `checkout`，而且计划那边还必须是 `fetch-depth: 0` 的全量拉取；
+- 多一段 `needs` + `if` 的样板，每个条件都是一处可能写错的地方。
 
-- `actionlint` / `hadolint` 改成**无条件跑**。原来靠 `ci_changed` / `docker_changed`
-  判断，那是为了省掉一次二进制下载（各 ~2 s）；为这点时间在 lint 里复制一份
-  diff 逻辑，等于给选择器开第二个实现——那正是本仓最想避免的漂移来源。
-- `ci_changed` / `docker_changed` 这两个 select 输出随之删除（已经没有消费者）。
+合成一个 job 之后，「静态没过就不算计划」是 **step 的天然语义**：前一 step 失败，
+后面的直接不执行。一行 `needs` 都不用写。
 
-`check_static.py` 的 `contract` 检查里加了两条断言守这个拓扑，写反会当场报错：
+代价只有一处：job 红了只看 `needs.select.result` 分不清倒在哪一步。所以最后
+一步用 `if: always()` 把 `stage`（`ok` / `static` / `select` / `cancelled`）写进
+job 输出，`gate.py` 用它决定摘要该写「静态检查未通过」还是「计划未算出」。
 
-1. `select.needs` 必须包含 `lint`；`lint` 自己不许有 `needs`（它必须是链头）。
-2. `lint` 的 job 正文里不许出现 `needs.select.outputs.*`（那时恒为空）。
+同时，`actionlint` / `hadolint` 是**无条件跑**的（早先靠 `ci_changed` /
+`docker_changed` 判断，那两个输出已经删除）：为省一次 2 s 的二进制下载去复制
+一份 diff 逻辑，等于给选择器开第二个实现——那正是本仓最想避免的漂移来源。
 
-### `needs` 串行带来的节省
+`check_static.py` 的 `contract` 检查守这个拓扑，写错会当场报错：
+
+1. 跑 `check_static.py` 的 job 必须**同时**跑 `affected.py`（别拆成两个 job）；
+2. 同一个 job 里 `check_static.py` 必须**排在** `affected.py` 之前；
+3. 算计划的入口只能有一处（`--changed-from git` 不许出现两次）。
+
+### 泳道串行带来的节省
 
 语义是**前面没过就不开后面的卡**：
 
 | 前一级 | 后一级 | 被拦住时省下 |
 |---|---|---|
-| lint | select / L1 / L2a / L2b | 全部（lint 只要 13 s，0 卡） |
-| select | L1 / L2a / L2b | 全部（计划没算出来就不知道该跑什么） |
+| select（静态 / 计划） | L1 / L2a / L2b | 全部（静态 + 计划 ~15 s，0 卡） |
 | L1 CPU | L2a / L2b | 2 卡 ~2 min + 8 卡 ~10 min |
 | L2a 特性 | L2b | 8 卡 ~10 min |
 
@@ -72,7 +79,7 @@ lint ─► select ─► L1(CPU) ─► L2a(NPU 特性) ─► L2b(NPU 端到�
 写在哪里、怎么恢复都留在原处。恢复后应该是：
 
 ```
-PR ──────────────► ci-gate-pr.yml（lint -> select -> L1 -> L2a -> L2b -> gate）
+PR ──────────────► ci-gate-pr.yml（select[静态+计划] -> L1 -> L2a -> L2b -> gate）
 每晚 ─────────────► ci-full.yml（全量，不选测）
 每晚 ─────────────► ci-image.yml（基础镜像，内容没变就跳过）
 手动 ─────────────► ci-pytest.yml / ci-train.yml
@@ -128,7 +135,7 @@ if: |
 不该跑而 `skipped` 是 ⏭（绿）。两边用**同一组变量名**，否则摘要会给出
 和实际执行相反的解释。
 
-### 决策层契约由 lint 看守
+### 决策层契约由 select 里的静态检查看守
 
 `check_static.py` 的 `contract` 项会**真的跑一次** `affected.py`，断言那五个
 输出真的被写出来，再逐个 workflow 校验 `needs.select.outputs.X` 都已声明。
@@ -145,7 +152,7 @@ if: |
 表中 ✅ = 该泳道会跑；「—」= `*_run=false`，job 直接 skipped（带原因）。
 L2a 一旦开跑就是**泳道内全跑**（17 个含 `torch_npu` 的文件），不再往下筛。
 
-| 改动 | lint | L1 CPU | L2a NPU | L2b E2E |
+| 改动 | 静态 | L1 CPU | L2a NPU | L2b E2E |
 |---|:--:|:--:|---|:--:|
 | `src/torchturbo/ops/**` | ✅ | 选中的 CPU 文件 | **✅ 全跑** | 最便宜画像 |
 | `src/torchturbo/models/<族>/**` | ✅ | 选中的 CPU 文件 | — | 该族画像 |
@@ -159,7 +166,7 @@ L2a 一旦开跑就是**泳道内全跑**（17 个含 `torch_npu` 的文件）�
 | `tests/**` | ✅ | affected | — | — |
 | `docs/**`、`*.md` | ✅ | — | — | — |
 
-L1 只跑选中的文件，所以「一个改文档的 PR」连 CPU 泳道都不开——lint 那 13 s
+L1 只跑选中的文件，所以「一个改文档的 PR」连 CPU 泳道都不开——静态那 15 s
 就是它的全部成本。
 
 两张表对应两个脚本：路径 → 用例是 `scripts/ci/affected.py`，路径 → 画像在
@@ -305,7 +312,7 @@ timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
 ## 本地怎么验
 
 ```bash
-python3 scripts/ci/check_static.py            # lint 六项（含跑一次选择器验契约）
+python3 scripts/ci/check_static.py            # 静态六项（含跑一次选择器验契约）
 python3 scripts/ci/affected.py --self-test    # 选测算法没退化（24 条断言）
 python3 scripts/ci/affected.py --audit        # 覆盖体检
 bash scripts/ci/pytest.sh                     # 真在本机跑一遍（MODE=cpu）
@@ -323,15 +330,16 @@ python3 scripts/ci/env.py check   --file /tmp/t.json
 验泳道判定最快的方法（不跑 CI，只看 gate 怎么说）：
 
 ```bash
-run() { env R_LINT=$1 R_SEL=$2 R_L1=$3 R_L2A=$4 R_L2B=$5 \
+run() { env R_SEL=$1 SEL_STAGE=$2 R_L1=$3 R_L2A=$4 R_L2B=$5 \
   L1_RUN=$6 L2A_RUN=$7 L2B_RUN=$8 STRICT=false SUMMARY=t \
   python3 scripts/ci/gate.py judge --mode pr; }
 
-run success success skipped skipped skipped false false false  # 改文档：只有 lint
-run success success success skipped skipped true  false false  # 改模型：lint+L1
-run success success skipped success success false true  true   # 改 ops：lint+L2a+L2b
-run success success success success success true  true  true   # 全绿
-run failure skipped skipped skipped skipped true  true  true   # lint 红：后三条按设计未启动
+run success ok      skipped skipped skipped false false false  # 改文档：什么都不跑
+run success ok      success skipped skipped true  false false  # 改模型：L1
+run success ok      skipped success success false true  true   # 改 ops：L2a+L2b
+run success ok      success success success true  true  true   # 全绿
+run failure static  skipped skipped skipped true  true  true   # 静态倒：其余按设计未启动
+run failure select  skipped skipped skipped true  true  true   # 计划没算出
 ```
 
 ## 一个刻意的取舍

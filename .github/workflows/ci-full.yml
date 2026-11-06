@@ -34,13 +34,12 @@ permissions:
 
 jobs:
   select:
-    name: 全量选择
-    # 与 PR 门禁同构：lint 先跑，红了就没计划。
-    needs: lint
+    name: Lint + 全量选择
+    # 与 PR 门禁同构：静态检查与选测共用一个 runner，静态没过就不算计划。
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
-    timeout-minutes: 10
+    timeout-minutes: 20
     outputs:
-      lint_run: ${{ steps.pick.outputs.lint_run }}
+      stage: ${{ steps.stage.outputs.stage }}
       l1_run: ${{ steps.pick.outputs.l1_run }}
       l2a_run: ${{ steps.pick.outputs.l2a_run }}
       l2b_run: ${{ steps.pick.outputs.l2b_run }}
@@ -54,6 +53,38 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ---- 静态检查：失败后下面的步骤全部不执行 ----
+      - name: 语法 / workflow / 映射表 / 决策层契约
+        id: static
+        run: |
+          set -uo pipefail
+          python -m pip install --quiet pyyaml
+          python3 scripts/ci/check_static.py
+
+      - name: actionlint
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+      # hadolint 用 arm64 二进制，不用镜像：hadolint/hadolint 只有 amd64。
+      # --failure-threshold error 只拦解析类问题，不拦钉版本之类的风格告警。
+      - name: hadolint
+        run: |
+          set -uo pipefail
+          case "$(uname -m)" in
+            aarch64|arm64) HARCH=arm64 ;;
+            x86_64|amd64)  HARCH=x86_64 ;;
+            *) echo "::error::unsupported arch $(uname -m)"; exit 1 ;;
+          esac
+          curl -sSfL -o /tmp/hadolint \
+            "https://github.com/hadolint/hadolint/releases/download/v2.15.1/hadolint-linux-$HARCH"
+          chmod +x /tmp/hadolint
+          /tmp/hadolint --failure-threshold error docker/npu/Dockerfile_aarch64
 
       - name: 全量
         id: pick
@@ -81,42 +112,28 @@ jobs:
           echo "image=$REF" >> "$GITHUB_OUTPUT"
           echo "镜像：$REF"
 
-  lint:
-    name: Lint 静态检查
-    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: |
-          python -m pip install --quiet pyyaml
-          python3 scripts/ci/check_static.py
-      - name: actionlint
-        run: |
-          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
-          ./actionlint -color
-      # hadolint 用 arm64 二进制，不用镜像：hadolint/hadolint 只有 amd64。
-      # --failure-threshold error 只拦解析类问题，不拦钉版本之类的风格告警。
-      - name: hadolint
+      # 必须放最后且 always()：前面的 step 失败后不会再执行，而这一步正是
+      # 用来告诉 gate「倒在哪一步」的。
+      - name: 记录失败阶段
+        id: stage
+        if: always()
         run: |
           set -uo pipefail
-          case "$(uname -m)" in
-            aarch64|arm64) HARCH=arm64 ;;
-            x86_64|amd64)  HARCH=x86_64 ;;
-            *) echo "::error::unsupported arch $(uname -m)"; exit 1 ;;
-          esac
-          curl -sSfL -o /tmp/hadolint \
-            "https://github.com/hadolint/hadolint/releases/download/v2.15.1/hadolint-linux-$HARCH"
-          chmod +x /tmp/hadolint
-          /tmp/hadolint --failure-threshold error docker/npu/Dockerfile_aarch64
+          if [ "${{ job.status }}" = "cancelled" ]; then
+            echo "stage=cancelled" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.static.outcome }}" != "success" ]; then
+            echo "stage=static" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.pick.outcome }}" != "success" ]; then
+            echo "stage=select" >> "$GITHUB_OUTPUT"
+          else
+            echo "stage=ok" >> "$GITHUB_OUTPUT"
+          fi
 
   l1:
     name: L1 CPU（${{ matrix.shard }}）
-    needs: [select, lint]
+    needs: select
     if: |
-      always() && needs.select.result == 'success' && needs.lint.result == 'success' &&
+      always() && needs.select.result == 'success' &&
       needs.select.outputs.l1_run == 'true'
     strategy:
       fail-fast: false
@@ -134,9 +151,9 @@ jobs:
   l2a:
     name: L2a NPU 特性
     # 与 PR 门禁同一条链：CPU 绿了才开 NPU。
-    needs: [select, lint, l1]
+    needs: [select, l1]
     if: |
-      always() && needs.select.result == 'success' && needs.lint.result == 'success' &&
+      always() && needs.select.result == 'success' &&
       (needs.l1.result == 'success' ||
        (needs.l1.result == 'skipped' && needs.select.outputs.l1_run == 'false')) &&
       needs.select.outputs.l2a_run == 'true'
@@ -156,9 +173,9 @@ jobs:
     name: L2b E2E（${{ matrix.profile.model_type }}）
     # 链尾。always() 的理由同 ci-gate-pr.yml：L1/L2a 可能因为「本次不需要」
     # 而 skipped，不能被 needs 的隐式跳过带走。
-    needs: [select, lint, l1, l2a]
+    needs: [select, l1, l2a]
     if: |
-      always() && needs.select.result == 'success' && needs.lint.result == 'success' &&
+      always() && needs.select.result == 'success' &&
       (needs.l1.result == 'success' ||
        (needs.l1.result == 'skipped' && needs.select.outputs.l1_run == 'false')) &&
       (needs.l2a.result == 'success' ||
@@ -188,7 +205,7 @@ jobs:
 
   gate:
     name: gate
-    needs: [select, lint, l1, l2a, l2b]
+    needs: [select, l1, l2a, l2b]
     if: always()
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10
@@ -205,7 +222,7 @@ jobs:
       - name: 判定
         env:
           R_SEL: ${{ needs.select.result }}
-          R_LINT: ${{ needs.lint.result }}
+          SEL_STAGE: ${{ needs.select.outputs.stage }}
           R_L1: ${{ needs.l1.result }}
           R_L2A: ${{ needs.l2a.result }}
           R_L2B: ${{ needs.l2b.result }}

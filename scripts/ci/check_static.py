@@ -112,7 +112,8 @@ def check_contract() -> list[str]:
         return []
 
     bad: list[str] = []
-    needed = ("lint_run", "l1_run", "l2a_run", "l2b_run", "l1_files")
+    # lint 不再是独立泳道（它是 select 里的几个 step），所以不再列 lint_run。
+    needed = ("l1_run", "l2a_run", "l2b_run", "l1_files")
 
     # 1. 决策层真的会写这些 key 吗 —— 直接跑一次，别猜源码长什么样。
     #    这是唯一能同时挡住「忘了写」和「写错名字」的办法。
@@ -150,33 +151,23 @@ def check_contract() -> list[str]:
         if "--changed-from git" in text and "fetch-depth: 0" not in text:
             bad.append(f"{rel}: 用了 --changed-from git 但 checkout 没设 fetch-depth: 0")
 
-        # 3. 拓扑：lint 必须排在 select **前面**（select 靠 needs 依赖它）。
-        #    写反了不会报错，只会变成「select 红了 lint 才跑」，等于白置一道闸。
+        # 3. 静态检查与算计划必须**在同一个 job 里**，且静态在前。
+        #    拆成两个 job 不会报错，只会白占一个 runner（它们本来就严格
+        #    串行）；顺序写反则会拿一个没检查过的选择器算计划。
         jobs = doc.get("jobs") or {}
-        if "select" in jobs and "lint" in jobs:
-            sel_needs = jobs["select"].get("needs") or []
-            if isinstance(sel_needs, str):
-                sel_needs = [sel_needs]
-            if "lint" not in sel_needs:
-                bad.append(f"{rel}: select 没有 needs: lint（lint 就不是前置闸了）")
-            lint_needs = jobs["lint"].get("needs") or []
-            if isinstance(lint_needs, str):
-                lint_needs = [lint_needs]
-            if lint_needs:
-                bad.append(f"{rel}: lint 不应有 needs（它必须是链头），实为 {lint_needs}")
+        dump = {n: yaml.safe_dump(j, allow_unicode=True) for n, j in jobs.items()}
+        for name, body in dump.items():
+            if "check_static.py" not in body:
+                continue
+            if "affected.py" not in body:
+                bad.append(f"{rel}: {name} 只跑静态检查、不算计划 —— 两者应同 job")
+            elif body.index("check_static.py") > body.index("affected.py"):
+                bad.append(f"{rel}: {name} 里 affected.py 排在 check_static.py 之前")
 
-        # 4. lint 阶段不允许去读 select 的输出（那时还没有 select）。
-        #    用 yaml dump 出来找，比按行切块稳——job 在文件里的物理顺序无关，
-        #    GitHub 只认 needs。
-        if "lint" in jobs:
-            lint_body = yaml.safe_dump(jobs["lint"], allow_unicode=True)
-            for name in sorted(set(
-                re.findall(r"needs\.select\.outputs\.([A-Za-z0-9_]+)", lint_body)
-            )):
-                bad.append(
-                    f"{rel}: lint 读了 needs.select.outputs.{name}，"
-                    f"但 lint 在 select 之前跑（该值恒为空）"
-                )
+        # 4. 计划只能有一个地方算：两处各算一次，必然慢慢分叉。
+        planners = [n for n, body in dump.items() if "--changed-from git" in body]
+        if len(planners) > 1:
+            bad.append(f"{rel}: 有多个 job 在算计划 {planners}")
 
     print(f"contract: {len(needed)} 个 lane 输出 / {len(bad)} 个问题")
     return bad

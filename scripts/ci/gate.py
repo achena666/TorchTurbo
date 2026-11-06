@@ -122,7 +122,11 @@ class Report:
 
 def judge_pr() -> int:
     rep = Report()
-    results = {k: _env(f"R_{k}") for k in ("LINT", "SEL", "L1", "L2A", "L2B")}
+    # 静态检查与选测现在在**同一个 job** 里，只看 R_SEL 分不清倒在哪一步 ——
+    # job 最后一步（always）把 stage 写进输出说明原因。这里把它还原成
+    # 两个值，下面的判定逻辑（含「lint 红了下游按设计未启动」那段）不用改。
+    results = {k: _env(f"R_{k}") for k in ("SEL", "L1", "L2A", "L2B")}
+    results["LINT"] = "failure" if _env("SEL_STAGE") == "static" else "success"
     # 决策层给的三个开关：「这个泳道本次该不该跑」。
     # 拿不到（旧调用方式 / 手敲测试）时按 true 处理，也就是宁可错判红。
     want = {k: _env(f"{k}_RUN", "true") for k in ("L1", "L2A", "L2B")}
@@ -142,9 +146,14 @@ def judge_pr() -> int:
             else:
                 rep.rows.append(f"| {name} | {SKIP} | lint 未通过，按设计未启动 |")
     else:
-        # L1 在「本次没选中任何 CPU 测试」时本来就该 skipped，那不是故障。
-        if want["L1"] == "false" and results["L1"] == "skipped":
-            rep.rows.append(f"| L1 CPU | {SKIP} | 未选中 CPU 测试 |")
+        # L1 在「本次没选中任何 CPU 测试」或「计划没算出来」时该 skipped，
+        # 两种都不是故障，但要写清是哪一种。
+        sel_bad = results["SEL"] != "success"
+        if results["L1"] == "skipped" and (want["L1"] == "false" or sel_bad):
+            rep.rows.append(
+                f"| L1 CPU | {SKIP} | "
+                f"{'未选中 CPU 测试' if not sel_bad else '计划未算出，按设计未启动'} |"
+            )
         else:
             rep.required("L1 CPU", results["L1"])
 
@@ -152,7 +161,7 @@ def judge_pr() -> int:
         # 那是「按设计没跑」，不是「不知道为什么没跑」—— 否则摘要会在真正的原因
         # （L1 红）旁边再挂一个 skipped-unknown，把人引到错的地方去。
         # 只影响措辞，不影响结论：上游本身红了这一轮仍然是失败。
-        cpu_bad = results["L1"] not in ("success", "skipped")
+        cpu_bad = sel_bad or results["L1"] not in ("success", "skipped")
         npu_bad = cpu_bad or results["L2A"] not in ("success", "skipped")
 
         if _env("IS_FORK") == "true":
@@ -209,7 +218,9 @@ def judge_pr() -> int:
 
 def judge_full() -> int:
     rep = Report()
-    req = {k: _env(f"R_{k}") for k in ("LINT", "SEL", "L1", "L2A")}
+    # 同 judge_pr：静态与选测共用一个 job，靠 stage 把两者拆回两行。
+    req = {k: _env(f"R_{k}") for k in ("SEL", "L1", "L2A")}
+    req["LINT"] = "failure" if _env("SEL_STAGE") == "static" else "success"
     want = {k: _env(f"{k}_RUN", "true") for k in ("L1", "L2A", "L2B")}
 
     rep.required("Lint 静态", req["LINT"])
@@ -232,8 +243,12 @@ def judge_full() -> int:
 
     # 全量模式下三条泳道都应该跑（force-all）；但保留 lane 判断，
     # 万一将来全量也做了裁剪，这里不用再改。
-    if want["L1"] == "false" and req["L1"] == "skipped":
-        rep.rows.append(f"| L1 CPU | {SKIP} | 未选中 CPU 测试 |")
+    sel_bad = req["SEL"] != "success"
+    if req["L1"] == "skipped" and (want["L1"] == "false" or sel_bad):
+        rep.rows.append(
+            f"| L1 CPU | {SKIP} | "
+            f"{'未选中 CPU 测试' if not sel_bad else '计划未算出，按设计未启动'} |"
+        )
     else:
         rep.required("L1 CPU", req["L1"])
 
