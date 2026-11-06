@@ -40,10 +40,10 @@ jobs:
     timeout-minutes: 20
     outputs:
       stage: ${{ steps.stage.outputs.stage }}
-      l1_run: ${{ steps.pick.outputs.l1_run }}
-      l2a_run: ${{ steps.pick.outputs.l2a_run }}
-      l2b_run: ${{ steps.pick.outputs.l2b_run }}
-      l1_files: ${{ steps.pick.outputs.l1_files }}
+      cpu_unit_run: ${{ steps.pick.outputs.cpu_unit_run }}
+      npu_unit_run: ${{ steps.pick.outputs.npu_unit_run }}
+      npu_model_run: ${{ steps.pick.outputs.npu_model_run }}
+      cpu_unit_files: ${{ steps.pick.outputs.cpu_unit_files }}
       test_files: ${{ steps.pick.outputs.test_files }}
       shard_list: ${{ steps.pick.outputs.shard_list }}
       e2e: ${{ steps.pick.outputs.e2e }}
@@ -129,38 +129,34 @@ jobs:
             echo "stage=ok" >> "$GITHUB_OUTPUT"
           fi
 
-  l1:
-    name: L1 CPU（${{ matrix.shard }}）
+  cpu_unit_tests:
+    name: cpu-unit-tests（${{ matrix.shard }}）
     needs: select
     if: |
       always() && needs.select.result == 'success' &&
-      needs.select.outputs.l1_run == 'true'
+      needs.select.outputs.cpu_unit_run == 'true'
     strategy:
       fail-fast: false
       matrix:
         shard: ${{ fromJSON(needs.select.outputs.shard_list) }}
     uses: ./.github/workflows/ci-pytest.yml
     with:
-      mode: cpu
-      use_container: false
+      kind: cpu-unit
       runner_label: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
-      test_files: ${{ needs.select.outputs.l1_files }}
+      test_files: ${{ needs.select.outputs.cpu_unit_files }}
       shard: ${{ matrix.shard }}
       timeout_minutes: 40
 
-  l2a:
-    name: L2a NPU 特性
-    # 与 PR 门禁同一条链：CPU 绿了才开 NPU。
-    needs: [select, l1]
+  npu_unit_tests:
+    name: npu-unit-tests
+    # 三条泳道并行，与 PR 门禁同构：各自只依赖 select，互不影响。
+    needs: select
     if: |
       always() && needs.select.result == 'success' &&
-      (needs.l1.result == 'success' ||
-       (needs.l1.result == 'skipped' && needs.select.outputs.l1_run == 'false')) &&
-      needs.select.outputs.l2a_run == 'true'
+      needs.select.outputs.npu_unit_run == 'true'
     uses: ./.github/workflows/ci-pytest.yml
     with:
-      mode: npu
-      use_container: true
+      kind: npu-unit
       image: ${{ needs.select.outputs.image }}
       runner_label: ${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}
       test_files: '[]'
@@ -169,25 +165,21 @@ jobs:
       SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
       SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}
 
-  l2b:
-    name: L2b E2E（${{ matrix.profile.model_type }}）
-    # 链尾。always() 的理由同 ci-gate-pr.yml：L1/L2a 可能因为「本次不需要」
-    # 而 skipped，不能被 needs 的隐式跳过带走。
-    needs: [select, l1, l2a]
+  npu_model_tests:
+    name: npu-model-tests（${{ matrix.profile.model_type }}）
+    # 与 cpu-unit / npu-unit 同级，同样只依赖 select。
+    needs: select
     if: |
       always() && needs.select.result == 'success' &&
-      (needs.l1.result == 'success' ||
-       (needs.l1.result == 'skipped' && needs.select.outputs.l1_run == 'false')) &&
-      (needs.l2a.result == 'success' ||
-       (needs.l2a.result == 'skipped' && needs.select.outputs.l2a_run == 'false')) &&
-      needs.select.outputs.l2b_run == 'true'
+      needs.select.outputs.npu_model_run == 'true'
     strategy:
       max-parallel: 1
       fail-fast: false
       matrix:
         profile: ${{ fromJSON(needs.select.outputs.e2e) }}
-    uses: ./.github/workflows/ci-train.yml
+    uses: ./.github/workflows/ci-pytest.yml
     with:
+      kind: npu-model
       runner_label: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
       image: ${{ needs.select.outputs.image }}
       model_type: ${{ matrix.profile.model_type }}
@@ -205,7 +197,7 @@ jobs:
 
   gate:
     name: gate
-    needs: [select, l1, l2a, l2b]
+    needs: [select, cpu_unit_tests, npu_unit_tests, npu_model_tests]
     if: always()
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10
@@ -223,11 +215,11 @@ jobs:
         env:
           R_SEL: ${{ needs.select.result }}
           SEL_STAGE: ${{ needs.select.outputs.stage }}
-          R_L1: ${{ needs.l1.result }}
-          R_L2A: ${{ needs.l2a.result }}
-          R_L2B: ${{ needs.l2b.result }}
-          L1_RUN: ${{ needs.select.outputs.l1_run }}
-          L2A_RUN: ${{ needs.select.outputs.l2a_run }}
-          L2B_RUN: ${{ needs.select.outputs.l2b_run }}
+          R_CPU_UNIT: ${{ needs.cpu_unit_tests.result }}
+          R_NPU_UNIT: ${{ needs.npu_unit_tests.result }}
+          R_NPU_MODEL: ${{ needs.npu_model_tests.result }}
+          CPU_UNIT_RUN: ${{ needs.select.outputs.cpu_unit_run }}
+          NPU_UNIT_RUN: ${{ needs.select.outputs.npu_unit_run }}
+          NPU_MODEL_RUN: ${{ needs.select.outputs.npu_model_run }}
           SUMMARY: ${{ needs.select.outputs.summary }}
         run: python3 scripts/ci/gate.py judge --mode full

@@ -480,24 +480,20 @@ def select(index: Index, changed: list[str], force_all: bool = False,
     # 每个泳道都带 why，缺 why 的门禁判红 —— 「不知道为什么没跑」比「跑了但
     # 失败」更危险，它会安静地变成常态。yaml 只读这里的 run，不做任何判断。
     image_changed = any(p.startswith("docker/npu/") for p in changed)
-    l1_run = len(cpu_targets) > 0
-    l2a_run = not no_npu and (bool(npu_targets) or image_changed or mode == "all")
-    l2b_run = bool(e2e)
+    cpu_unit_run = len(cpu_targets) > 0
+    npu_unit_run = not no_npu and (bool(npu_targets) or image_changed or mode == "all")
+    npu_model_run = bool(e2e)
 
     lanes = {
-        "lint": {
-            "run": True,
-            "why": "总是跑：只做静态检查，不执行仓库代码",
-        },
-        "l1": {
-            "run": l1_run,
+        "cpu_unit": {
+            "run": cpu_unit_run,
             "why": (f"选中 {len(cpu_targets)} 个 CPU 文件"
-                    if l1_run else "没有选中任何 CPU 测试"),
+                    if cpu_unit_run else "没有选中任何 CPU 测试"),
             "files": cpu_targets,
             "shards": shards,
         },
-        "l2a": {
-            "run": l2a_run,
+        "npu_unit": {
+            "run": npu_unit_run,
             # files 为空 = 泳道内全跑：算子/镜像的影响是全仓的，
             # 只跑「选中的那几个」等于没验到真正的暴露面。
             "files": [],
@@ -511,10 +507,10 @@ def select(index: Index, changed: list[str], force_all: bool = False,
                 "没有选中任何需要真卡的测试文件"
             ),
         },
-        "l2b": {
-            "run": l2b_run,
+        "npu_model": {
+            "run": npu_model_run,
             "why": (f"{len(e2e)} 个画像：" + ",".join(e["model_type"] for e in e2e)
-                    if l2b_run else "没有匹配的端到端画像"),
+                    if npu_model_run else "没有匹配的端到端画像"),
             "profiles": e2e,
         },
     }
@@ -534,7 +530,7 @@ def select(index: Index, changed: list[str], force_all: bool = False,
         "targets": targets,
         "shards": shards,
         # npu 保留为「L2a 要不要跑」的同义词，避免调用方跟着改。
-        "npu": l2a_run,
+        "npu": npu_unit_run,
         "cpu_files": cpu_targets,
         "npu_files": npu_targets,
         "e2e": e2e,
@@ -613,10 +609,11 @@ def self_test(root: Path) -> int:
 
     # ---- 泳道开关（yaml 只读这四个值） ------------------------------------
     def lane_runs(r: dict) -> dict[str, bool]:
-        return {k: r["lanes"][k]["run"] for k in ("lint", "l1", "l2a", "l2b")}
+        return {k: r["lanes"][k]["run"] for k in ("cpu_unit", "npu_unit", "npu_model")}
 
     r = select(index, ["docs/ci/README.md"])
-    check("文档 -> 只有 lint", lane_runs(r) == {"lint": True, "l1": False, "l2a": False, "l2b": False},
+    check("文档 -> 一条泳道都不起",
+          lane_runs(r) == {"cpu_unit": False, "npu_unit": False, "npu_model": False},
           str(lane_runs(r)))
 
     r = select(index, ["src/torchturbo/ops/cross_entropy_loss.py"])
@@ -624,9 +621,9 @@ def self_test(root: Path) -> int:
     check("ops 算子 -> 选中用例非空", len(r["targets"]) > 0, str(r["counts"]))
     check("ops 算子 -> E2E 画像 = qwen3_5",
           [e["model_type"] for e in r["e2e"]] == [CHEAPEST_MODEL], str(r["e2e"]))
-    check("ops 算子 -> NPU 泳道内全跑（files 为空）", r["lanes"]["l2a"]["files"] == [])
-    check("ops 算子 -> L2a 确实被选中", r["lanes"]["l2a"]["selected"] > 0,
-          str(r["lanes"]["l2a"]["selected"]))
+    check("ops 算子 -> NPU 泳道内全跑（files 为空）", r["lanes"]["npu_unit"]["files"] == [])
+    check("ops 算子 -> npu-unit 确实被选中", r["lanes"]["npu_unit"]["selected"] > 0,
+          str(r["lanes"]["npu_unit"]["selected"]))
 
     r = select(index, ["src/torchturbo/engine/core.py"])
     check("engine -> 精准模式", r["mode"] == "precise", r["mode"])
@@ -636,19 +633,19 @@ def self_test(root: Path) -> int:
 
     r = select(index, ["src/torchturbo/models/qwen3_5/model.py"])
     check("族目录 -> 该族画像", [e["model_type"] for e in r["e2e"]] == ["qwen3_5"], str(r["e2e"]))
-    check("族目录 -> 不起 NPU 特性", not r["lanes"]["l2a"]["run"], str(lane_runs(r)))
-    check("族目录 -> 起 E2E", r["lanes"]["l2b"]["run"], str(lane_runs(r)))
+    check("族目录 -> 不起 npu-unit", not r["lanes"]["npu_unit"]["run"], str(lane_runs(r)))
+    check("族目录 -> 起 npu-model", r["lanes"]["npu_model"]["run"], str(lane_runs(r)))
 
     r = select(index, ["src/torchturbo/models/qwen3_5_moe/model.py"])
     check("MoE 族 -> 减层画像",
           [e["layers"] for e in r["e2e"]] == [6], str(r["e2e"]))
 
     r = select(index, ["docker/npu/Dockerfile_aarch64"])
-    check("镜像配方 -> 起 NPU 特性（选不中测试也要跑）", r["lanes"]["l2a"]["run"], str(lane_runs(r)))
+    check("镜像配方 -> 起 npu-unit（选不中测试也要跑）", r["lanes"]["npu_unit"]["run"], str(lane_runs(r)))
 
     r = select(index, ["scripts/ci/affected.py"])
     check("CI 自身改动 -> 全量 CPU", r["mode"] == "all", r["mode"])
-    check("CI 自身改动 -> 不起 E2E", r["e2e"] == [], str(r["e2e"]))
+    check("CI 自身改动 -> 不起 npu-model", r["e2e"] == [], str(r["e2e"]))
 
     r = select(index, ["README.md"])
     check("文档 -> 0 用例 0 泳道",
@@ -656,10 +653,10 @@ def self_test(root: Path) -> int:
 
     r = select(index, ["pyproject.toml"])
     check("pyproject -> 全量", r["mode"] == "all", r["mode"])
-    check("pyproject -> 起 E2E", [e["model_type"] for e in r["e2e"]] == [CHEAPEST_MODEL], str(r["e2e"]))
-    check("pyproject -> 四条泳道全跑", all(lane_runs(r).values()), str(lane_runs(r)))
-    check("pyproject -> L1 只给 CPU 文件",
-          all(not has_torch_npu(index.root / f) for f in r["lanes"]["l1"]["files"]))
+    check("pyproject -> 起 npu-model", [e["model_type"] for e in r["e2e"]] == [CHEAPEST_MODEL], str(r["e2e"]))
+    check("pyproject -> 三条泳道全跑", all(lane_runs(r).values()), str(lane_runs(r)))
+    check("pyproject -> cpu-unit 只给 CPU 文件",
+          all(not has_torch_npu(index.root / f) for f in r["lanes"]["cpu_unit"]["files"]))
 
     r = select(index, [f"src/torchturbo/engine/f{i}.py" for i in range(400)])
     check("大 PR -> 全量（不是降级）", r["mode"] == "all", str(r["valves"]))
@@ -824,12 +821,13 @@ def main(argv: list[str]) -> int:
             fh.write("shard_list=" + json.dumps(
                 [f"{i}/{result['shards']}" for i in range(result['shards'])]
             ) + "\n")
-            # 泳道开关：yaml 只读这四个值，不做任何判断。
-            for name in ("lint", "l1", "l2a", "l2b"):
+            # 泳道开关：yaml 只读这三个值，不做任何判断。
+            for name in ("cpu_unit", "npu_unit", "npu_model"):
                 fh.write(f"{name}_run={str(lanes[name]['run']).lower()}\n")
-            # 这个名字是为了区分「L1 真的拿到了文件」与「L1 拿到全量」。
+            # 这个名字是为了区分「cpu-unit 真的拿到了文件」与「拿到全量」。
             # 因为 --github-output 一次只能写一行，用 JSON 数组传过去。
-            fh.write("l1_files=" + json.dumps(lanes["l1"]["files"], ensure_ascii=False) + "\n")
+            fh.write("cpu_unit_files="
+                     + json.dumps(lanes["cpu_unit"]["files"], ensure_ascii=False) + "\n")
             fh.write(f"npu={str(result['npu']).lower()}\n")
             fh.write(f"targets={json.dumps(result['targets'], ensure_ascii=False)}\n")
             fh.write(f"e2e={json.dumps(result['e2e'], ensure_ascii=False)}\n")

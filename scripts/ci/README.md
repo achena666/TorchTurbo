@@ -23,11 +23,12 @@
 被下面这些 workflow 调用，`.github/workflows` 里的入口只负责声明输入：
 
 ```
-ci-gate-pr.yml   PR 门禁        select -> L0 / L1 / L2a / L2b -> gate
-ci-full.yml      main 全量（当前只手动）
-ci-image.yml     构建 L1 基础镜像（**只手动 dispatch**）
-ci-pytest.yml    pytest 的唯一实现（workflow_call + dispatch）
-ci-train.yml     训练的唯一实现（workflow_call + dispatch）
+ci-gate-pr.yml       PR 门禁   select -> {cpu-unit, npu-unit, npu-model} -> gate
+ci-full.yml          main 全量（当前只手动）
+ci-image.yml         构建基础镜像（**只手动 dispatch**）
+ci-pytest.yml        三条测试泳道的唯一入口（workflow_call + dispatch）
+                     kind=cpu-unit / npu-unit / npu-model
+npu-model-tests.yml  npu-model 的实现体（workflow_call，无手动入口）
 ```
 
 yaml 里只留「输什么、调哪个脚本」，超过 10 行的 bash 一律下沉到这里。
@@ -90,6 +91,6 @@ python3 scripts/ci/model.py probe --dir /root/.cache/models/<repo>
 python3 scripts/ci/result.py junit --file /tmp/r.json --junit /tmp/pytest.xml
 
 # 门禁判定（手写 env 模拟各种结果）
-R_SEL=success R_L0=success R_L1=success R_L2A=skipped R_L2B=skipped \
+R_SEL=success SEL_STAGE=ok R_CPU_UNIT=success R_NPU_UNIT=skipped R_NPU_MODEL=skipped \
   WANT_NPU=false WANT_E2E='[]' python3 scripts/ci/gate.py judge --mode pr
 ```

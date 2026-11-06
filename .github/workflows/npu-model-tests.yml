@@ -1,8 +1,12 @@
-name: 训练
+name: npu-model-tests
 
-# 「装一套真实的训练栈，然后跑一步」的唯一实现，同时也是**手动入口**。
-# 调用方只描述自己的模型差异（下哪个仓库、留几层、用哪个数据集），
-# 其余全部在 scripts/ci，修一处对所有调用方生效：
+# 「装一套真实的训练栈，然后跑一步」的唯一实现。
+# 调用方是 ci-pytest.yml（kind=npu-model）—— 全仓**只有一个手动入口**，
+# 就是 ci-pytest.yml。这里不单独开 workflow_dispatch，否则同一套输入要
+# 在两个文件里各维护一份，默认值迟早打架（这正是当初 ci-pytest/ci-train
+# 分成两个文件时踩过的坑）。
+#
+# 编排全在 scripts/ci，修一处对所有调用方生效：
 #
 #   train.sh      编排：prepare / probe / install / run / report
 #   model.py      取模型：probe / find / mark / fetch / trim
@@ -11,12 +15,6 @@ name: 训练
 #   train_supervisor.sh  看门狗 + 进程组清理         （tee 卡死、step 被取消）
 #   diag/sitecustomize.py 异常捕获与 NaN 探针
 #   result.py            事实 -> 摘要 markdown      （失败的 run 也要有报告）
-#
-# 两种触发：
-#   workflow_call      被 ci-gate-pr / ci-full 调用：45 min 硬上限，超时即跳过
-#   workflow_dispatch  手动跑：300 min 上限，超时必须当失败（全量权重要下 255 GB）
-# 拆成两个文件时这两套默认值会互相打架（手动跑被 45 min 截断 / PR 被 300 min
-# 拖死），所以合成一个：dispatch 的默认只影响手动跑，调用方永远显式传值。
 #
 # 时间预算：不追求极限，只要求「不失控」。step 硬超时给到实测值的 3~4 倍 ——
 # 超时的职责是拦住卡死，不是卡住正常但较慢的运行。
@@ -109,117 +107,7 @@ on:
     outputs:
       skip_reason:
         description: '非空表示这次没真的训练（超时/跳过），gate 据此判 skipped-reason'
-        value: ${{ jobs.sft.outputs.skip_reason }}
-
-  # 手动入口。默认值换成为「排查 / 跑全量」方便的那一套：超时给满、
-  # 模型获取超时当失败（strict），并允许直接覆盖 hf_repo 与数据集。
-  workflow_dispatch:
-    inputs:
-      model_type:
-        description: '模型：@register_model 的名字，映射表见 .github/workflows/model_map.tsv'
-        required: true
-        default: 'bailing_hybrid'
-        type: choice
-        options:
-          - bailing_hybrid
-          - qwen3_5
-          - qwen3_5_moe
-          - qwen3_5_moe_text
-          - qwen4_exp
-      framework:
-        description: '训练框架；决定用 lf_* 还是 swift_* 启动脚本'
-        required: true
-        default: 'lf'
-        type: choice
-        options:
-          - lf
-          - swift
-      runner_label:
-        description: 'Runner 标签（尾缀数字是卡数）'
-        required: true
-        default: 'linux-aarch64-a3-800i-2'
-        type: choice
-        options:
-          - linux-aarch64-a3-800i-2
-          - linux-aarch64-a3-800i-4
-          - linux-aarch64-a3-800i-8
-          - linux-aarch64-a3-800i-16
-      image:
-        description: 'L1 基础镜像；用 repo@sha256:... 可严格复现'
-        required: true
-        default: 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest'
-        type: string
-      train_model_path:
-        description: '显式模型目录；留空则按映射表第 5 列的 hf_repo 找 / 下载'
-        required: false
-        default: ''
-        type: string
-      hf_repo_override:
-        description: '覆盖映射表第 5 列的 hf_repo（flash 配方：inclusionAI/Ling-3.0-flash）'
-        required: false
-        default: ''
-        type: string
-      trim_layers:
-        description: '只保留前 N 层，0 = 全量。flash 用 6（约一个周期）'
-        required: false
-        default: 0
-        type: number
-      train_dataset:
-        description: '数据集名（必须是 dataset/dataset_info.json 里的 key）'
-        required: false
-        default: 'gsm8k'
-        type: string
-      train_seq_len:
-        description: 'cutoff_len'
-        required: false
-        default: '1024'
-        type: string
-      train_finetuning_type:
-        description: '微调方式'
-        required: false
-        default: 'full'
-        type: choice
-        options:
-          - full
-          - lora
-      train_sp_size:
-        description: '序列并行度；“auto” = 按卡数收敛（不整除则减半）'
-        required: false
-        default: 'auto'
-        type: string
-      train_ep_size:
-        description: '专家并行度；“auto” = min(yaml 值, 卡数/sp)'
-        required: false
-        default: 'auto'
-        type: string
-      diag:
-        description: '装 scripts/ci/diag（异常捕获 + NaN 定位）'
-        required: false
-        default: true
-        type: boolean
-      strict:
-        description: 'true = 模型获取超时判红（手动跑建议开）'
-        required: false
-        default: true
-        type: boolean
-      # 下面三个只有手动跑才需要露出来。调用方永远显式传，所以调用走不到这里；
-      # 但它们必须在 dispatch 里声明 —— 否则按 dispatch 触发时 inputs 里根本没有
-      # 这三个键，job 的 timeout-minutes 会拿到空值而校验失败。
-      timeout_minutes:
-        description: 'job 硬上限（手动跑给满：全量权重要下 255 GB）'
-        required: false
-        default: 300
-        type: number
-      train_timeout_minutes:
-        description: '单步训练的硬上限'
-        required: false
-        default: 240
-        type: number
-      fetch_timeout_seconds:
-        description: '模型获取硬超时；超时即跳过（strict=true 时判红）'
-        required: false
-        default: 7200
-        type: number
+        value: ${{ jobs.npu_model_tests.outputs.skip_reason }}
 
 permissions:
   contents: read
@@ -243,11 +131,11 @@ env:
   RESULT_JSON: /tmp/ci-result.json
 
 jobs:
-  sft:
-    name: 训练（${{ inputs.model_type }}/${{ inputs.framework }} · ${{ inputs.runner_label }}）
+  npu_model_tests:
+    name: npu-model-tests（${{ inputs.model_type }}/${{ inputs.framework }} · ${{ inputs.runner_label }}）
     runs-on: ${{ inputs.runner_label }}
-    # fromJSON 不能省：dispatch 触发的 number 输入实际是字符串，直接给
-    # timeout-minutes 会让 GitHub 静默丢弃整个 job。见 ci-pytest.yml。
+    # fromJSON 不能省：inputs 里的 number 经 workflow_call 传进来仍可能是字符串，
+    # 直接给 timeout-minutes 会让 GitHub 静默丢弃整个 job。见 ci-pytest.yml。
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 45) }}
     # 这里**不要**加 job 级 concurrency：同组 pending 的 job 只保留最后一个，
     # 会把排在前面的 run 静默取消（ci-pytest.yml 里踩过，5 个分片剩 2 个）。

@@ -113,7 +113,8 @@ def check_contract() -> list[str]:
 
     bad: list[str] = []
     # lint 不再是独立泳道（它是 select 里的几个 step），所以不再列 lint_run。
-    needed = ("l1_run", "l2a_run", "l2b_run", "l1_files")
+    needed = ("cpu_unit_run", "npu_unit_run", "npu_model_run",
+              "cpu_unit_files")
 
     # 1. 决策层真的会写这些 key 吗 —— 直接跑一次，别猜源码长什么样。
     #    这是唯一能同时挡住「忘了写」和「写错名字」的办法。
@@ -168,6 +169,28 @@ def check_contract() -> list[str]:
         planners = [n for n, body in dump.items() if "--changed-from git" in body]
         if len(planners) > 1:
             bad.append(f"{rel}: 有多个 job 在算计划 {planners}")
+
+        # 5. 三条泳道必须**并行**：都只依赖 select，谁也不依赖谁。
+        #    串起来不会报错，但 L1 红会白等，且 L2a/L2b 的 if 要多写一层
+        #    「上游是否挂了」的判断——那是这轮特意去掉的东西。
+        lanes = ("cpu_unit_tests", "npu_unit_tests", "npu_model_tests")
+        if "select" in jobs and set(lanes) <= set(jobs):
+            for lane in lanes:
+                deps = jobs[lane].get("needs") or []
+                if isinstance(deps, str):
+                    deps = [deps]
+                if list(deps) != ["select"]:
+                    bad.append(
+                        f"{rel}: {lane} 的 needs 应为 [select]（三条泳道并行），实为 {list(deps)}"
+                    )
+
+        # 6. select 必须直连 gate：否则它失败时 gate 要多等三条已 skipped 的边。
+        if "gate" in jobs and "select" in jobs:
+            gate_deps = jobs["gate"].get("needs") or []
+            if isinstance(gate_deps, str):
+                gate_deps = [gate_deps]
+            if "select" not in gate_deps:
+                bad.append(f"{rel}: gate 的 needs 缺 select（提前结束通路断了）")
 
     print(f"contract: {len(needed)} 个 lane 输出 / {len(bad)} 个问题")
     return bad

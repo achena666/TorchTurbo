@@ -1,44 +1,51 @@
-name: pytest
+name: ci-pytest
 
-# CPU 与 NPU 两条泳道的唯一实现，同时也是**手动入口**。差别只在「在哪跑」，不在「跑什么」：
-#   container 任务：NPU pod / 自托管池，镜像里已经装好整套栈
-#   hosted 任务：GH 托管 arm64，裸机 pip install
-# 两者都调用 scripts/ci/pytest.sh —— 分片、marker 过滤、junit、汇总只写一份。
+# **所有测试的唯一入口**：三条泳道共用一份输入声明、一份结果解析、一个手动入口。
 #
-# 两种触发：
-#   workflow_call      被 ci-gate-pr / ci-full 调用（默认值都是「CI 想耍的」）
-#   workflow_dispatch  手动点名跑一个路径 / node id（默认值换成为「排查」方便的）
-# 拆成两个文件时这两个默认值会互相打架，所以合成一个：dispatch 的默认只影响
-# 手动跑，调用方永远显式传值。
+#   kind=cpu-unit    cpu-unit-tests    GH 托管 arm64 · 裸机 pip         0 卡
+#   kind=npu-unit    npu-unit-tests    自托管 NPU 池 · 基础镜像          2 卡
+#   kind=npu-model   npu-model-tests   自建训练栈 + 跑一步              8 卡
 #
-# mode 只控制 marker：
-#   cpu -> -m "not npu"
-#   npu -> -m npu
-# 没装 torch_npu 时 tests/conftest.py 会直接不收集那些文件（marker 过滤发生在
-# 收集之后，光靠 -m 挡不住 import 期就崩的文件）。
+# 为什么合成一个文件而不是三个：
+#   · **两条 unit 泳道的差别只在「在哪跑」**，跑什么（分片 / marker / junit）
+#     完全一样。拆开就要么复制一份 step，要么再抽一层——前者必然漂，后者
+#     等于把这一层又写回来。
+#   · **手动入口只能有一个**。拆成 ci-pytest + ci-train 时，两套默认值互相
+#     打架（手动跑被 45 min 截断 / PR 被 300 min 拖死），只能靠「dispatch 的
+#     默认值不影响调用方」这种口头约定，而约定不会报错。
+#
+# npu-model 的实现体很复杂（取权重 / 减层 / sp-ep 收敛 / 看门狗 / 收尾），
+# 所以它**不在本文件里**：这里只保留一个 `uses:` 转发到 npu-model-tests.yml。
+# 本文件负责「选哪条泳道」，复杂度留在各自的实现里。
+#
+# kind 同时承担了原来的 `use_container`：cpu-unit 一定裸机、npu-unit 一定容器。
+# 少一个布尔输入，就少一类「cpu-unit 却给了镜像」的无效组合。
 
 on:
   workflow_call:
     inputs:
-      mode:
-        description: 'cpu 或 npu；只影响 marker 过滤'
+      # ---------------------------------------------------------------- 通用
+      kind:
+        description: 'cpu-unit / npu-unit / npu-model'
         required: false
-        default: 'cpu'
+        default: 'npu-unit'
         type: string
       runner_label:
         description: 'Runner 标签；尾缀数字是卡数'
         required: true
         type: string
-      use_container:
-        description: 'true = 用镜像（NPU 必开）；false = 裸机 pip'
-        required: false
-        default: true
-        type: boolean
       image:
-        description: 'use_container=true 时必填'
+        description: '单位测试的容器镜像 / 模型测试的基础镜像'
         required: false
         default: ''
         type: string
+      timeout_minutes:
+        description: 'job 硬上限，只拦卡死'
+        required: false
+        default: 60
+        type: number
+
+      # ------------------------------------------------------------ unit 专用
       test_files:
         description: 'JSON 数组；空 = 全量'
         required: false
@@ -64,40 +71,101 @@ on:
         required: false
         default: ''
         type: string
-      timeout_minutes:
-        description: 'job 硬上限，只拦卡死'
+
+      # ----------------------------------------------------------- model 专用
+      model_type:
+        description: '@register_model 的名字，model_map.tsv 的键'
         required: false
-        default: 60
+        default: 'qwen3_5'
+        type: string
+      framework:
+        description: 'lf 或 swift'
+        required: false
+        default: 'lf'
+        type: string
+      train_model_path:
+        description: '显式模型目录；留空则按 hf_repo 查找'
+        required: false
+        default: ''
+        type: string
+      hf_repo_override:
+        description: '覆盖 model_map.tsv 第 5 列的 hf_repo'
+        required: false
+        default: ''
+        type: string
+      trim_layers:
+        description: '只保留前 N 层；0 = 全量下载'
+        required: false
+        default: 0
+        type: number
+      train_seq_len:
+        required: false
+        default: '1024'
+        type: string
+      train_dataset:
+        required: false
+        default: 'gsm8k'
+        type: string
+      train_finetuning_type:
+        required: false
+        default: 'full'
+        type: string
+      train_sp_size:
+        description: 'auto = 按卡数收敛仓库里的值'
+        required: false
+        default: 'auto'
+        type: string
+      train_ep_size:
+        required: false
+        default: 'auto'
+        type: string
+      diag:
+        description: '把 scripts/ci/diag 装进 PYTHONPATH'
+        required: false
+        default: true
+        type: boolean
+      strict:
+        description: 'true = 模型获取超时判红；false = 跳过并判绿（PR 默认）'
+        required: false
+        default: false
+        type: boolean
+      train_timeout_minutes:
+        description: '单步训练的硬上限（实测 163 s，默认 10 min 只拦卡死）'
+        required: false
+        default: 10
+        type: number
+      fetch_timeout_seconds:
+        description: '模型获取硬超时；超时即跳过'
+        required: false
+        default: 600
         type: number
     secrets:
       SWR_USERNAME:
         required: false
       SWR_PASSWORD:
         required: false
+    outputs:
+      skip_reason:
+        description: 'npu-model 没真的训练（超时/跳过）时的原因，gate 据此判 skipped-reason'
+        value: ${{ jobs.npu_model_tests.outputs.skip_reason }}
 
-  # 手动入口。不写 test_files / shard：手动跑的意义就是「点名一个路径」或者
-  # 「全跑一遍」，不是重现某次分片。
+  # 手动入口。默认值换成「排查 / 跑全量」方便的那一套，调用方永远显式传值。
   workflow_dispatch:
     inputs:
-      mode:
-        description: '跑哪一类：npu 需要真实卡，cpu 是纯 python 逻辑'
+      kind:
+        description: '跑哪条泳道'
         required: true
-        default: 'npu'
+        default: 'npu-unit'
         type: choice
         options:
-          - npu
-          - cpu
-      test_path:
-        description: 'pytest 目标：目录 / 文件 / node id；填 - 表示整条泳道（留空会回落成本默认值）'
-        required: false
-        default: 'tests/ops/npu'
-        type: string
+          - cpu-unit
+          - npu-unit
+          - npu-model
       runner_label:
         description: 'Runner 标签（尾缀数字是卡数）'
         required: true
         default: 'linux-aarch64-a3-800i-2'
         type: choice
-        # 手动入口也要能点名 CPU 池，否则「不带容器跑一遍」根本没法验证。
         options:
           - linux-aarch64-a3-800i-2
           - linux-aarch64-a3-800i-4
@@ -107,29 +175,82 @@ on:
           - linux-aarch64-cpu-24
           - ubuntu-22.04-arm
       image:
-        description: 'L1 基础镜像；用 repo@sha256:... 可严格复现'
-        required: true
+        description: '基础镜像；用 repo@sha256:... 可严格复现'
+        required: false
         default: 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest'
         type: string
-      use_container:
-        description: 'true = 用镜像（NPU 必开）；false = 裸机 pip'
-        required: true
-        default: true
-        type: boolean
+      test_path:
+        description: 'unit 专用：目录 / 文件 / node id；填 - 表示整条泳道（留空会回落到默认值）'
+        required: false
+        default: '-'
+        type: string
       pytest_args:
-        description: '额外 pytest 参数（按空格拆）'
+        description: 'unit 专用：额外 pytest 参数（按空格拆）'
         required: false
         default: '-v --durations=20'
         type: string
       transformers_spec:
-        description: '额外的 transformers 约束；留空则用镜像里的版本'
+        description: 'unit 专用：额外的 transformers 约束；留空则用镜像里的版本'
         required: false
         default: ''
         type: string
+      model_type:
+        description: 'model 专用：@register_model 的名字'
+        required: false
+        default: 'qwen3_5'
+        type: choice
+        options:
+          - qwen3_5
+          - qwen3_5_moe
+          - qwen3_5_moe_text
+          - bailing_hybrid
+          - bailing_moe_v3_vl
+          - deepseek_v4
+          - kimi_k25
+          - llada2_moe
+          - qwen4_exp
+          - qwen3_moe
+          - glm_moe_dsa
+      framework:
+        description: 'model 专用：训练框架；决定用 lf_* 还是 swift_* 启动脚本'
+        required: false
+        default: 'lf'
+        type: choice
+        options:
+          - lf
+          - swift
+      trim_layers:
+        description: 'model 专用：只保留前 N 层，0 = 全量。flash 用 6（约一个周期）'
+        required: false
+        default: 0
+        type: number
+      train_dataset:
+        description: 'model 专用：数据集名（dataset/dataset_info.json 里的 key）'
+        required: false
+        default: 'gsm8k'
+        type: string
+      train_seq_len:
+        description: 'model 专用：cutoff_len'
+        required: false
+        default: '1024'
+        type: string
+      train_finetuning_type:
+        description: 'model 专用：微调方式'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - lora
+      strict:
+        description: 'model 专用：true = 模型获取超时判红（手动跑建议开）'
+        required: false
+        default: true
+        type: boolean
       timeout_minutes:
         description: 'job 硬上限（手动跑给宽一点）'
         required: false
-        default: 90
+        default: 300
         type: number
 
 permissions:
@@ -142,21 +263,90 @@ env:
   RESULT_JSON: /tmp/ci-result.json
 
 jobs:
-  # ---------------------------------------------------------------- 容器内
-  container:
-    name: pytest-${{ inputs.mode }}（容器 · ${{ inputs.runner_label }}）
-    if: ${{ inputs.use_container }}
+  # ---------------------------------------------------------- cpu-unit-tests
+  cpu_unit_tests:
+    name: cpu-unit-tests（裸机 · ${{ inputs.runner_label }}）
+    if: ${{ inputs.kind == 'cpu-unit' }}
     runs-on: ${{ inputs.runner_label }}
     # `|| 60` 是兜底；外面必须包 fromJSON：dispatch 触发的 number 输入实际是
     # 字符串（"30"），直接给 timeout-minutes 会让 GitHub **静默丢弃整个 job**
     # （不是报错，是 run 里看不到这个 job）。详见 docs/ci/README.md。
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
-    # 这里**不要**加 job 级 concurrency。曾经按 runner_label 分过组，结果
-    # cancel-in-progress: false 并没带来排队：「同一个组里 pending 的 job
-    # 只保留最后一个」。ci-full 的 5 个 L1 分片中 2/3/4 在创建 1 s 后全部
-    # cancelled，只剩 2 个在跑 —— group 必须按「能不能共用»划，而分片恰恰
-    # 是要并行的。串行本来就不需要它：self-hosted runner 忙时，下一个 job
-    # 天然在 queued 里等。
+    # concurrency 一律不加：曾经按 runner_label 分过组，结果同组 pending 的
+    # job 只保留最后一个，5 个分片剩 2 个。串行由 runner 忙时天然排队提供。
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: ① 检出
+        uses: actions/checkout@v4
+
+      - name: ② 准备 python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: ③ 安装 torchturbo
+        env:
+          TRANSFORMERS_SPEC: ${{ inputs.transformers_spec }}
+        run: |
+          set -uo pipefail
+          python3 "$CI_SCRIPTS/result.py" init --file "$RESULT_JSON" \
+            kind=pytest model_type="pytest-${{ inputs.kind }}" \
+            mode='${{ inputs.kind }}' runner_label='${{ inputs.runner_label }}'
+
+          START=$(date +%s)
+          # 先单独装 torch：GH 托管机没有预装，而下面 extras 里好几个包会
+          # 声明对 torch 的依赖，一起解会让 pip 顺带装一份 GPU 版（几百 MB）。
+          python -m pip install torch 2>&1 | tee /tmp/turbo.log
+          RC=${PIPESTATUS[0]}
+          # `-e ".[test]"`：extras 里是测试真正 import 的那几个包，两条 unit
+          # 泳道（镜像 / 裸机）必须装同一套，否则同一个测试一边绿一边红。
+          # pyproject 里的 torch>=2.10.0 刚才已满足，不会重新下载。
+          if [ "$RC" -eq 0 ]; then
+            python -m pip install --no-build-isolation -e ".[test]" 2>&1 | tee -a /tmp/turbo.log
+            RC=${PIPESTATUS[0]}
+          fi
+          # 手动覆盖版本时才装。默认留空 = 完全跟随 extras 解出来的版本。
+          if [ "$RC" -eq 0 ] && [ -n "${TRANSFORMERS_SPEC}" ]; then
+            python -m pip install "${TRANSFORMERS_SPEC}" 2>&1 | tee -a /tmp/turbo.log
+            RC=${PIPESTATUS[0]}
+          fi
+          # 装完打一行实际版本：这是「两条 unit 泳道是否同一个 transformers」的唯一证据。
+          python -c "import transformers; print('transformers =', transformers.__version__)" || true
+
+          python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
+            --name '③ torchturbo 安装' --seconds "$(( $(date +%s) - START ))" --rc "$RC"
+          exit "$RC"
+
+      - name: ④ pytest
+        env:
+          MODE: cpu
+          TEST_FILES: ${{ inputs.test_files }}
+          TEST_PATH: ${{ inputs.test_path }}
+          SHARD: ${{ inputs.shard }}
+          PYTEST_ARGS: ${{ inputs.pytest_args }}
+        run: bash "$CI_SCRIPTS/pytest.sh"
+
+      - name: ⑤ 摘要
+        if: always()
+        run: |
+          set -uo pipefail
+          python3 "$CI_SCRIPTS/result.py" report --file "$RESULT_JSON" \
+            --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
+          python3 "$CI_SCRIPTS/result.py" notice --file "$RESULT_JSON" \
+            --model-type "pytest-${{ inputs.kind }}" || true
+
+  # ---------------------------------------------------------- npu-unit-tests
+  npu_unit_tests:
+    name: npu-unit-tests（容器 · ${{ inputs.runner_label }}）
+    if: ${{ inputs.kind == 'npu-unit' }}
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
 
     container:
       image: ${{ inputs.image }}
@@ -176,14 +366,14 @@ jobs:
       # 结果文件在任何可能失败的步骤之前就建好，这样「② 就挂了」的 run 也有摘要。
       - name: ② 先行校验
         env:
-          MODE: ${{ inputs.mode }}
+          KIND: ${{ inputs.kind }}
           RUNNER_LABEL: ${{ inputs.runner_label }}
           IMAGE: ${{ inputs.image }}
           TEST_FILES: ${{ inputs.test_files }}
         run: |
           set -uo pipefail
           python3 "$CI_SCRIPTS/result.py" init --file "$RESULT_JSON" \
-            kind=pytest model_type="pytest-$MODE" mode="$MODE" \
+            kind=pytest model_type="pytest-$KIND" mode="$KIND" \
             runner_label="$RUNNER_LABEL" image="$IMAGE"
 
           # 装上之前先记一份 torch，装完比对：被换掉的 torch 会让测试全红，
@@ -193,8 +383,7 @@ jobs:
           uname -m; nproc; free -h | head -2; df -h / | tail -1; python -V
           echo "files: ${TEST_FILES}"
 
-      - name: ②b NPU 自检（仅 npu 泳道）
-        if: ${{ inputs.mode == 'npu' }}
+      - name: ②b NPU 自检
         run: |
           set -uo pipefail
           # 用 bash 通配数设备，不用 `ls | wc -l`：actionlint 会按 shellcheck
@@ -234,7 +423,7 @@ jobs:
           ELAPSED=$(( $(date +%s) - START ))
           # 把装完的实际版本打出来。基础镜像里的 transformers 是
           # `pip install flash-linear-attention` 带进来的、无版本约束，
-          # 已经徙过两次；没有这一行，环境漂移只能等一堆用例变红才发现。
+          # 已经漂过两次；没有这一行，环境漂移只能等一堆用例变红才发现。
           python -c "import transformers; print('transformers =', transformers.__version__)" || true
           [ "$RC" -eq 0 ] && { python3 "$CI_SCRIPTS/env.py" check --file /tmp/torch-before.json || RC=1; }
           python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
@@ -243,7 +432,7 @@ jobs:
 
       - name: ④ pytest
         env:
-          MODE: ${{ inputs.mode }}
+          MODE: npu
           TEST_FILES: ${{ inputs.test_files }}
           TEST_PATH: ${{ inputs.test_path }}
           SHARD: ${{ inputs.shard }}
@@ -257,79 +446,33 @@ jobs:
           python3 "$CI_SCRIPTS/result.py" report --file "$RESULT_JSON" \
             --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
           python3 "$CI_SCRIPTS/result.py" notice --file "$RESULT_JSON" \
-            --model-type "pytest-${{ inputs.mode }}" || true
+            --model-type "pytest-${{ inputs.kind }}" || true
 
-  # ---------------------------------------------------------------- 裸机
-  hosted:
-    name: pytest-${{ inputs.mode }}（裸机 · ${{ inputs.runner_label }}）
-    if: ${{ !inputs.use_container }}
-    runs-on: ${{ inputs.runner_label }}
-    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
-    # concurrency 与上面的容器 job 同理：会杀掉并行的分片，不加。
-
-    defaults:
-      run:
-        shell: bash
-
-    steps:
-      - name: ① 检出
-        uses: actions/checkout@v4
-
-      - name: ② 准备 python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: pip
-          cache-dependency-path: pyproject.toml
-
-      - name: ③ 安装 torchturbo
-        env:
-          TRANSFORMERS_SPEC: ${{ inputs.transformers_spec }}
-        run: |
-          set -uo pipefail
-          python3 "$CI_SCRIPTS/result.py" init --file "$RESULT_JSON" \
-            kind=pytest model_type="pytest-${{ inputs.mode }}" \
-            mode='${{ inputs.mode }}' runner_label='${{ inputs.runner_label }}'
-
-          START=$(date +%s)
-          # 先单独装 torch：GH 托管机没有预装，而下面 extras 里好几个包会
-          # 声明对 torch 的依赖，一起解会让 pip 顺带装一份 GPU 版（几百 MB）。
-          python -m pip install torch 2>&1 | tee /tmp/turbo.log
-          RC=${PIPESTATUS[0]}
-          # `-e ".[test]"`：extras 里是测试真正 import 的那几个包，两条泳道
-          # （镜像 / 裸机）必须装同一套，否则同一个测试一边绿一边红。
-          # pyproject 里的 torch>=2.10.0 刚才已满足，不会重新下载。
-          if [ "$RC" -eq 0 ]; then
-            python -m pip install --no-build-isolation -e ".[test]" 2>&1 | tee -a /tmp/turbo.log
-            RC=${PIPESTATUS[0]}
-          fi
-          # 手动覆盖版本时才装。默认留空 = 完全跟随 extras 解出来的版本，
-          # 与容器泳道（镜像自带）保持一致。
-          if [ "$RC" -eq 0 ] && [ -n "${TRANSFORMERS_SPEC}" ]; then
-            python -m pip install "${TRANSFORMERS_SPEC}" 2>&1 | tee -a /tmp/turbo.log
-            RC=${PIPESTATUS[0]}
-          fi
-          # 装完打一行实际版本：这是「两条泳道是否同一个 transformers」的唯一证据。
-          python -c "import transformers; print('transformers =', transformers.__version__)" || true
-
-          python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
-            --name '③ torchturbo 安装' --seconds "$(( $(date +%s) - START ))" --rc "$RC"
-          exit "$RC"
-
-      - name: ④ pytest
-        env:
-          MODE: ${{ inputs.mode }}
-          TEST_FILES: ${{ inputs.test_files }}
-          TEST_PATH: ${{ inputs.test_path }}
-          SHARD: ${{ inputs.shard }}
-          PYTEST_ARGS: ${{ inputs.pytest_args }}
-        run: bash "$CI_SCRIPTS/pytest.sh"
-
-      - name: ⑤ 摘要
-        if: always()
-        run: |
-          set -uo pipefail
-          python3 "$CI_SCRIPTS/result.py" report --file "$RESULT_JSON" \
-            --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
-          python3 "$CI_SCRIPTS/result.py" notice --file "$RESULT_JSON" \
-            --model-type "pytest-${{ inputs.mode }}" || true
+  # --------------------------------------------------------- npu-model-tests
+  # 只做转发。实现体（取权重 / 减层 / 看门狗 / 收尾）在 npu-model-tests.yml，
+  # 那里没有手动入口 —— 手动入口只在本文件，避免两套默认值再次分叉。
+  npu_model_tests:
+    name: npu-model-tests（${{ inputs.model_type }}/${{ inputs.framework }}）
+    if: ${{ inputs.kind == 'npu-model' }}
+    uses: ./.github/workflows/npu-model-tests.yml
+    with:
+      runner_label: ${{ inputs.runner_label }}
+      image: ${{ inputs.image }}
+      model_type: ${{ inputs.model_type }}
+      framework: ${{ inputs.framework }}
+      train_model_path: ${{ inputs.train_model_path }}
+      hf_repo_override: ${{ inputs.hf_repo_override }}
+      trim_layers: ${{ inputs.trim_layers }}
+      train_seq_len: ${{ inputs.train_seq_len }}
+      train_dataset: ${{ inputs.train_dataset }}
+      train_finetuning_type: ${{ inputs.train_finetuning_type }}
+      train_sp_size: ${{ inputs.train_sp_size }}
+      train_ep_size: ${{ inputs.train_ep_size }}
+      diag: ${{ inputs.diag }}
+      strict: ${{ inputs.strict }}
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      train_timeout_minutes: ${{ inputs.train_timeout_minutes }}
+      fetch_timeout_seconds: ${{ inputs.fetch_timeout_seconds }}
+    secrets:
+      SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
+      SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}

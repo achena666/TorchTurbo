@@ -1,17 +1,19 @@
 name: CI · PR 门禁
 
 # PR 只留一个 required check：gate。
-# 三条泳道并行，谁该跑由改动路径决定：
 #
-#   Lint 静态   语法 / workflow 解析 / 映射表漂移    合在 select 里，几十秒
-#   select      算改动 → 出计划（泳道开关 + 文件清单）  与 Lint 共用一个 runner
-#   L1 CPU      affected 选中的用例（或全量分片）    gh 托管 arm64，裸机
-#   L2a NPU     需要 torch_npu 的那批用例            只有碰了 ops / 镜像 / 依赖才起
-#   L2b E2E     一个族内小模型跑一步                 只有路径命中才起
+#   计划层（0 卡，同一个 runner）
+#     Lint 静态   语法 / workflow 解析 / 映射表漂移
+#     select      算改动 → 出计划（泳道开关 + 文件清单）
+#
+#   三条泳道（并行，各自 needs: select）
+#     cpu-unit-tests   affected 选中的用例（或全量分片）  gh 托管 arm64，裸机
+#     npu-unit-tests   需要 torch_npu 的那批用例           只有碰了 ops / 镜像 / 依赖才起
+#     npu-model-tests  一个族内小模型跑一步                只有路径命中才起
 #
 # 时间不追求极限（目标 25 min / 告警 35 min / 硬上限 45 min），
-# 但**跳过必须带原因**：L2 没跑却没记录原因 -> gate 判红，
-# 否则「慢慢把 L2 关掉」会被当成正常。
+# 但**跳过必须带原因**：NPU 泳道没跑却没记录原因 -> gate 判红，
+# 否则「慢慢把 NPU 关掉」会被当成正常。
 
 on:
   pull_request:
@@ -55,10 +57,10 @@ jobs:
       stage: ${{ steps.stage.outputs.stage }}
       # l*_run 是决策层唯一需要下游读的东西：yaml 只读这几个布尔值，
       # 不自己拼路径规则。它们的值都在 scripts/ci/affected.py 里算。
-      l1_run: ${{ steps.pick.outputs.l1_run }}
-      l2a_run: ${{ steps.pick.outputs.l2a_run }}
-      l2b_run: ${{ steps.pick.outputs.l2b_run }}
-      l1_files: ${{ steps.pick.outputs.l1_files }}
+      cpu_unit_run: ${{ steps.pick.outputs.cpu_unit_run }}
+      npu_unit_run: ${{ steps.pick.outputs.npu_unit_run }}
+      npu_model_run: ${{ steps.pick.outputs.npu_model_run }}
+      cpu_unit_files: ${{ steps.pick.outputs.cpu_unit_files }}
       test_files: ${{ steps.pick.outputs.test_files }}
       shard_list: ${{ steps.pick.outputs.shard_list }}
       image: ${{ steps.image.outputs.image }}
@@ -161,7 +163,7 @@ jobs:
             echo '| 项 | 值 |'
             echo '|---|---|'
             echo "| mode | \`${{ steps.pick.outputs.mode }}\` |"
-            echo "| L1 / L2a / L2b | \`${{ steps.pick.outputs.l1_run }} / ${{ steps.pick.outputs.l2a_run }} / ${{ steps.pick.outputs.l2b_run }}\` |"
+            echo "| cpu-unit / npu-unit / npu-model | \`${{ steps.pick.outputs.cpu_unit_run }} / ${{ steps.pick.outputs.npu_unit_run }} / ${{ steps.pick.outputs.npu_model_run }}\` |"
             echo "| E2E | \`${{ steps.pick.outputs.e2e }}\` |"
             echo "| 分片 | \`${{ steps.pick.outputs.shard_list }}\` |"
             echo "| 镜像 | \`$REF\` |"
@@ -192,50 +194,45 @@ jobs:
             echo "stage=ok" >> "$GITHUB_OUTPUT"
           fi
 
-  # ------------------------------------------------------------------ L1
-  l1:
-    name: L1 CPU（${{ matrix.shard }}）
+  # ------------------------------------------------------------ cpu-unit-tests
+  cpu_unit_tests:
+    name: cpu-unit-tests（${{ matrix.shard }}）
     # 第一道闸：计划没算出来（静态没过 / 选择器倒）就没有 CPU 子集可跑。
     needs: select
-    # `l1_run` 为 false 时这个 job 本就不该存在（本次没选中 CPU 测试），
+    # `cpu_unit_run` 为 false 时这个 job 本就不该存在（本次没选中 CPU 测试），
     # 与「上游挂了」是两回事 —— 区分靠 select 的输出（详见 docs/ci/README.md）。
     if: |
       always() && needs.select.result == 'success' &&
-      needs.select.outputs.l1_run == 'true'
+      needs.select.outputs.cpu_unit_run == 'true'
     strategy:
       fail-fast: false
       matrix:
         shard: ${{ fromJSON(needs.select.outputs.shard_list) }}
     uses: ./.github/workflows/ci-pytest.yml
     with:
-      mode: cpu
-      use_container: false
+      kind: cpu-unit
       runner_label: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
       # 用选中的 CPU 子集，不是全量 —— 这是选测真正生效的地方。
-      test_files: ${{ needs.select.outputs.l1_files }}
+      test_files: ${{ needs.select.outputs.cpu_unit_files }}
       shard: ${{ matrix.shard }}
       timeout_minutes: 40
 
-  # ------------------------------------------------------------------ L2a
-  l2a:
-    name: L2a NPU 特性
-    needs: [select, l1]
-    # 两件事分开写：
-    #   1) L1 要么跑成功，要么是「本次本来就没有 CPU 测试」（l1_run=false）——
-    #      后者不能拖累 NPU。`needs` 会把任何 skipped 传下去，所以得显式区分。
-    #   2) fork PR 不起 L2：secrets 不给 fork，而「把 secrets 递到 fork 的
-    #      代码上」等于把 RCE 送人（pull_request_target 就是这么出事的）。
+  # ------------------------------------------------------------ npu-unit-tests
+  npu_unit_tests:
+    name: npu-unit-tests
+    # 三条泳道**并行**，各自只依赖 select：互不影响，CPU 红不会拖累 NPU。
+    # 是否开卡完全由 select 的输出决定。
+    needs: select
+    # fork PR 不起 NPU：secrets 不给 fork，而「把 secrets 递到 fork 的代码上」
+    # 等于把 RCE 送人（pull_request_target 就是这么出事的）。
     if: |
       always() && needs.select.result == 'success' &&
-      (needs.l1.result == 'success' ||
-       (needs.l1.result == 'skipped' && needs.select.outputs.l1_run == 'false')) &&
-      needs.select.outputs.l2a_run == 'true' &&
+      needs.select.outputs.npu_unit_run == 'true' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
     uses: ./.github/workflows/ci-pytest.yml
     with:
-      mode: npu
-      use_container: true
+      kind: npu-unit
       image: ${{ needs.select.outputs.image }}
       runner_label: ${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}
       # 泳道内全跑：算子/镜像的影响是全仓的，只跑选中的几个等于没验。
@@ -245,20 +242,14 @@ jobs:
       SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
       SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}
 
-  # ------------------------------------------------------------------ L2b
-  l2b:
-    name: L2b E2E（${{ matrix.profile.model_type }}）
-    # 链尾。为什么用 always() 而不是靠 needs 的隐式跳过：L1/L2a 都可能因为
-    # 「本次不需要」而 skipped，而 needs 里任何 skipped 都会把下游一起带走。
-    # E2E 与它们只是顺序关系，不是「必须都跑过」。
-    needs: [select, l1, l2a]
+  # ----------------------------------------------------------- npu-model-tests
+  npu_model_tests:
+    name: npu-model-tests（${{ matrix.profile.model_type }}）
+    # 与 cpu-unit / npu-unit 同级，同样只依赖 select。
+    needs: select
     if: |
       always() && needs.select.result == 'success' &&
-      (needs.l1.result == 'success' ||
-       (needs.l1.result == 'skipped' && needs.select.outputs.l1_run == 'false')) &&
-      (needs.l2a.result == 'success' ||
-       (needs.l2a.result == 'skipped' && needs.select.outputs.l2a_run == 'false')) &&
-      needs.select.outputs.l2b_run == 'true' &&
+      needs.select.outputs.npu_model_run == 'true' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
     strategy:
@@ -267,8 +258,9 @@ jobs:
       fail-fast: false
       matrix:
         profile: ${{ fromJSON(needs.select.outputs.e2e) }}
-    uses: ./.github/workflows/ci-train.yml
+    uses: ./.github/workflows/ci-pytest.yml
     with:
+      kind: npu-model
       runner_label: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
       image: ${{ needs.select.outputs.image }}
       model_type: ${{ matrix.profile.model_type }}
@@ -302,7 +294,7 @@ jobs:
   #     打架。所以显式写 `needs.select.result == 'success'`。
   gate:
     name: gate
-    needs: [select, l1, l2a, l2b]
+    needs: [select, cpu_unit_tests, npu_unit_tests, npu_model_tests]
     if: always()
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10
@@ -320,13 +312,13 @@ jobs:
         env:
           R_SEL: ${{ needs.select.result }}
           SEL_STAGE: ${{ needs.select.outputs.stage }}
-          R_L1: ${{ needs.l1.result }}
-          R_L2A: ${{ needs.l2a.result }}
-          R_L2B: ${{ needs.l2b.result }}
-          L1_RUN: ${{ needs.select.outputs.l1_run }}
-          L2A_RUN: ${{ needs.select.outputs.l2a_run }}
-          L2B_RUN: ${{ needs.select.outputs.l2b_run }}
-          SKIP_REASON: ${{ needs.l2b.outputs.skip_reason }}
+          R_CPU_UNIT: ${{ needs.cpu_unit_tests.result }}
+          R_NPU_UNIT: ${{ needs.npu_unit_tests.result }}
+          R_NPU_MODEL: ${{ needs.npu_model_tests.result }}
+          CPU_UNIT_RUN: ${{ needs.select.outputs.cpu_unit_run }}
+          NPU_UNIT_RUN: ${{ needs.select.outputs.npu_unit_run }}
+          NPU_MODEL_RUN: ${{ needs.select.outputs.npu_model_run }}
+          SKIP_REASON: ${{ needs.npu_model_tests.outputs.skip_reason }}
           STRICT: ${{ contains(github.event.pull_request.labels.*.name, 'ci:e2e:strict') }}
           IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
           SUMMARY: ${{ needs.select.outputs.summary }}

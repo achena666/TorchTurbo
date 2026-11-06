@@ -122,51 +122,43 @@ class Report:
 
 def judge_pr() -> int:
     rep = Report()
-    # 静态检查与选测现在在**同一个 job** 里，只看 R_SEL 分不清倒在哪一步 ——
+    # 静态检查与选测在**同一个 job** 里，只看 R_SEL 分不清倒在哪一步 ——
     # job 最后一步（always）把 stage 写进输出说明原因。这里把它还原成
-    # 两个值，下面的判定逻辑（含「lint 红了下游按设计未启动」那段）不用改。
-    results = {k: _env(f"R_{k}") for k in ("SEL", "L1", "L2A", "L2B")}
-    results["LINT"] = "failure" if _env("SEL_STAGE") == "static" else "success"
+    # 「静态检查过没过」，下面就能像以前一样先判静态、再判泳道。
+    results = {k: _env(f"R_{k}") for k in ("SEL", "CPU_UNIT", "NPU_UNIT", "NPU_MODEL")}
+    results["STATIC"] = "failure" if _env("SEL_STAGE") == "static" else "success"
     # 决策层给的三个开关：「这个泳道本次该不该跑」。
     # 拿不到（旧调用方式 / 手敲测试）时按 true 处理，也就是宁可错判红。
-    want = {k: _env(f"{k}_RUN", "true") for k in ("L1", "L2A", "L2B")}
+    want = {k: _env(f"{k}_RUN", "true")
+            for k in ("CPU_UNIT", "NPU_UNIT", "NPU_MODEL")}
 
-    rep.required("Lint 静态", results["LINT"])
+    rep.required("静态检查", results["STATIC"])
 
-    # lint 是整条链的闸：它没过就不算计划（select 不启动），后面三条泳道
+    # 静态检查是整条链的闸：它没过就不算计划（select 没跑完），后面三条泳道
     # 因此一定 skipped。那是「按设计没跑」，不是「不知道为什么没跑」——
     # 后者才需要报警，前者报警只会把真正的原因埋掉。
-    lint_bad = results["LINT"] not in ("success", "skipped")
+    static_bad = results["STATIC"] not in ("success", "skipped")
 
-    if lint_bad:
-        for name, key in (("select", "SEL"), ("L1 CPU", "L1"),
-                          ("L2a NPU", "L2A"), ("L2b E2E", "L2B")):
-            if results[key] == "success":
-                rep.rows.append(f"| {name} | {OK} |  |")
-            else:
-                rep.rows.append(f"| {name} | {SKIP} | lint 未通过，按设计未启动 |")
+    lanes = (("CPU-unit", "CPU_UNIT"), ("NPU-unit", "NPU_UNIT"),
+             ("NPU-model", "NPU_MODEL"))
+
+    if static_bad:
+        rep.rows.append(f"| select | {SKIP} | 静态检查未通过，按设计未启动 |")
+        for name, key in lanes:
+            rep.rows.append(f"| {name} | {SKIP} | 静态检查未通过，按设计未启动 |")
     else:
-        # L1 在「本次没选中任何 CPU 测试」或「计划没算出来」时该 skipped，
-        # 两种都不是故障，但要写清是哪一种。
         sel_bad = results["SEL"] != "success"
-        if results["L1"] == "skipped" and (want["L1"] == "false" or sel_bad):
-            rep.rows.append(
-                f"| L1 CPU | {SKIP} | "
-                f"{'未选中 CPU 测试' if not sel_bad else '计划未算出，按设计未启动'} |"
-            )
-        else:
-            rep.required("L1 CPU", results["L1"])
+        skip_why = "计划未算出，按设计未启动"
 
-        # 三条泳道是串行门控（L1 -> L2a -> L2b）。上游红了，下游一定 skipped，
-        # 那是「按设计没跑」，不是「不知道为什么没跑」—— 否则摘要会在真正的原因
-        # （L1 红）旁边再挂一个 skipped-unknown，把人引到错的地方去。
-        # 只影响措辞，不影响结论：上游本身红了这一轮仍然是失败。
-        cpu_bad = sel_bad or results["L1"] not in ("success", "skipped")
-        npu_bad = cpu_bad or results["L2A"] not in ("success", "skipped")
-
+        # 每条泳道独立判定：并行拓扑下「上游红了」不再是跳过的理由，
+        # 跳过只可能是「自己没被选中」或「计划没算出来」。
         if _env("IS_FORK") == "true":
-            # fork PR 的 L2 不执行是设计，不是故障。
-            for name, key in (("L2a NPU", "L2A"), ("L2b E2E", "L2B")):
+            # fork PR 的 NPU 泳道不执行是设计，不是故障。
+            if results["CPU_UNIT"] == "skipped" and want["CPU_UNIT"] == "false":
+                rep.rows.append(f"| CPU-unit | {SKIP} | 未选中 CPU 测试 |")
+            else:
+                rep.required("CPU-unit", results["CPU_UNIT"])
+            for name, key in lanes[1:]:
                 res = results[key]
                 if res == "skipped":
                     rep.rows.append(f"| {name} | {SKIP} | fork PR（secrets 不递） |")
@@ -176,29 +168,29 @@ def judge_pr() -> int:
                     rep.rows.append(f"| {name} | {BAD} {res} |  |")
                     rep.failed = True
         else:
-            rep.optional(
-                "L2a NPU", results["L2A"],
-                expect_skip=(want["L2A"] != "true") or cpu_bad,
-                why="上游未通过，按串行链跳过" if cpu_bad
-                else "未选中需要真卡的测试文件",
-            )
-            rep.optional(
-                "L2b E2E", results["L2B"],
-                expect_skip=(want["L2B"] != "true") or npu_bad,
-                why="上游未通过，按串行链跳过" if npu_bad else "无匹配画像",
-            )
+            why = {
+                "CPU_UNIT": "未选中 CPU 测试",
+                "NPU_UNIT": "未选中需要真卡的测试文件",
+                "NPU_MODEL": "无匹配画像",
+            }
+            for name, key in lanes:
+                rep.optional(
+                    name, results[key],
+                    expect_skip=(want[key] != "true") or sel_bad,
+                    why=skip_why if sel_bad else why[key],
+                )
 
     # 跑起来了但自己宣告跳过（模型获取超时）：记 skipped-reason，
     # 默认判绿，只有 ci:e2e:strict 才判红。
     skip_reason = _env("SKIP_REASON")
-    if skip_reason and results["L2B"] == "success":
-        rep.note("L2b 跳过原因", f"⚠️ {skip_reason}")
+    if skip_reason and results["NPU_MODEL"] == "success":
+        rep.note("npu-model 跳过原因", f"⚠️ {skip_reason}")
         if _env("STRICT") == "true":
             rep.failed = True
 
-    # select 只在 lint 通过后才启动，所以 lint 红时它 skipped 是设计内，
-    # 已经在上面那一组行里记过了，不再重复记一次红。
-    if not lint_bad:
+    # select 是计划本身：没算出来就没有「跑不跑」可言，直接判红。
+    # 静态检查红时它 skipped 是设计内，已经在上面记过，不重复。
+    if not static_bad:
         sel = results["SEL"]
         rep.note("select", OK if sel == "success" else f"{BAD} {sel}")
         if sel != "success":
@@ -206,8 +198,8 @@ def judge_pr() -> int:
 
     rep.render("CI 结果", _env("SUMMARY"))
     # select 没跑时摘要必然是空的，退回一句能解释的话，别写 "select-failed"——
-    # 真正失败的是 lint，写成 select 会把人引到错的地方。
-    fallback = "lint-failed" if lint_bad else "select-failed"
+    # 真正失败的是静态检查，写成 select 会把人引到错的地方。
+    fallback = "static-failed" if static_bad else "select-failed"
     print(f"::notice title=ci::{_env('SUMMARY') or fallback}")
     if rep.failed:
         print("::error::门禁未通过")
@@ -219,24 +211,23 @@ def judge_pr() -> int:
 def judge_full() -> int:
     rep = Report()
     # 同 judge_pr：静态与选测共用一个 job，靠 stage 把两者拆回两行。
-    req = {k: _env(f"R_{k}") for k in ("SEL", "L1", "L2A")}
-    req["LINT"] = "failure" if _env("SEL_STAGE") == "static" else "success"
-    want = {k: _env(f"{k}_RUN", "true") for k in ("L1", "L2A", "L2B")}
+    req = {k: _env(f"R_{k}") for k in ("SEL", "CPU_UNIT", "NPU_UNIT", "NPU_MODEL")}
+    req["STATIC"] = "failure" if _env("SEL_STAGE") == "static" else "success"
+    want = {k: _env(f"{k}_RUN", "true")
+            for k in ("CPU_UNIT", "NPU_UNIT", "NPU_MODEL")}
 
-    rep.required("Lint 静态", req["LINT"])
+    rep.required("静态检查", req["STATIC"])
 
-    # lint 红了就不算计划：后面全 skipped 是设计内，一句话说清楚即可。
-    lint_bad = req["LINT"] not in ("success", "skipped")
-    if lint_bad:
-        for name, key in (("select", "SEL"), ("L1 CPU", "L1"), ("L2a NPU", "L2A")):
-            if req[key] == "success":
-                rep.rows.append(f"| {name} | {OK} |  |")
-            else:
-                rep.rows.append(f"| {name} | {SKIP} | lint 未通过，按设计未启动 |")
-        rep.optional("L2b E2E", _env("R_L2B"), expect_skip=True,
-                     why="lint 未通过，按设计未启动")
+    # 静态红就不算计划：后面全 skipped 是设计内，一句话说清楚即可。
+    static_bad = req["STATIC"] not in ("success", "skipped")
+    if static_bad:
+        for name in ("CPU-unit", "NPU-unit"):
+            rep.rows.append(f"| {name} | {SKIP} | 静态检查未通过，按设计未启动 |")
+        rep.rows.append(f"| select | {SKIP} | 静态检查未通过，按设计未启动 |")
+        rep.optional("NPU-model", req["NPU_MODEL"], expect_skip=True,
+                     why="静态检查未通过，按设计未启动")
         rep.render("main 全量结果", _env("SUMMARY"))
-        print(f"::error::全量未通过")
+        print("::error::全量未通过")
         return 1
 
     rep.required("select", req["SEL"])
@@ -244,29 +235,18 @@ def judge_full() -> int:
     # 全量模式下三条泳道都应该跑（force-all）；但保留 lane 判断，
     # 万一将来全量也做了裁剪，这里不用再改。
     sel_bad = req["SEL"] != "success"
-    if req["L1"] == "skipped" and (want["L1"] == "false" or sel_bad):
-        rep.rows.append(
-            f"| L1 CPU | {SKIP} | "
-            f"{'未选中 CPU 测试' if not sel_bad else '计划未算出，按设计未启动'} |"
+    why = {
+        "CPU_UNIT": "未选中 CPU 测试",
+        "NPU_UNIT": "未选中需要真卡的测试文件",
+        "NPU_MODEL": "无匹配画像",
+    }
+    for name, key in (("CPU-unit", "CPU_UNIT"), ("NPU-unit", "NPU_UNIT"),
+                      ("NPU-model", "NPU_MODEL")):
+        rep.optional(
+            name, req[key],
+            expect_skip=(want[key] != "true") or sel_bad,
+            why="计划未算出，按设计未启动" if sel_bad else why[key],
         )
-    else:
-        rep.required("L1 CPU", req["L1"])
-
-    # 串行门控后，上游红了下游一定是 skipped。这里不重复记一笔「未执行」，
-    # 只把真正的红标出来，免得摘要里同一件事说两遍。
-    upstream_failed = any(
-        req[k] not in ("success", "skipped") for k in ("SEL", "L1")
-    )
-    if upstream_failed and req["L2A"] == "skipped":
-        rep.rows.append(f"| L2a NPU | {SKIP} | 上游未通过，按串行链跳过 |")
-    else:
-        rep.required("L2a NPU", req["L2A"])
-
-    # 全量里 E2E 也可能因为「今天没有画像要跑」而跳过，属正常。
-    rep.optional(
-        "L2b E2E", _env("R_L2B"), expect_skip=True,
-        why="上游未通过，按串行链跳过" if upstream_failed else "无匹配画像",
-    )
 
     rep.render("main 全量结果", _env("SUMMARY"))
     print(f"::notice title=ci-full::{_env('SUMMARY') or 'select-failed'}")
