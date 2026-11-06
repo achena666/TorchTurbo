@@ -1,33 +1,57 @@
-name: CI / PR
+name: CI
 
-# Sole required check: gate.
-# select does static checks + planning on one runner; the three lanes run in
-# parallel and depend only on select. A skipped lane must carry a reason,
-# otherwise gate fails -- that is what keeps lanes from being disabled silently.
+# One entry point, two modes, one job per lane.
 #
-# Job keys are numbered because the graph orders sibling jobs by key: that is
-# what pins cpu-unit -> npu-unit -> model-unit top to bottom.
+#   mode=pr     pull request gate; selection from the diff, sole required check: gate
+#   mode=full   everything; selection forced, no sharding
+#
+# Lanes are inlined, not called as reusable workflows: a `uses:` job always
+# displays as "<caller name> / <callee name>", which cannot be collapsed into
+# the single label we want on the graph. Job keys carry an l1_/l2_/l3_ prefix
+# because the graph orders sibling jobs by key -- that is what keeps cpu-unit
+# first, npu-unit second, npu-model last.
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'pr = select from the diff, full = run everything'
+        required: true
+        default: 'pr'
+        type: choice
+        options:
+          - pr
+          - full
       force_all:
-        description: 'Run everything (same as the ci:full label)'
+        description: 'pr only: run everything (same as the ci:full label)'
         required: false
         default: false
         type: boolean
+      with_e2e:
+        description: 'full only: run every e2e profile'
+        required: false
+        default: true
+        type: boolean
 
-# A new push cancels the old run; model-unit is the expensive part.
+# PR runs cancel the previous run of the same PR. Full runs get a per-run group
+# on purpose: a shared group with cancel-in-progress: false still cancels
+# *pending* jobs, and repeated dispatches left the queue stuck at pending
+# forever. No shared group, no queue, nothing to get stuck.
 concurrency:
-  group: ci-pr-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('full-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
   pull-requests: read
   actions: read          # gate timing reads created_at / run_started_at
+
+env:
+  # Two triggers, one body: pull_request is always pr mode.
+  # Named CI_MODE because MODE is what pytest.sh reads (cpu / npu).
+  CI_MODE: ${{ github.event_name == 'pull_request' && 'pr' || inputs.mode }}
 
 jobs:
   # Static checks and planning share one runner: they are strictly sequential,
@@ -87,17 +111,23 @@ jobs:
         env:
           LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
           FORCE_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.force_all }}
+          WITH_E2E: ${{ github.event_name != 'workflow_dispatch' || inputs.with_e2e }}
         run: |
           set -uo pipefail
 
           # Label semantics live here only; jobs never re-interpret them.
           EXTRA=()
-          case ",${LABELS}," in
-            *,ci:full,*)     EXTRA+=(--force-all --e2e-all) ;;
-            *,ci:e2e,*)      EXTRA+=(--e2e-force) ;;
-            *,ci:skip-npu,*) EXTRA+=(--no-npu) ;;
-          esac
-          [ "${FORCE_INPUT}" = "true" ] && EXTRA+=(--force-all --e2e-all)
+          if [ "${CI_MODE}" = "full" ]; then
+            EXTRA+=(--force-all)
+            [ "${WITH_E2E}" = "true" ] && EXTRA+=(--e2e-all)
+          else
+            case ",${LABELS}," in
+              *,ci:full,*)     EXTRA+=(--force-all --e2e-all) ;;
+              *,ci:e2e,*)      EXTRA+=(--e2e-force) ;;
+              *,ci:skip-npu,*) EXTRA+=(--no-npu) ;;
+            esac
+            [ "${FORCE_INPUT}" = "true" ] && EXTRA+=(--force-all --e2e-all)
+          fi
 
           # An empty diff means "not enough information" -> full run (fail-open).
           python3 scripts/ci/affected.py --changed-from git \
@@ -127,7 +157,7 @@ jobs:
 
           | item | value |
           |---|---|---|
-          | mode | \`${{ steps.pick.outputs.mode }}\` |
+          | mode | \`${CI_MODE}\` |
           | lanes | \`${{ steps.pick.outputs.cpu_unit_run }} / ${{ steps.pick.outputs.npu_unit_run }} / ${{ steps.pick.outputs.npu_model_run }}\` |
           | e2e | \`${{ steps.pick.outputs.e2e }}\` |
           | image | \`$REF\` |
@@ -158,22 +188,81 @@ jobs:
             echo "stage=ok" >> "$GITHUB_OUTPUT"
           fi
 
-  # One call, one job: each lane file declares exactly one job, and the CPU
-  # lane is not sharded. No matrix anywhere, so the graph stays one box per lane.
+  # Bare metal, no sharding: one job, one box. Sharding would put one box per
+  # shard on the graph, and 5 shards was slower end to end than one job.
   l1_cpu_unit:
-    name: '1. cpu-unit'
+    name: cpu-unit-tests
     needs: select
     if: |
       always() && needs.select.result == 'success' &&
       needs.select.outputs.cpu_unit_run == 'true'
-    uses: ./.github/workflows/ci-tests-cpu.yml
-    with:
-      runner_label: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
-      test_files: ${{ needs.select.outputs.cpu_unit_files }}
-      timeout_minutes: 40
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 40
 
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: install
+        env:
+          TEST_FILES: ${{ needs.select.outputs.cpu_unit_files }}
+          RESULT_JSON: /tmp/ci-result.json
+        run: |
+          set -uo pipefail
+          python3 scripts/ci/result.py init --file "$RESULT_JSON" \
+            kind=pytest model_type=pytest-cpu-unit mode=cpu \
+            runner_label="${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}"
+
+          START=$(date +%s)
+          # Install torch first: the extras below declare torch deps, and
+          # resolving them together pulls a full CUDA build.
+          python -m pip install torch 2>&1 | tee /tmp/turbo.log
+          RC=${PIPESTATUS[0]}
+          # Same extras as the container lane, otherwise the same test is green
+          # on one lane and red on the other.
+          if [ "$RC" -eq 0 ]; then
+            python -m pip install --no-build-isolation -e ".[test]" 2>&1 | tee -a /tmp/turbo.log
+            RC=${PIPESTATUS[0]}
+          fi
+          # Print the real version: transformers arrives transitively, so
+          # without this line drift only shows up as a batch of red tests.
+          python -c "import transformers; print('transformers =', transformers.__version__)" || true
+
+          python3 scripts/ci/result.py phase --file "$RESULT_JSON" \
+            --name 'install' --seconds "$(( $(date +%s) - START ))" --rc "$RC"
+          exit "$RC"
+
+      - name: pytest
+        env:
+          MODE: cpu
+          TEST_FILES: ${{ needs.select.outputs.cpu_unit_files }}
+          RESULT_JSON: /tmp/ci-result.json
+        run: bash scripts/ci/pytest.sh
+
+      - name: summary
+        if: always()
+        env:
+          RESULT_JSON: /tmp/ci-result.json
+        run: |
+          set -uo pipefail
+          python3 scripts/ci/result.py report --file "$RESULT_JSON" \
+            --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
+          python3 scripts/ci/result.py notice --file "$RESULT_JSON" \
+            --model-type pytest-cpu-unit || true
+
+  # Containerised; once it starts, the whole lane runs (the operator and image
+  # surface is repo-wide, so running only the selected files proves nothing).
   l2_npu_unit:
-    name: '2. npu-unit'
+    name: npu-unit-tests
     needs: select
     # Fork PRs get no secrets, and passing secrets to fork code is RCE.
     if: |
@@ -181,41 +270,160 @@ jobs:
       needs.select.outputs.npu_unit_run == 'true' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
-    uses: ./.github/workflows/ci-tests-npu.yml
-    with:
-      image: ${{ needs.select.outputs.image }}
-      runner_label: ${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}
-      test_files: '[]'
-      timeout_minutes: 40
-    secrets:
-      SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
-      SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}
+    runs-on: ${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}
+    timeout-minutes: 40
 
-  l3_model_unit:
-    name: '3. model-unit'
+    container:
+      image: ${{ needs.select.outputs.image }}
+      credentials:
+        username: ${{ secrets.SWR_USERNAME }}
+        password: ${{ secrets.SWR_PASSWORD }}
+      options: --user root
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build the result file before anything can fail, so a run that dies in
+      # this step still renders a summary.
+      - name: preflight
+        env:
+          RESULT_JSON: /tmp/ci-result.json
+        run: |
+          set -uo pipefail
+          python3 scripts/ci/result.py init --file "$RESULT_JSON" \
+            kind=pytest model_type=pytest-npu-unit mode=npu \
+            runner_label="${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}" \
+            image="${{ needs.select.outputs.image }}"
+
+          # Snapshot torch before installing; a swapped torch turns every test
+          # red and looks like a code bug.
+          python3 scripts/ci/env.py capture --file /tmp/torch-before.json || true
+
+          uname -m; nproc; free -h | head -2; df -h / | tail -1; python -V
+
+      - name: npu self-check
+        env:
+          RESULT_JSON: /tmp/ci-result.json
+        run: |
+          set -uo pipefail
+          # Glob instead of `ls | wc -l`: shellcheck SC2012 flags ls parsing.
+          shopt -s nullglob
+          davinci=(/dev/davinci*)
+          if [ "${#davinci[@]}" -eq 0 ]; then
+            echo "::error::no /dev/davinci*, NPUs not mapped into the pod"
+            exit 1
+          fi
+          echo "davinci count: ${#davinci[@]}"
+          npu-smi info 2>/dev/null | head -12 || true
+          START=$(date +%s); set +e
+          python3 scripts/ci/env.py verify
+          RC=$?
+          python3 scripts/ci/result.py phase --file "$RESULT_JSON" \
+            --name 'npu self-check' --seconds "$(( $(date +%s) - START ))" --rc "$RC"
+          exit "$RC"
+
+      - name: install
+        env:
+          RESULT_JSON: /tmp/ci-result.json
+        run: |
+          set -uo pipefail
+          START=$(date +%s)
+          # --no-build-isolation: [build-system].requires contains torch, and
+          # pip would otherwise download a full torch just to run setuptools.
+          python -m pip install --no-cache-dir --no-build-isolation -e ".[test]" 2>&1 \
+            | tee /tmp/turbo.log
+          RC=${PIPESTATUS[0]}
+          ELAPSED=$(( $(date +%s) - START ))
+          python -c "import transformers; print('transformers =', transformers.__version__)" || true
+          [ "$RC" -eq 0 ] && { python3 scripts/ci/env.py check --file /tmp/torch-before.json || RC=1; }
+          python3 scripts/ci/result.py phase --file "$RESULT_JSON" \
+            --name 'install' --seconds "$ELAPSED" --rc "$RC"
+          exit "$RC"
+
+      - name: pytest
+        env:
+          MODE: npu
+          TEST_FILES: '[]'
+          RESULT_JSON: /tmp/ci-result.json
+        run: bash scripts/ci/pytest.sh
+
+      - name: summary
+        if: always()
+        env:
+          RESULT_JSON: /tmp/ci-result.json
+        run: |
+          set -uo pipefail
+          python3 scripts/ci/result.py report --file "$RESULT_JSON" \
+            --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
+          python3 scripts/ci/result.py notice --file "$RESULT_JSON" \
+            --model-type pytest-npu-unit || true
+
+  # N profiles in one job. A matrix would put one box per profile on the graph,
+  # so the loop lives in train.sh lane instead.
+  l3_npu_model:
+    name: npu-model-tests
     needs: select
     if: |
       always() && needs.select.result == 'success' &&
       needs.select.outputs.npu_model_run == 'true' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
-    uses: ./.github/workflows/ci-tests-model.yml
-    with:
-      runner_label: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
-      image: ${{ needs.select.outputs.image }}
-      profiles: ${{ needs.select.outputs.e2e }}
-      framework: lf
-      train_seq_len: '1024'
-      train_dataset: 'gsm8k'
-      train_finetuning_type: 'full'
-      timeout_minutes: 45
-      train_timeout_minutes: 25
-      fetch_timeout_seconds: 600
-    secrets:
-      SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
-      SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}
+    runs-on: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
+    # fromJSON is not needed here (no inputs), but keep the literal in sync with
+    # the lane timeout below.
+    timeout-minutes: 45
+    outputs:
+      skip_reason: ${{ steps.lane.outputs.skip_reason }}
 
-  # Sole required check. Rules live in scripts/ci/gate.py so PR and full runs
+    container:
+      image: ${{ needs.select.outputs.image }}
+      credentials:
+        username: ${{ secrets.SWR_USERNAME }}
+        password: ${{ secrets.SWR_PASSWORD }}
+      options: --user root
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 20 s to detect "no NPU" beats discovering it after installing deps.
+      - name: npu and stack self-check
+        run: bash scripts/ci/train.sh probe
+
+      # prepare / install / run / report per profile, aggregated into one rc.
+      - name: train
+        id: lane
+        timeout-minutes: 25
+        env:
+          E2E_PROFILES: ${{ needs.select.outputs.e2e }}
+          FRAMEWORK: lf
+          RUNNER_LABEL: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
+          IMAGE: ${{ needs.select.outputs.image }}
+          SEQ_LEN: '1024'
+          DATASET_IN: 'gsm8k'
+          FINETUNING_TYPE: 'full'
+          FETCH_TIMEOUT: '600'
+          DIAG: 'true'
+          RESULT_JSON: /tmp/ci-result.json
+        run: bash scripts/ci/train.sh lane
+
+      # Cleanup removes derived config and half a checkpoint, so it runs last.
+      # timeout-minutes only kills the process: a killed training leaves child
+      # processes holding cards and HBM, which makes the next job fail for
+      # unrelated reasons.
+      - name: cleanup
+        if: always()
+        continue-on-error: true
+        run: python3 scripts/ci/env.py cleanup
+
+  # Sole required check. Rules live in scripts/ci/gate.py so pr and full modes
   # cannot drift apart.
   #
   # select is a direct dependency: when planning fails the lanes skip
@@ -223,7 +431,7 @@ jobs:
   # reporting the result in seconds instead of minutes.
   gate:
     name: gate
-    needs: [select, l1_cpu_unit, l2_npu_unit, l3_model_unit]
+    needs: [select, l1_cpu_unit, l2_npu_unit, l3_npu_model]
     if: always()
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10
@@ -241,12 +449,12 @@ jobs:
           SEL_STAGE: ${{ needs.select.outputs.stage }}
           R_CPU_UNIT: ${{ needs.l1_cpu_unit.result }}
           R_NPU_UNIT: ${{ needs.l2_npu_unit.result }}
-          R_NPU_MODEL: ${{ needs.l3_model_unit.result }}
+          R_NPU_MODEL: ${{ needs.l3_npu_model.result }}
           CPU_UNIT_RUN: ${{ needs.select.outputs.cpu_unit_run }}
           NPU_UNIT_RUN: ${{ needs.select.outputs.npu_unit_run }}
           NPU_MODEL_RUN: ${{ needs.select.outputs.npu_model_run }}
-          SKIP_REASON: ${{ needs.l3_model_unit.outputs.skip_reason }}
+          SKIP_REASON: ${{ needs.l3_npu_model.outputs.skip_reason }}
           STRICT: ${{ contains(github.event.pull_request.labels.*.name, 'ci:e2e:strict') }}
           IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
           SUMMARY: ${{ needs.select.outputs.summary }}
-        run: python3 scripts/ci/gate.py judge --mode pr
+        run: python3 scripts/ci/gate.py judge --mode "$CI_MODE"

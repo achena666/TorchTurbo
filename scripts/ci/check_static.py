@@ -56,8 +56,7 @@ def check_workflows() -> list[str]:
     for path in paths:
         rel = path.relative_to(ROOT)
         # 命名规范：一律 `ci-<scope>.yml`，小写 kebab。
-        # 不统一的时候，`npu-model-tests.yml` 和 `ci-tests.yml` 这种混搭
-        # 会让人以为前者是独立入口 —— 它其实只是被调用的实现体。
+        # 不统一的时候会出一堆前缀，谁都分不清哪个是入口、哪个只是被调用的实现。
         if not re.fullmatch(r"ci-[a-z0-9]+(-[a-z0-9]+)*\.yml", path.name):
             bad.append(f"{rel}: 文件名不符合 ci-<scope>.yml（小写 kebab）")
         if yaml is not None:
@@ -124,16 +123,6 @@ def check_model_map() -> list[str]:
     if missing:
         bad.append(f"model_map 未收录: {', '.join(missing)}")
     return bad
-
-
-def read_jobs(rel: str) -> dict:
-    """读一个 workflow 的 jobs；路径是 caller 里的 `./.github/workflows/x.yml`。"""
-    import yaml  # noqa: PLC0415
-
-    path = ROOT / (rel[2:] if rel.startswith("./") else rel)
-    if not path.exists():
-        return {}
-    return (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("jobs") or {}
 
 
 def check_contract() -> list[str]:
@@ -211,7 +200,7 @@ def check_contract() -> list[str]:
         # 5. 三条泳道必须**并行**：都只依赖 select，谁也不依赖谁。
         #    串起来不会报错，但 L1 红会白等，且 L2a/L2b 的 if 要多写一层
         #    「上游是否挂了」的判断——那是这轮特意去掉的东西。
-        lanes = ("l1_cpu_unit", "l2_npu_unit", "l3_model_unit")
+        lanes = ("l1_cpu_unit", "l2_npu_unit", "l3_npu_model")
         if "select" in jobs and set(lanes) <= set(jobs):
             for lane in lanes:
                 deps = jobs[lane].get("needs") or []
@@ -224,14 +213,13 @@ def check_contract() -> list[str]:
                 # 矩阵 = 一张卡片变多个 job，图上一条泳道会炸成一堆盒子。
                 if "strategy" in jobs[lane]:
                     bad.append(f"{rel}: {lane} 不能用 strategy/matrix（每条泳道只能有一个 job）")
-                uses = jobs[lane].get("uses")
-                if uses:
-                    inner = list(read_jobs(uses))
-                    if len(inner) != 1:
-                        bad.append(
-                            f"{rel}: {lane} 调用的 {uses} 有 {len(inner)} 个 job"
-                            "（可复用 workflow 会把它全部展开成图上盒子）"
-                        )
+                # `uses:` 的 job 在图上一律显示成 `调用方名 / 被调方名`，两段
+                # 合不成一段 —— 所以泳道必须内联。
+                if "uses" in jobs[lane]:
+                    bad.append(
+                        f"{rel}: {lane} 不能是可复用 workflow"
+                        "（图上会变成 `调用方 / 被调方` 两段名字）"
+                    )
 
         # 6. select 必须直连 gate：否则它失败时 gate 要多等三条已 skipped 的边。
         if "gate" in jobs and "select" in jobs:

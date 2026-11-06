@@ -23,14 +23,14 @@
 被下面这些 workflow 调用，`.github/workflows` 里的入口只负责声明输入：
 
 ```
-ci-pr.yml           PR 门禁   select -> {1. cpu-unit, 2. npu-unit, 3. model-unit} -> gate
-ci-full.yml         main 全量（当前只手动）
+ci-pr.yml          唯一入口  select -> {cpu-unit-tests, npu-unit-tests, npu-model-tests} -> gate
+                    mode=pr（PR 门禁） / mode=full（全量，不选测）
 ci-image.yml        构建基础镜像（**只手动 dispatch**）
-ci-tests-cpu.yml    cpu-unit（workflow_call + dispatch，一个 job，不分片）
-ci-tests-npu.yml    npu-unit（workflow_call + dispatch，一个 job）
-ci-tests-model.yml  model-unit（workflow_call + dispatch，一个 job，内部循环 profiles）
-model_map.json      模型 -> 启动脚本 / 权重 / 端到端画像（被上面几个读）
+model_map.json      模型 -> 启动脚本 / 权重 / 端到端画像（被上面两个读）
 ```
+
+三条泳道**内联**在 `ci-pr.yml` 里，不是可复用 workflow：`uses:` 的 job 一律
+显示成 `调用方名 / 被调方名`，图上的泳道名就只能是两段。
 
 yaml 里只留「输什么、调哪个脚本」，超过 10 行的 bash 一律下沉到这里。
 除语法高亮之外的好处是 **shellcheck / actionlint 能看**，而且改一行能在本机验。
