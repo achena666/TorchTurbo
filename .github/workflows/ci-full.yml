@@ -38,6 +38,11 @@ jobs:
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10
     outputs:
+      l0_run: ${{ steps.pick.outputs.l0_run }}
+      l1_run: ${{ steps.pick.outputs.l1_run }}
+      l2a_run: ${{ steps.pick.outputs.l2a_run }}
+      l2b_run: ${{ steps.pick.outputs.l2b_run }}
+      l1_files: ${{ steps.pick.outputs.l1_files }}
       test_files: ${{ steps.pick.outputs.test_files }}
       shard_list: ${{ steps.pick.outputs.shard_list }}
       e2e: ${{ steps.pick.outputs.e2e }}
@@ -107,7 +112,10 @@ jobs:
 
   l1:
     name: L1 CPU（${{ matrix.shard }}）
-    needs: select
+    needs: [select, l0]
+    if: |
+      always() && needs.select.result == 'success' && needs.l0.result == 'success' &&
+      needs.select.outputs.l1_run == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -117,14 +125,19 @@ jobs:
       mode: cpu
       use_container: false
       runner_label: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
-      test_files: ${{ needs.select.outputs.test_files }}
+      test_files: ${{ needs.select.outputs.l1_files }}
       shard: ${{ matrix.shard }}
       timeout_minutes: 40
 
   l2a:
     name: L2a NPU 特性
-    # 与 PR 门禁同一条链：CPU 绿了才开 NPU（needs 自带失败传播）。
-    needs: [select, l1]
+    # 与 PR 门禁同一条链：CPU 绿了才开 NPU。
+    needs: [select, l0, l1]
+    if: |
+      always() && needs.select.result == 'success' && needs.l0.result == 'success' &&
+      (needs.l1.result == 'success' ||
+       (needs.l1.result == 'skipped' && needs.select.outputs.l1_run == 'false')) &&
+      needs.select.outputs.l2a_run == 'true'
     uses: ./.github/workflows/ci-pytest.yml
     with:
       mode: npu
@@ -139,13 +152,16 @@ jobs:
 
   l2b:
     name: L2b E2E（${{ matrix.profile.model_type }}）
-    # 链尾。always() 的理由同 ci-gate-pr.yml：l2a 可能因为「本次无 NPU 特性
-    # 需求」而 skipped，不能被 needs 的隐式跳过带走。
-    needs: [select, l1, l2a]
+    # 链尾。always() 的理由同 ci-gate-pr.yml：L1/L2a 可能因为「本次不需要」
+    # 而 skipped，不能被 needs 的隐式跳过带走。
+    needs: [select, l0, l1, l2a]
     if: |
-      always() && needs.l1.result == 'success' &&
-      needs.l2a.result != 'failure' && needs.l2a.result != 'cancelled' &&
-      needs.select.outputs.e2e != '[]'
+      always() && needs.select.result == 'success' && needs.l0.result == 'success' &&
+      (needs.l1.result == 'success' ||
+       (needs.l1.result == 'skipped' && needs.select.outputs.l1_run == 'false')) &&
+      (needs.l2a.result == 'success' ||
+       (needs.l2a.result == 'skipped' && needs.select.outputs.l2a_run == 'false')) &&
+      needs.select.outputs.l2b_run == 'true'
     strategy:
       max-parallel: 1
       fail-fast: false
@@ -191,5 +207,8 @@ jobs:
           R_L1: ${{ needs.l1.result }}
           R_L2A: ${{ needs.l2a.result }}
           R_L2B: ${{ needs.l2b.result }}
+          L1_RUN: ${{ needs.select.outputs.l1_run }}
+          L2A_RUN: ${{ needs.select.outputs.l2a_run }}
+          L2B_RUN: ${{ needs.select.outputs.l2b_run }}
           SUMMARY: ${{ needs.select.outputs.summary }}
         run: python3 scripts/ci/gate.py judge --mode full

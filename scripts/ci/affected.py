@@ -172,7 +172,25 @@ class Index:
             leaf = name.rsplit(".", 1)[-1]
             counts[leaf] = counts.get(leaf, 0) + 1
         return counts
+    def dangling_tests(self, deleted: set[str]) -> set[str]:
+        """删掉的模块 -> 还在 import 它（或其子模块）的测试。
 
+        `self.src` 扫的是**删除之后**的树，所以删一个模块时 A 层从种子出发
+        什么都找不到。而删模块恰恰是最容易让一片测试在 import 期就崩的改动。
+        这里反向查：某个测试的种子是删除模块的前缀，就说明它 import 过。
+
+        `import torchturbo.registry.core` 在文件消失后会被 `_resolve` 削到
+        `torchturbo.registry`，所以按前缀匹配才找得回来。
+        """
+        if not deleted:
+            return set()
+        out: set[str] = set()
+        for test, seeds in self.tests.items():
+            for seed in seeds:
+                if any(d == seed or d.startswith(seed + ".") for d in deleted):
+                    out.add(test)
+                    break
+        return out
 
 # --------------------------------------------------------------------------
 # 画像映射
@@ -267,16 +285,10 @@ def pick_e2e(changed: list[str], models: dict[str, dict[str, str]]) -> list[dict
     return out
 
 
-def wants_npu(changed: list[str]) -> bool:
-    """起 NPU 的两个条件：碰了算子实现，或碰了镜像配方/依赖。"""
-    for p in changed:
-        if p.startswith("src/torchturbo/ops/"):
-            return True
-        if p.startswith("docker/npu/"):
-            return True
-        if p == "pyproject.toml":
-            return True
-    return False
+# 曾经有一个 `wants_npu(changed)` 在这里，按路径前缀猜「要不要起 NPU」。
+# 它和选中的文件是两套判断，会出现「ops 改了但选中的全是 CPU 文件却起了 NPU」，
+# 也会漏掉「改了别的目录但确实选中了 NPU 测试」。现在改成从 `targets` 分类结果
+# 反推（见 select() 里的 lanes），一份数据得出一个结论。
 
 
 # --------------------------------------------------------------------------
@@ -284,6 +296,27 @@ def wants_npu(changed: list[str]) -> bool:
 # --------------------------------------------------------------------------
 def _tokens(stem: str) -> set[str]:
     return {t for t in stem.replace("-", "_").split("_") if t and t != "test"}
+
+
+# 每个文件只读一次：select() 里会反复问「这个测试要不要卡」。
+_NPU_CACHE: dict[Path, bool] = {}
+
+
+def has_torch_npu(path: Path) -> bool:
+    """源码里出现过 `torch_npu` 就算 NPU 泳道的文件。
+
+    判定特征必须与 `tests/conftest.py` 完全一致 —— 两处都用同一个字符串，
+    否则「被选进 NPU 泳道的文件」和「被 pytest 打上 npu 标记的测试」会不一致。
+    不用维护第二份清单：清单一定会漂。
+    """
+    hit = _NPU_CACHE.get(path)
+    if hit is None:
+        try:
+            hit = "torch_npu" in path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            hit = False
+        _NPU_CACHE[path] = hit
+    return hit
 
 
 def mirror_test_dir(root: Path, rel: str) -> str | None:
@@ -390,7 +423,26 @@ def select(index: Index, changed: list[str], force_all: bool = False,
     if mode == "all":
         targets = sorted(index.test_files)
 
-    npu = wants_npu(changed) and not no_npu
+    # ---- D：被删掉的源码 --------------------------------------------------
+    # `changed_modules` 只收「删完之后仍然存在」的模块，所以删文件时 A/B 层
+    # 什么都选不到。这里把「还在 import 它」的测试补回来。
+    deleted_modules = {
+        Index._dotted(index.root / p, index.root / "src")
+        for p in src_changed
+        if not (index.root / p).exists()
+    }
+    dangling = index.dangling_tests(deleted_modules)
+    if dangling:
+        targets = sorted(set(targets) | dangling)
+
+    # ---- 按「要不要真卡」切成两条泳道 -------------------------------------
+    # 判断方式与 tests/conftest.py 一致（源码里出现 torch_npu）。
+    # 这样「要不要起 NPU」不再靠猜路径，而是看实际选中的文件 —— 一份数据
+    # 得出一个结论，不会出现「ops 改了但选中的全是 CPU 文件却起了 NPU」。
+    npu_targets = [t for t in targets if has_torch_npu(index.root / t)]
+    npu_set = set(npu_targets)
+    cpu_targets = [t for t in targets if t not in npu_set]
+
     models = load_model_map(index.root)
     e2e = pick_e2e(changed, models)
     if e2e_force and not e2e:
@@ -404,8 +456,51 @@ def select(index: Index, changed: list[str], force_all: bool = False,
                for name, row in models.items() if row["e2e"] != "-"]
 
     # 分片数：空跑/小改动不分片，全量按 30 个文件一片，上限 5 片。
-    files_for_shard = total_tests if mode == "all" else len(targets)
+    files_for_shard = len(cpu_targets)
     shards = 1 if files_for_shard <= 12 else min(5, math.ceil(files_for_shard / 30))
+
+    # ---- lanes：决策的唯一产出 --------------------------------------------
+    # 每个泳道都带 why，缺 why 的门禁判红 —— 「不知道为什么没跑」比「跑了但
+    # 失败」更危险，它会安静地变成常态。yaml 只读这里的 run，不做任何判断。
+    image_changed = any(p.startswith("docker/npu/") for p in changed)
+    l1_run = len(cpu_targets) > 0
+    l2a_run = not no_npu and (bool(npu_targets) or image_changed or mode == "all")
+    l2b_run = bool(e2e)
+
+    lanes = {
+        "l0": {
+            "run": True,
+            "why": "总是跑：只做静态检查，不执行仓库代码",
+        },
+        "l1": {
+            "run": l1_run,
+            "why": (f"选中 {len(cpu_targets)} 个 CPU 文件"
+                    if l1_run else "没有选中任何 CPU 测试"),
+            "files": cpu_targets,
+            "shards": shards,
+        },
+        "l2a": {
+            "run": l2a_run,
+            # files 为空 = 泳道内全跑：算子/镜像的影响是全仓的，
+            # 只跑「选中的那几个」等于没验到真正的暴露面。
+            "files": [],
+            "selected": len(npu_targets),
+            "why": (
+                "ci:skip-npu 标签" if no_npu else
+                f"命中 {len(npu_targets)} 个含 torch_npu 的文件（泳道内全跑）"
+                if npu_targets else
+                "镜像配方变更（泳道内全跑）" if image_changed else
+                "全量模式（泳道内全跑）" if mode == "all" else
+                "没有选中任何含 torch_npu 的文件"
+            ),
+        },
+        "l2b": {
+            "run": l2b_run,
+            "why": (f"{len(e2e)} 个画像：" + ",".join(e["model_type"] for e in e2e)
+                    if l2b_run else "没有匹配的端到端画像"),
+            "profiles": e2e,
+        },
+    }
 
     reasons = {
         p: {"A": len(a_tests) if p in src_changed else 0,
@@ -416,12 +511,17 @@ def select(index: Index, changed: list[str], force_all: bool = False,
     }
 
     return {
+        "schema": 1,
         "mode": mode,
         "valves": valves,
         "targets": targets,
         "shards": shards,
-        "npu": npu,
+        # npu 保留为「L2a 要不要跑」的同义词，避免调用方跟着改。
+        "npu": l2a_run,
+        "cpu_files": cpu_targets,
+        "npu_files": npu_targets,
         "e2e": e2e,
+        "lanes": lanes,
         "counts": {
             "files": len(changed),
             "tests": len(targets),
@@ -432,7 +532,8 @@ def select(index: Index, changed: list[str], force_all: bool = False,
         },
         "reasons": reasons,
         "layers": {"A": sorted(a_tests), "B": sorted(b_tests),
-                   "C": sorted(c_tests), "direct": sorted(direct)},
+                   "C": sorted(c_tests), "direct": sorted(direct),
+                   "dangling": sorted(dangling)},
     }
 
 
@@ -493,11 +594,22 @@ def self_test(root: Path) -> int:
 
     print("affected.py --self-test")
 
+    # ---- 泳道开关（yaml 只读这四个值） ------------------------------------
+    def lane_runs(r: dict) -> dict[str, bool]:
+        return {k: r["lanes"][k]["run"] for k in ("l0", "l1", "l2a", "l2b")}
+
+    r = select(index, ["docs/ci/README.md"])
+    check("文档 -> 只有 L0", lane_runs(r) == {"l0": True, "l1": False, "l2a": False, "l2b": False},
+          str(lane_runs(r)))
+
     r = select(index, ["src/torchturbo/ops/cross_entropy_loss.py"])
     check("ops 算子 -> 起 NPU", r["npu"])
     check("ops 算子 -> 选中用例非空", len(r["targets"]) > 0, str(r["counts"]))
     check("ops 算子 -> E2E 画像 = qwen3_5",
           [e["model_type"] for e in r["e2e"]] == [CHEAPEST_MODEL], str(r["e2e"]))
+    check("ops 算子 -> NPU 泳道内全跑（files 为空）", r["lanes"]["l2a"]["files"] == [])
+    check("ops 算子 -> L2a 确实被选中", r["lanes"]["l2a"]["selected"] > 0,
+          str(r["lanes"]["l2a"]["selected"]))
 
     r = select(index, ["src/torchturbo/engine/core.py"])
     check("engine -> 精准模式", r["mode"] == "precise", r["mode"])
@@ -507,14 +619,18 @@ def self_test(root: Path) -> int:
 
     r = select(index, ["src/torchturbo/models/qwen3_5/model.py"])
     check("族目录 -> 该族画像", [e["model_type"] for e in r["e2e"]] == ["qwen3_5"], str(r["e2e"]))
+    check("族目录 -> 不起 NPU 特性", not r["lanes"]["l2a"]["run"], str(lane_runs(r)))
+    check("族目录 -> 起 E2E", r["lanes"]["l2b"]["run"], str(lane_runs(r)))
 
     r = select(index, ["src/torchturbo/models/qwen3_5_moe/model.py"])
     check("MoE 族 -> 减层画像",
           [e["layers"] for e in r["e2e"]] == [6], str(r["e2e"]))
 
+    r = select(index, ["docker/npu/Dockerfile_aarch64"])
+    check("镜像配方 -> 起 NPU 特性（选不中测试也要跑）", r["lanes"]["l2a"]["run"], str(lane_runs(r)))
+
     r = select(index, ["scripts/ci/affected.py"])
     check("CI 自身改动 -> 全量 CPU", r["mode"] == "all", r["mode"])
-    check("CI 自身改动 -> 不起 NPU", not r["npu"])
     check("CI 自身改动 -> 不起 E2E", r["e2e"] == [], str(r["e2e"]))
 
     r = select(index, ["README.md"])
@@ -524,9 +640,17 @@ def self_test(root: Path) -> int:
     r = select(index, ["pyproject.toml"])
     check("pyproject -> 全量", r["mode"] == "all", r["mode"])
     check("pyproject -> 起 E2E", [e["model_type"] for e in r["e2e"]] == [CHEAPEST_MODEL], str(r["e2e"]))
+    check("pyproject -> 四条泳道全跑", all(lane_runs(r).values()), str(lane_runs(r)))
+    check("pyproject -> L1 只给 CPU 文件",
+          all(not has_torch_npu(index.root / f) for f in r["lanes"]["l1"]["files"]))
 
     r = select(index, [f"src/torchturbo/engine/f{i}.py" for i in range(400)])
     check("大 PR -> 全量（不是降级）", r["mode"] == "all", str(r["valves"]))
+
+    # ---- 删除文件：dangling import 兜底 ----------------------------------
+    # `Index.src` 扫的是删完之后的树，所以删除场景必须靠名字反查。
+    dangling = index.dangling_tests({"torchturbo.registry.registry"})
+    check("删模块 -> 找到 import 过它的测试", len(dangling) > 0, str(len(dangling)))
 
     a = audit(index)
     print(f"  info  精准定位 {a['precision']}%  含目录兜底 {a['precision_dir']}%  "
@@ -539,11 +663,20 @@ def self_test(root: Path) -> int:
 
 
 # --------------------------------------------------------------------------
-def changed_from_git(base_ref: str = "origin/main", diff_filter: str = "d") -> list[str]:
+def changed_from_git(base_ref: str = "origin/main", diff_filter: str = "ACDMT") -> list[str]:
     """算本次 PR 改了哪些文件。
 
     基线取 merge-base（PR 分叉点），不是 main 的最新提交：main 上别人合进来的
     改动不该算进这次 PR 的选测范围，否则 PR 会随着 main 前进越来越"全量"。
+
+    两个参数是刻意的：
+
+    * `--no-renames` 让改名同时给出「旧路径删除 + 新路径新增」两条。只报新路径
+      的话，「把代码移走」看起来等于没删任何东西，被移走的模块的 import 者就没人
+      管了。DeepSpeed 的 `ci/check_paths.py` 是同一个理由。
+    * `--diff-filter=ACDMT` **包含 D（删除）**。默认的 `d` 是小写 = **排除**
+      删除，那样「删掉一个模块」在选测里完全不可见 —— 而这恰恰最容易让一整片
+      测试在 import 期就崩。
 
     任何一步失败都返回空列表 —— 空列表会被 select() 当成「信息不足」直接全量
     （fail-open），比猜一个错的基线安全。
@@ -568,7 +701,8 @@ def changed_from_git(base_ref: str = "origin/main", diff_filter: str = "d") -> l
         return give_up(f"拿不到基线 {base_ref}")
 
     print(f"changed_files: base={base} ref={base_ref}", file=sys.stderr)
-    diff = git("diff", "--name-only", f"--diff-filter={diff_filter}", f"{base}...HEAD")
+    diff = git("diff", "--name-only", "--no-renames",
+               f"--diff-filter={diff_filter}", f"{base}...HEAD")
     if diff.returncode != 0:
         return give_up(f"git diff 失败：{diff.stderr.strip()[:200]}")
     return [line for line in diff.stdout.splitlines() if line.strip()]
@@ -637,17 +771,20 @@ def main(argv: list[str]) -> int:
 
     if args.shard:
         i, n = (int(x) for x in args.shard.split("/"))
-        files = index.test_files if result["mode"] == "all" else result["targets"]
+        # 分片只对 L1（CPU）有意义：NPU 泳道是泳道内全跑。
+        files = result["cpu_files"]
         # 轮转切分：按文件而不是按用例，保证每片之间用例数大致均衡。
-        result["targets"] = [f for f in files if files.index(f) % n == i]
+        result["targets"] = [f for k, f in enumerate(files) if k % n == i]
         result["shard"] = f"{i}/{n}"
 
     if args.explain:
         print(f"mode={result['mode']} files={result['counts']['files']} "
               f"files-hit={result['counts']['tests']}/{result['counts']['total']} "
               f"({result['counts']['pct']}%) cases~{result['counts']['cases']} "
-              f"shards={result['shards']} "
-              f"npu={result['npu']} e2e={[e['model_type'] for e in result['e2e']]}")
+              f"shards={result['shards']}")
+        for name, lane in result["lanes"].items():
+            flag = "RUN " if lane["run"] else "skip"
+            print(f"  {flag} {name:<4} {lane['why']}")
         if result["valves"]:
             print(f"阀门: {', '.join(result['valves'])}")
         for p in changed:
@@ -663,15 +800,23 @@ def main(argv: list[str]) -> int:
         print(payload)
 
     if args.github_output:
+        lanes = result["lanes"]
         with open(args.github_output, "a", encoding="utf-8") as fh:
             fh.write(f"mode={result['mode']}\n")
             fh.write(f"shards={result['shards']}\n")
             fh.write("shard_list=" + json.dumps(
                 [f"{i}/{result['shards']}" for i in range(result['shards'])]
             ) + "\n")
+            # 泳道开关：yaml 只读这四个值，不做任何判断。
+            for name in ("l0", "l1", "l2a", "l2b"):
+                fh.write(f"{name}_run={str(lanes[name]['run']).lower()}\n")
+            # 这个名字是为了区分「L1 真的拿到了文件」与「L1 拿到全量」。
+            # 因为 --github-output 一次只能写一行，用 JSON 数组传过去。
+            fh.write("l1_files=" + json.dumps(lanes["l1"]["files"], ensure_ascii=False) + "\n")
             fh.write(f"npu={str(result['npu']).lower()}\n")
             fh.write(f"targets={json.dumps(result['targets'], ensure_ascii=False)}\n")
             fh.write(f"e2e={json.dumps(result['e2e'], ensure_ascii=False)}\n")
+            # 保底：pytest.sh 在不给 TEST_FILES 时自己 glob 全量，这里保留原语义。
             fh.write(f"test_files={json.dumps(index.test_files, ensure_ascii=False)}\n")
             fh.write(f"summary={result['mode']} {result['counts']['files']}f "
                      f"{result['counts']['tests']}/{result['counts']['total']}f "

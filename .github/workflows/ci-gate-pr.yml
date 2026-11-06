@@ -43,6 +43,13 @@ jobs:
       mode: ${{ steps.pick.outputs.mode }}
       npu: ${{ steps.pick.outputs.npu }}
       e2e: ${{ steps.pick.outputs.e2e }}
+      # l*_run 是决策层唯一需要下游读的东西：yaml 只读这四个布尔值，
+      # 不自己拼路径规则。四个值都在 scripts/ci/affected.py 里算。
+      l0_run: ${{ steps.pick.outputs.l0_run }}
+      l1_run: ${{ steps.pick.outputs.l1_run }}
+      l2a_run: ${{ steps.pick.outputs.l2a_run }}
+      l2b_run: ${{ steps.pick.outputs.l2b_run }}
+      l1_files: ${{ steps.pick.outputs.l1_files }}
       test_files: ${{ steps.pick.outputs.test_files }}
       shard_list: ${{ steps.pick.outputs.shard_list }}
       ci_changed: ${{ steps.pick.outputs.ci_changed }}
@@ -120,7 +127,7 @@ jobs:
             echo '| 项 | 值 |'
             echo '|---|---|'
             echo "| mode | \`${{ steps.pick.outputs.mode }}\` |"
-            echo "| NPU | \`${{ steps.pick.outputs.npu }}\` |"
+            echo "| L0 / L1 / L2a / L2b | \`${{ steps.pick.outputs.l0_run }} / ${{ steps.pick.outputs.l1_run }} / ${{ steps.pick.outputs.l2a_run }} / ${{ steps.pick.outputs.l2b_run }}\` |"
             echo "| E2E | \`${{ steps.pick.outputs.e2e }}\` |"
             echo "| 分片 | \`${{ steps.pick.outputs.shard_list }}\` |"
             echo "| 镜像 | \`$REF\` |"
@@ -183,8 +190,13 @@ jobs:
   # ------------------------------------------------------------------ L1
   l1:
     name: L1 CPU（${{ matrix.shard }}）
-    needs: select
-    if: needs.select.result == 'success'
+    # 链头：L0 没过就不占托管机。L0 只要 10 s，串起来的代价很小。
+    needs: [select, l0]
+    # `l1_run` 为 false 时这个 job 本就不该存在（本次没选中 CPU 测试），
+    # 与「上游挂了」是两回事 —— 区分靠 select 的输出（详见 docs/ci/README.md）。
+    if: |
+      always() && needs.select.result == 'success' && needs.l0.result == 'success' &&
+      needs.select.outputs.l1_run == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -194,23 +206,25 @@ jobs:
       mode: cpu
       use_container: false
       runner_label: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
-      test_files: ${{ needs.select.outputs.test_files }}
+      # 用选中的 CPU 子集，不是全量 —— 这是选测真正生效的地方。
+      test_files: ${{ needs.select.outputs.l1_files }}
       shard: ${{ matrix.shard }}
       timeout_minutes: 40
 
   # ------------------------------------------------------------------ L2a
   l2a:
     name: L2a NPU 特性
-    # 串行门控：CPU 没过就不开 NPU。两个泳道其实不抢资源（L1 在托管机、
-    # L2a 在自建池），串起来的唯一目的是「前面红了就别再烧卡」。
-    # needs 自带失败传播：l1 挂了 l2a 自动 skipped，不用写 if。
-    needs: [select, l1]
-    # fork PR 不起 L2：secrets 不给 fork，而「把 secrets 递到 fork 的代码上」
-    # 等于把 RCE 送人（pull_request_target 就是这么出事的，已明确禁用）。
-    # 要求 maintainer 把 commit 推进本仓分支再跑，见 docs/ci/README.md。
+    needs: [select, l0, l1]
+    # 两件事分开写：
+    #   1) L1 要么跑成功，要么是「本次本来就没有 CPU 测试」（l1_run=false）——
+    #      后者不能拖累 NPU。`needs` 会把任何 skipped 传下去，所以得显式区分。
+    #   2) fork PR 不起 L2：secrets 不给 fork，而「把 secrets 递到 fork 的
+    #      代码上」等于把 RCE 送人（pull_request_target 就是这么出事的）。
     if: |
-      needs.select.result == 'success' && needs.l1.result == 'success' &&
-      needs.select.outputs.npu == 'true' &&
+      always() && needs.select.result == 'success' && needs.l0.result == 'success' &&
+      (needs.l1.result == 'success' ||
+       (needs.l1.result == 'skipped' && needs.select.outputs.l1_run == 'false')) &&
+      needs.select.outputs.l2a_run == 'true' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
     uses: ./.github/workflows/ci-pytest.yml
@@ -219,7 +233,7 @@ jobs:
       use_container: true
       image: ${{ needs.select.outputs.image }}
       runner_label: ${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}
-      # NPU 泳道跑全量：这些文件本来就少（十来份），选中的子集没意义。
+      # 泳道内全跑：算子/镜像的影响是全仓的，只跑选中的几个等于没验。
       test_files: '[]'
       timeout_minutes: 40
     secrets:
@@ -229,18 +243,17 @@ jobs:
   # ------------------------------------------------------------------ L2b
   l2b:
     name: L2b E2E（${{ matrix.profile.model_type }}）
-    # 链尾：CPU 红了不跑，NPU 特性红了也不跑（特性 2 卡 ~2 min，E2E 8 卡
-    # ~10 min，这一层门控省得最多）。
-    # 为什么用 always() 而不是靠 needs 的隐式跳过：l2a 在「npu=false」时是
-    # skipped，而 needs 里任何 skipped 都会把 l2b 一起带下去 —— 但 E2E 与
-    # 特性是两条互不依赖的判断（改 engine/ 会起 E2E 却不起特性）。所以这里
-    # 自己写条件：l2a 只要不是 failure/cancelled 就放行。
-    needs: [select, l1, l2a]
+    # 链尾。为什么用 always() 而不是靠 needs 的隐式跳过：L1/L2a 都可能因为
+    # 「本次不需要」而 skipped，而 needs 里任何 skipped 都会把下游一起带走。
+    # E2E 与它们只是顺序关系，不是「必须都跑过」。
+    needs: [select, l0, l1, l2a]
     if: |
-      always() && needs.select.result == 'success' &&
-      needs.l1.result == 'success' &&
-      needs.l2a.result != 'failure' && needs.l2a.result != 'cancelled' &&
-      needs.select.outputs.e2e != '[]' &&
+      always() && needs.select.result == 'success' && needs.l0.result == 'success' &&
+      (needs.l1.result == 'success' ||
+       (needs.l1.result == 'skipped' && needs.select.outputs.l1_run == 'false')) &&
+      (needs.l2a.result == 'success' ||
+       (needs.l2a.result == 'skipped' && needs.select.outputs.l2a_run == 'false')) &&
+      needs.select.outputs.l2b_run == 'true' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
     strategy:
@@ -294,8 +307,10 @@ jobs:
           R_L1: ${{ needs.l1.result }}
           R_L2A: ${{ needs.l2a.result }}
           R_L2B: ${{ needs.l2b.result }}
-          WANT_NPU: ${{ needs.select.outputs.npu }}
-          WANT_E2E: ${{ needs.select.outputs.e2e }}
+          L0_RUN: ${{ needs.select.outputs.l0_run }}
+          L1_RUN: ${{ needs.select.outputs.l1_run }}
+          L2A_RUN: ${{ needs.select.outputs.l2a_run }}
+          L2B_RUN: ${{ needs.select.outputs.l2b_run }}
           SKIP_REASON: ${{ needs.l2b.outputs.skip_reason }}
           STRICT: ${{ contains(github.event.pull_request.labels.*.name, 'ci:e2e:strict') }}
           IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}

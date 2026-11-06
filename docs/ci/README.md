@@ -5,10 +5,11 @@
 
 ```
 pull_request ──► ci-gate-pr.yml
-                   ├─ select   算改动 → 选测试 / 判 NPU / 判画像
-                   ├─ L0       编译 + workflow 解析 + 映射表漂移 (+actionlint +hadolint)
-                   ├─ L1       CPU pytest（affected 选中的，或全量 ×N 片）
-                   ├─ L2a      NPU pytest（只要 torch_npu 的那批）
+                   ├─ select   算改动 → 出计划（四个泳道开关 + 文件清单）
+                   ├─ L0       编译 / workflow 解析 / 映射表 / 决策层契约 / 选择器防篡改
+                   │           (+actionlint +hadolint)
+                   ├─ L1       CPU pytest（affected 选中的文件 ×N 片）
+                   ├─ L2a      NPU pytest（一旦开跑就泳道内全跑）
                    ├─ L2b      E2E：一个族内小模型跑一步
                    └─ gate     唯一 required check
 
@@ -68,21 +69,76 @@ PR ──────────────► ci-gate-pr.yml（select -> L0 -
 拆成两个文件就得把人肉维护一份重复的输入声明，而且两份会慢慢漂。
 合成一个后，dispatch 的默认值只影响手动跑，调用方永远显式传值。
 
+## 决策层：一个计划，四个开关
+
+分支判断**只允许存在一处**，在 `scripts/ci/affected.py` 里。它输出一份计划：
+
+```
+l0_run=true   l1_run=true   l2a_run=true   l2b_run=false
+l1_files=["tests/ops/cpu/test_x.py", ...]     shard_list=["0/5","1/5",...]
+```
+
+yaml 里**只读布尔值，不做任何判断**。没有 `if: contains(github.event.pull_request.labels...)`，
+没有 `if: github.event_name == 'push'`，也没有 `if: needs.x.outputs.y != '[]'`。
+
+向下游传「跑不跑」，不传「为什么跑」：一旦 yaml 也要理解路径语义，就出现了
+第二份判断逻辑，两份必然漂，而且漂了不会报错——只会少跑。
+
+四个泳道用同一张模板，只换最后一行：
+
+```yaml
+if: |
+  always() && needs.select.result == 'success' && needs.l0.result == 'success' &&
+  (needs.l1.result == 'success' ||
+   (needs.l1.result == 'skipped' && needs.select.outputs.l1_run == 'false')) &&
+  needs.select.outputs.l2a_run == 'true'
+```
+
+`always()` 是为了**不让 `needs` 的隐式跳过替我们决策**。`needs` 会把任何
+`skipped` 往下游传染，而我们恰恰需要「上游 skipped 但它是故意的」这种情况继续跑
+（改 `models/qwen3_5/` 时 L2a 不跑，但 L2b 要跑）。所以串行链的条件全部显式写死：
+
+- `needs.l1.result == 'success'` —— 真的跑了并且绿了
+- `needs.l1.result == 'skipped' && l1_run == 'false'` —— 没跑，但计划里本来就不跑
+- 剩下两种（红、或该跑却没跑）→ 门禁判红
+
+`gate.py` 拿同样的开关做判定：该跑却 `skipped` 是 `skipped-unknown`（红），
+不该跑而 `skipped` 是 ⏭（绿）。两边用**同一组变量名**，否则摘要会给出
+和实际执行相反的解释。
+
+### 决策层契约由 L0 看守
+
+`check_static.py` 的 `contract` 项会**真的跑一次** `affected.py`，断言那五个
+输出真的被写出来，再逐个 workflow 校验 `needs.select.outputs.X` 都已声明。
+
+这类 bug 的特点就是「能跑、能绿」：拼错一个输出名 → GitHub 给空字符串 →
+`== 'true'` 永假 → job 静默不跑 → gate 把它当成「不需要」。实测中它让选测
+失效了好几天才被发现。
+
+`selector` 项守另一头：`scripts/ci/**` 的改动必须触发全量。否则一个 PR
+可以把自己的选择器改成「永远选 0 个测试」并且全绿——那就是自己给自己发通行证。
+
 ## 三条泳道怎么被选中
+
+表中 ✅ = 该泳道会跑；「—」= `*_run=false`，job 直接 skipped（带原因）。
+L2a 一旦开跑就是**泳道内全跑**（17 个含 `torch_npu` 的文件），不再往下筛。
 
 | 改动 | L0 | L1 CPU | L2a NPU | L2b E2E |
 |---|:--:|:--:|---|:--:|
-| `src/torchturbo/ops/**` | ✅ | ✅ | **✅** | 最便宜画像 |
-| `src/torchturbo/models/<族>/**` | ✅ | ✅ | — | 该族画像 |
-| `src/torchturbo/{engine,models/modules,parallel}/**` | ✅ | ✅ | — | 最便宜画像 |
-| `src/torchturbo/adapters/**` | ✅ | ✅ | — | lf/swift 对应画像 |
-| `src/torchturbo/runtime/**` | ✅ | ✅ | — | — |
-| `docker/npu/**` | ✅ | ✅ | **✅** | 最便宜画像 |
-| `pyproject.toml` | ✅ | **全量** | **✅** | 最便宜画像 |
+| `src/torchturbo/ops/**` | ✅ | 选中的 CPU 文件 | **✅ 全跑** | 最便宜画像 |
+| `src/torchturbo/models/<族>/**` | ✅ | 选中的 CPU 文件 | — | 该族画像 |
+| `src/torchturbo/{engine,models/modules,parallel}/**` | ✅ | 选中的 CPU 文件 | — | 最便宜画像 |
+| `src/torchturbo/adapters/**` | ✅ | 选中的 CPU 文件 | — | lf/swift 对应画像 |
+| `src/torchturbo/runtime/**` | ✅ | 选中的 CPU 文件 | — | — |
+| `docker/npu/**` | ✅ | 选中的 CPU 文件 | **✅ 全跑** | 最便宜画像 |
+| `pyproject.toml` | ✅ | **全量** | **✅ 全跑** | 最便宜画像 |
 | `.github/**`、`scripts/ci/**` | ✅ | **全量** | — | — |
 | `scripts/runs/<dir>/**` | ✅ | `tests/scripts` | — | 该 `run_dir` 的模型 |
 | `tests/**` | ✅ | affected | — | — |
 | `docs/**`、`*.md` | ✅ | — | — | — |
+
+L1 只跑选中的文件，所以「一个改文档的 PR」连 CPU 泳道都不开——L0 那 8 s
+就是它的全部成本。
 
 两张表对应两个脚本：路径 → 用例是 `scripts/ci/affected.py`，路径 → 画像在
 `affected.py` 的 `pick_e2e()` 里，画像本身写在 `model_map.tsv` 第 6 列。
@@ -227,19 +283,32 @@ timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
 ## 本地怎么验
 
 ```bash
-python3 scripts/ci/check_static.py            # L0 三项
-python3 scripts/ci/affected.py --self-test    # 选测算法没退化
+python3 scripts/ci/check_static.py            # L0 五项（含跑一次选择器验契约）
+python3 scripts/ci/affected.py --self-test    # 选测算法没退化（24 条断言）
 python3 scripts/ci/affected.py --audit        # 覆盖体检
 bash scripts/ci/pytest.sh                     # 真在本机跑一遍（MODE=cpu）
 python3 scripts/ci/gate.py judge --mode pr    # 用手写的 env 验判定
 python3 scripts/ci/image.py tag --dry-run     # 看当前内容的镜像 tag
 
-# 某个改动会被怎么选
+# 某个改动会被怎么选（含四个泳道开关）
 python3 scripts/ci/affected.py --changed-file src/torchturbo/engine/core.py --explain
 
 # 装完依赖 torch 有没有被 pip 换掉
 python3 scripts/ci/env.py capture --file /tmp/t.json
 python3 scripts/ci/env.py check   --file /tmp/t.json
+```
+
+验泳道判定最快的方法（不跑 CI，只看 gate 怎么说）：
+
+```bash
+run() { env R_SEL=success R_L0=$1 R_L1=$2 R_L2A=$3 R_L2B=$4 \
+  L1_RUN=$5 L2A_RUN=$6 L2B_RUN=$7 STRICT=false SUMMARY=t \
+  python3 scripts/ci/gate.py judge --mode pr; }
+
+run success skipped skipped skipped false false false   # 改文档：只有 L0
+run success success success skipped true  false true    # 改模型：L0+L1+L2b
+run success success skipped success true  true  true    # 改 ops：L0+L2a+L2b
+run success success success success true  true  true    # 全绿
 ```
 
 ## 一个刻意的取舍

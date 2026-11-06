@@ -123,11 +123,19 @@ class Report:
 def judge_pr() -> int:
     rep = Report()
     results = {k: _env(f"R_{k}") for k in ("SEL", "L0", "L1", "L2A", "L2B")}
+    # 决策层给的四个开关：「这个泳道本次该不该跑」。
+    # 拿不到（旧调用方式 / 手敲测试）时按 true 处理，也就是宁可错判红。
+    want = {k: _env(f"{k}_RUN", "true") for k in ("L0", "L1", "L2A", "L2B")}
 
     rep.required("L0 静态", results["L0"])
-    rep.required("L1 CPU", results["L1"])
 
-    # 三条泳道现在是串行门控（L1 -> L2a -> L2b）。上游红了，下游一定 skipped，
+    # L1 在「本次没选中任何 CPU 测试」时本来就该 skipped，那不是故障。
+    if want["L1"] == "false" and results["L1"] == "skipped":
+        rep.rows.append(f"| L1 CPU | {SKIP} | 未选中 CPU 测试 |")
+    else:
+        rep.required("L1 CPU", results["L1"])
+
+    # 三条泳道是串行门控（L0 -> L1 -> L2a -> L2b）。上游红了，下游一定 skipped，
     # 那是「按设计没跑」，不是「不知道为什么没跑」—— 否则摘要会在真正的原因
     # （L1 红）旁边再挂一个 skipped-unknown，把人引到错的地方去。
     # 只影响措辞，不影响结论：上游本身红了这一轮仍然是失败。
@@ -149,13 +157,13 @@ def judge_pr() -> int:
     else:
         rep.optional(
             "L2a NPU", results["L2A"],
-            expect_skip=(_env("WANT_NPU") != "true") or cpu_bad,
+            expect_skip=(want["L2A"] != "true") or cpu_bad,
             why="上游未通过，按串行链跳过" if cpu_bad
-            else "路径不含 ops/镜像/依赖",
+            else "未选中含 torch_npu 的文件",
         )
         rep.optional(
             "L2b E2E", results["L2B"],
-            expect_skip=(_env("WANT_E2E") == "[]") or npu_bad,
+            expect_skip=(want["L2B"] != "true") or npu_bad,
             why="上游未通过，按串行链跳过" if npu_bad else "无匹配画像",
         )
 
@@ -184,10 +192,17 @@ def judge_pr() -> int:
 def judge_full() -> int:
     rep = Report()
     req = {k: _env(f"R_{k}") for k in ("SEL", "L0", "L1", "L2A")}
+    want = {k: _env(f"{k}_RUN", "true") for k in ("L1", "L2A", "L2B")}
 
     rep.required("select", req["SEL"])
     rep.required("L0 静态", req["L0"])
-    rep.required("L1 CPU", req["L1"])
+
+    # 全量模式下三条泳道都应该跑（force-all）；但保留 lane 判断，
+    # 万一将来全量也做了裁剪，这里不用再改。
+    if want["L1"] == "false" and req["L1"] == "skipped":
+        rep.rows.append(f"| L1 CPU | {SKIP} | 未选中 CPU 测试 |")
+    else:
+        rep.required("L1 CPU", req["L1"])
 
     # 串行门控后，上游红了下游一定是 skipped。这里不重复记一笔「未执行」，
     # 只把真正的红标出来，免得摘要里同一件事说两遍。
