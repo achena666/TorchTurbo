@@ -208,7 +208,7 @@ jobs:
       fail-fast: false
       matrix:
         shard: ${{ fromJSON(needs.select.outputs.shard_list) }}
-    uses: ./.github/workflows/ci-pytest.yml
+    uses: ./.github/workflows/ci-tests.yml
     with:
       kind: cpu-unit
       runner_label: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
@@ -230,7 +230,7 @@ jobs:
       needs.select.outputs.npu_unit_run == 'true' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
-    uses: ./.github/workflows/ci-pytest.yml
+    uses: ./.github/workflows/ci-tests.yml
     with:
       kind: npu-unit
       image: ${{ needs.select.outputs.image }}
@@ -258,7 +258,7 @@ jobs:
       fail-fast: false
       matrix:
         profile: ${{ fromJSON(needs.select.outputs.e2e) }}
-    uses: ./.github/workflows/ci-pytest.yml
+    uses: ./.github/workflows/ci-tests.yml
     with:
       kind: npu-model
       runner_label: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}

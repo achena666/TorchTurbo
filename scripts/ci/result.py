@@ -36,6 +36,27 @@ DIAG_PREFIX = "[ttdiag]"
 KIND_TRAIN = "train"
 KIND_PYTEST = "pytest"
 
+# 映射表的字段顺序。train.sh 的 cmd_prepare 按这个顺序 set -- 分区，
+# 所以只能往后追加，不能插队。
+_MAP_FIELDS = ("run_dir", "lf", "swift", "hf_repo", "e2e")
+
+
+def _read_map(path: str) -> dict[str, dict[str, str]]:
+    """读 model_map.json -> {model_type: {run_dir, lf, swift, hf_repo, e2e}}。
+
+    缺字段按 "-" 补齐。读不了直接抛：调用方（map-row / map-keys /
+    migrate-map）要么据此报错退出，要么把异常渲染成摘要，都不应该
+    静默降成空表 —— 空表看起来就像「这个模型不存在」。
+    """
+    doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    models = doc.get("models") if isinstance(doc, dict) else None
+    if not isinstance(models, dict):
+        raise ValueError(f"{path} 缺顶层 models 对象")
+    return {
+        name: {k: str(row.get(k, "-") or "-") for k in _MAP_FIELDS}
+        for name, row in models.items() if isinstance(row, dict)
+    }
+
 
 def _load(path: Path) -> dict:
     if not path.is_file():
@@ -317,7 +338,8 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "command",
-        choices=["init", "set", "phase", "report", "notice", "migrate-map", "junit"],
+        choices=["init", "set", "phase", "report", "notice", "migrate-map",
+                 "junit", "map-row", "map-keys"],
     )
     parser.add_argument("--file", default="", help="事实文件；除 junit 外都必填")
     parser.add_argument("--model-type", default="")
@@ -329,7 +351,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--traceback", default="/tmp/tt_traceback.log")
     parser.add_argument("--versions", default="/tmp/after.txt")
     parser.add_argument("--junit", default="/tmp/pytest.xml")
-    parser.add_argument("--map", default=".github/workflows/model_map.tsv")
+    parser.add_argument("--map", default=".github/workflows/model_map.json")
     parser.add_argument("values", nargs="*")
     # Python 3.10 / 3.11 的 argparse 不允许「选项之后跟位置参数」：
     # `init --file X k=v` 会把 k=v 判成 unrecognized arguments（3.12 起才放宽）。
@@ -357,6 +379,33 @@ def main(argv: list[str]) -> int:
         )
         for name in stats["failed_cases"][:20]:
             print(f"  failed: {name}")
+        return 0
+
+    # ---- 映射表查询 -------------------------------------------------------
+    # train.sh 以前用 awk 取第 2/3/4/5 列。改成 JSON 之后用 awk 就得现写
+    # 一个 JSON 解析器，所以挪到这里：shell 只负责把值读进变量。
+    # 这两个不需要 --file（它们不碰事实文件），所以放在必填校验之前。
+    if args.command == "map-row":
+        if not args.model_type:
+            parser.error("map-row 需要 --model-type")
+        try:
+            row = _read_map(args.map).get(args.model_type)
+        except (OSError, ValueError) as exc:
+            print(f"::error::读不了映射表 {args.map}: {exc}", file=sys.stderr)
+            return 2
+        if row is None:
+            return 1
+        print(" ".join(row[k] for k in _MAP_FIELDS))
+        return 0
+
+    if args.command == "map-keys":
+        try:
+            models = _read_map(args.map)
+        except (OSError, ValueError) as exc:
+            print(f"::error::读不了映射表 {args.map}: {exc}", file=sys.stderr)
+            return 2
+        for name in models:
+            print(name)
         return 0
 
     if not args.file:
@@ -389,13 +438,12 @@ def main(argv: list[str]) -> int:
         # keeps the workflow from shelling out to grep/sed.
         doc = _load(path)
         try:
-            rows = [
-                line.rstrip()
-                for line in Path(args.map).read_text(encoding="utf-8").splitlines()
-                if line.strip() and not line.lstrip().startswith("#")
-            ]
-            doc["model_map"] = "\n".join(rows)
-        except Exception as exc:
+            models = _read_map(args.map)
+            doc["model_map"] = "\n".join(
+                f"{name:<22} " + " ".join(str(row[k]) for k in _MAP_FIELDS)
+                for name, row in models.items()
+            )
+        except Exception as exc:                       # noqa: BLE001
             doc["model_map"] = f"(map unreadable: {exc})"
         _save(path, doc)
         return 0

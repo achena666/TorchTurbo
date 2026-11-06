@@ -6,7 +6,7 @@
 
 1. 语法编译      —— src / scripts / tests 全部 py_compile
 2. workflow 解析 —— .github/workflows/*.yml 能被 YAML 解析，且有 on / jobs
-3. 映射表漂移    —— 代码里 @register_model 的名字必须都在 model_map.tsv 里
+3. 映射表漂移    —— 代码里 @register_model 的名字必须都在 model_map.json 里
 4. 决策层契约    —— workflow 读的 `needs.select.outputs.X` 必须真的被声明。
    这一条踩过：`affected.py` 算了 `targets` 却没人读，`select` 输出的是
    全部 144 个文件，选测静默失效了好几天。现在只要有一边拼错就红。
@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-MAP = ROOT / ".github" / "workflows" / "model_map.tsv"
+MAP = ROOT / ".github" / "workflows" / "model_map.json"
 PKG = "torchturbo"
 
 
@@ -52,8 +52,14 @@ def check_workflows() -> list[str]:
         yaml = None
 
     bad: list[str] = []
-    for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+    paths = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+    for path in paths:
         rel = path.relative_to(ROOT)
+        # 命名规范：一律 `ci-<scope>.yml`，小写 kebab。
+        # 不统一的时候，`npu-model-tests.yml` 和 `ci-tests.yml` 这种混搭
+        # 会让人以为前者是独立入口 —— 它其实只是被调用的实现体。
+        if not re.fullmatch(r"ci-[a-z0-9]+(-[a-z0-9]+)*\.yml", path.name):
+            bad.append(f"{rel}: 文件名不符合 ci-<scope>.yml（小写 kebab）")
         if yaml is not None:
             try:
                 doc = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -72,7 +78,7 @@ def check_workflows() -> list[str]:
             text = path.read_text(encoding="utf-8")
             if "jobs:" not in text:
                 bad.append(f"{rel}: 缺 jobs")
-    print(f"workflows: {len(list((ROOT / '.github' / 'workflows').glob('*.yml')))} 个文件，{len(bad)} 个有问题")
+    print(f"workflows: {len(paths)} 个文件，{len(bad)} 个有问题")
     return bad
 
 
@@ -82,12 +88,32 @@ def check_model_map() -> list[str]:
         src = path.read_text(encoding="utf-8")
         registered.update(re.findall(r'@register_model\(\s*["\']([^"\']+)["\']', src))
 
+    bad: list[str] = []
     mapped: set[str] = set()
     if MAP.exists():
-        for line in MAP.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                mapped.add(line.split()[0])
+        try:
+            doc = json.loads(MAP.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            # JSON 坏了比漏收录更麻烦：整个映射表都读不出来，而下游
+            # load_model_map() 会静默降成空表，选测看起来「正常」但不起 E2E。
+            return [f"model_map.json 解析失败: {exc}"]
+        models = doc.get("models") if isinstance(doc, dict) else None
+        if not isinstance(models, dict):
+            return ["model_map.json 缺顶层 models 对象"]
+        mapped = set(models)
+        fields = ("run_dir", "lf", "swift", "hf_repo", "e2e")
+        for name, row in models.items():
+            if not isinstance(row, dict):
+                bad.append(f"model_map.json: {name} 不是对象")
+                continue
+            missing = [k for k in fields if k not in row]
+            if missing:
+                bad.append(f"model_map.json: {name} 缺字段 {missing}")
+            spec = str(row.get("e2e", "-"))
+            if spec != "-" and spec != "full" and not re.fullmatch(r"trim:\d+", spec):
+                bad.append(f"model_map.json: {name} 的 e2e='{spec}' 不合法")
+    else:
+        return [f"找不到映射表 {MAP.relative_to(ROOT)}"]
 
     missing = sorted(registered - mapped)
     unknown = sorted(mapped - registered)
@@ -95,7 +121,9 @@ def check_model_map() -> list[str]:
     if unknown:
         # 只警告：先删代码后删表是正常顺序。
         print("::warning::映射表里有未注册的名字: " + ", ".join(unknown))
-    return [f"model_map 未收录: {', '.join(missing)}"] if missing else []
+    if missing:
+        bad.append(f"model_map 未收录: {', '.join(missing)}")
+    return bad
 
 
 def check_contract() -> list[str]:

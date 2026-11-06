@@ -4,7 +4,15 @@
 但**跳过必须带原因**，否则门禁判红。
 
 ```
-pull_request ──► ci-gate-pr.yml
+.github/workflows/
+  ci-pr.yml           PR 门禁（唯一 required check：gate）
+  ci-full.yml         main 全量（调试期只手动）
+  ci-image.yml        构建基础镜像（只手动）
+  ci-tests.yml        三条测试泳道的唯一入口（kind 选择）
+  ci-tests-model.yml  npu-model 的实现体（被 ci-tests.yml 调用，无 dispatch）
+  model_map.json      模型 -> 启动脚本 / 权重 / 端到端画像
+
+pull_request ──► ci-pr.yml
                    ├─ select   静态检查（编译 / workflow / 映射表 / 契约 / 选择器防篡改
                    │           + actionlint + hadolint）
                    │           然后算改动 → 出计划（泳道开关 + 文件清单）
@@ -14,11 +22,18 @@ pull_request ──► ci-gate-pr.yml
                    ├─ npu-model-tests  E2E：一个族内小模型跑一步
                    └─ gate     唯一 required check
 
-手动 ─────────────► ci-full.yml    全量（不选测；调试期唯一入口）
-                    ci-image.yml   构建基础镜像
-                    ci-pytest.yml  三条测试泳道的唯一入口（kind 选择）
-                                       内部转发到 npu-model-tests.yml
+手动 ─────────────► ci-full.yml / ci-image.yml / ci-tests.yml
 ```
+
+### 文件名规范
+
+一律 `ci-<scope>.yml`，小写 kebab。`check_static.py` 的 `workflows` 项会校验，
+不合规当场报错。
+
+为什么值得管：早先叫 `ci-gate-pr.yml` / `ci-pytest.yml` / `npu-model-tests.yml`，
+前缀一会儿有一会儿没有，`npu-model-tests.yml` 看起来像独立入口 —— 它其实只是
+被调用的实现体。统一前缀之后，一组文件在目录里能连成一片，「哪几个是入口」
+一眼就能分出来。
 
 ## 拓扑：静态检查 + 计划算好，然后三条泳道并行
 
@@ -95,14 +110,14 @@ job 输出，`gate.py` 用它决定摘要该写「静态检查未通过」还是
 写在哪里、怎么恢复都留在原处。恢复后应该是：
 
 ```
-PR ──────────────► ci-gate-pr.yml（select[静态+计划] -> {三条测试泳道} -> gate）
+PR ──────────────► ci-pr.yml（select[静态+计划] -> {三条测试泳道} -> gate）
 每晚 ─────────────► ci-full.yml（全量，不选测）
 每晚 ─────────────► ci-image.yml（基础镜像，内容没变就跳过）
-手动 ─────────────► ci-pytest.yml（kind 选一条泳道）
+手动 ─────────────► ci-tests.yml（kind 选一条泳道）
 ```
 
 
-`ci-pytest.yml` 同时是 `workflow_call`（给门禁调用）与 `workflow_dispatch`
+`ci-tests.yml` 同时是 `workflow_call`（给门禁调用）与 `workflow_dispatch`
 （给自己排查用）：**手动入口全仓只有一个**。合成一个文件而不是维护两个入口，
 是因为**两边的默认值刚好相反**：
 
@@ -115,14 +130,14 @@ PR ──────────────► ci-gate-pr.yml（select[静态+
 拆成两个文件就得人肉维护一份重复的输入声明，而且两份会慢慢漂。
 合成一个后，dispatch 的默认值只影响手动跑，调用方永远显式传值。
 
-### 为什么 `npu-model-tests.yml` 又是单独一个文件
+### 为什么 `ci-tests-model.yml` 又是单独一个文件
 
 因为它**不是同一个问题**：单位测试的差别只在「在哪跑、跑哪些」，而模型测试
 要取权重、减层、按卡数收敛 sp/ep、看门狗、超时收尾 —— 实现体比两条 unit 泳道
-加起来还长。塞进 `ci-pytest.yml` 只会让「哪条泳道」和「训练怎么跑」这两件事
+加起来还长。塞进 `ci-tests.yml` 只会让「哪条泳道」和「训练怎么跑」这两件事
 互相牵制。
 
-所以分界线是：**`ci-pytest.yml` 负责「选哪条泳道」，`npu-model-tests.yml`
+所以分界线是：**`ci-tests.yml` 负责「选哪条泳道」，`ci-tests-model.yml`
 负责「模型测试怎么跑」**。前者用一个 `kind` 输入 + 一个 `uses:` 转发，
 后者的输入原样透传；后者**没有** `workflow_dispatch`，避免默认值再次分叉。
 
@@ -196,7 +211,7 @@ cpu-unit 只跑选中的文件，所以「一个改文档的 PR」连 CPU 泳道
 就是它的全部成本。
 
 两张表对应两个脚本：路径 → 用例是 `scripts/ci/affected.py`，路径 → 画像在
-`affected.py` 的 `pick_e2e()` 里，画像本身写在 `model_map.tsv` 第 6 列。
+`affected.py` 的 `pick_e2e()` 里，画像本身写在 `model_map.json` 的 `e2e` 字段。
 
 改 CI 自身为什么跑全量 CPU：这些脚本就是「怎么跑测试」本身，改错了会**静默少跑**，
 只有全量能看出来。但它们不烧 NPU。
@@ -255,10 +270,10 @@ fork PR 拿不到 secrets，而两条 NPU 泳道都需要 SWR 凭据。更关键
 ```bash
 git fetch origin pull/123/head:ci/pr-123
 git push origin ci/pr-123
-gh workflow run ci-gate-pr.yml -F ref=ci/pr-123
+gh workflow run ci-pr.yml -F ref=ci/pr-123
 ```
 
-或者直接手动跑 `ci-pytest.yml`（用 `kind` 选泳道）。
+或者直接手动跑 `ci-tests.yml`（用 `kind` 选泳道）。
 
 ## 时间预算
 
@@ -280,8 +295,8 @@ gh workflow run ci-gate-pr.yml -F ref=ci/pr-123
 
 ## NPU 池串行：不要用 job 级 `concurrency`
 
-第一版在 `ci-pytest.yml` 里按 runner 标签分过组
-（`ci-pytest-<label>`，`cancel-in-progress: false`），想的是"让手动跑和 PR 排同一个队"。
+第一版在 `ci-tests.yml` 里按 runner 标签分过组
+（`ci-tests-<label>`，`cancel-in-progress: false`），想的是"让手动跑和 PR 排同一个队"。
 实测**这个做法会吃掉分片**：
 
 > 同一个 concurrency group 里，GitHub 只保留**一个** pending 的 job；
@@ -320,7 +335,7 @@ timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
 `fromJSON` 对 number 和字符串两种输入都成立（number 输入在 `workflow_call` 下
 仍然走这条路，实测同样正常），所以两条触发链可以用同一份表达式。
 
-这个 bug 让 `ci-pytest.yml` 的**手动入口**完全不可用 —— 提交
+这个 bug 让 `ci-tests.yml` 的**手动入口**完全不可用 —— 提交
 `f2acd5d` 之后的三次 dispatch 全是这个原因。定位过程：二分探针（`applied` 过的
 `zz-probe*.yml` 已删除），`p`/`q` 两个不带 `timeout-minutes` 的 job 正常创建，
 而带表达式的 `r` 直接消失。
@@ -370,7 +385,7 @@ run failure select  skipped skipped skipped true  true  true   # 计划没算出
 
 ## 一个刻意的取舍
 
-`ci-pytest.yml` 的**裸机**泳道不用 `pip install -e ".[dev]"`，而是先装
+`ci-tests.yml` 的**裸机**泳道不用 `pip install -e ".[dev]"`，而是先装
 「可用版本」的 torch，再 `--no-deps` 装本包。
 
 原因：`pyproject` 钉的是 `torch>=2.10.0`（NPU 镜像里那套），GH 托管机只能从 PyPI 拿

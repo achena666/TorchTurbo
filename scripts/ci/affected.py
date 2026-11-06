@@ -197,27 +197,27 @@ class Index:
 # 画像映射
 # --------------------------------------------------------------------------
 def load_model_map(root: Path) -> dict[str, dict[str, str]]:
-    """model_map.tsv -> {model_type: {run_dir, lf, swift, hf_repo, e2e}}。
+    """model_map.json -> {model_type: {run_dir, lf, swift, hf_repo, e2e}}。
 
-    第 6 列 e2e 缺失时按 "-" 处理，这样旧表也能跑。
+    缺字段按 "-" 补齐，这样旧表也能跑。读不动就当空表 —— 调用方
+    （pick_e2e）会把空表当成「没有画像」，不会静默改变选测。
     """
-    path = root / ".github" / "workflows" / "model_map.tsv"
-    table: dict[str, dict[str, str]] = {}
+    path = root / ".github" / "workflows" / "model_map.json"
     if not path.exists():
-        return table
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        cols = line.split()
-        if len(cols) < 2:
-            continue
-        cols += ["-"] * (6 - len(cols))
-        table[cols[0]] = {
-            "run_dir": cols[1], "lf": cols[2], "swift": cols[3],
-            "hf_repo": cols[4], "e2e": cols[5],
-        }
-    return table
+        return {}
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"::warning::读不了 {path}: {exc}；按空表处理", file=sys.stderr)
+        return {}
+    raw = doc.get("models") if isinstance(doc, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    fields = ("run_dir", "lf", "swift", "hf_repo", "e2e")
+    return {
+        name: {k: str(row.get(k, "-") or "-") for k in fields}
+        for name, row in raw.items() if isinstance(row, dict)
+    }
 
 
 def pick_e2e(changed: list[str], models: dict[str, dict[str, str]]) -> list[dict]:

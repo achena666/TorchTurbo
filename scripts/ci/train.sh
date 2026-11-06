@@ -19,7 +19,7 @@ set -uo pipefail
 CI_SCRIPTS="${CI_SCRIPTS:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 RESULT_JSON="${RESULT_JSON:-/tmp/ci-result.json}"
 GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
-MAP="${MAP:-.github/workflows/model_map.tsv}"
+MAP="${MAP:-.github/workflows/model_map.json}"
 
 result() { python3 "$CI_SCRIPTS/result.py" "$@"; }
 
@@ -38,7 +38,7 @@ phase_run() {                       # phase_run <名字> <命令...>
 
 # ---------------------------------------------------------------- prepare
 # 先确认这个 model_type 真能跑，再去装依赖；否则白等几十分钟。
-# 列：1=model_type 2=run_dir 3=lf 脚本 4=swift 脚本 5=hf_repo 6=e2e
+# 字段：run_dir lf swift hf_repo e2e（顺序由 result.py 的 _MAP_FIELDS 决定）
 cmd_prepare() {
   result init --file "$RESULT_JSON" \
     kind=train model_type="$MODEL_TYPE" framework="$FRAMEWORK" \
@@ -47,22 +47,23 @@ cmd_prepare() {
 
   [ -f "$MAP" ] || { echo "::error::缺少 $MAP"; return 1; }
 
+  # 映射表是 JSON，用 awk 取字段就得现写一个 JSON 解析器 —— 所以让
+  # result.py 读，shell 只负责把值读进变量。字段顺序见 _MAP_FIELDS。
   local row
-  row=$(awk -v m="$MODEL_TYPE" '$1==m && $0 !~ /^\s*#/ {print; exit}' "$MAP")
-  if [ -z "$row" ]; then
+  if ! row=$(result map-row --map "$MAP" --model-type "$MODEL_TYPE"); then
     echo "::error::model_type '$MODEL_TYPE' 不在 $MAP 里；可选项："
-    awk '$0 !~ /^\s*#/ && NF {printf "  %s\n", $1}' "$MAP"
+    result map-keys --map "$MAP" | sed 's/^/             /'
     return 1
   fi
   # shellcheck disable=SC2086
   set -- $row
-  local run_dir=$2 launchers
+  local run_dir=$1 launchers
   case "$FRAMEWORK" in
-    lf)    launchers=$3 ;;
-    swift) launchers=$4 ;;
+    lf)    launchers=$2 ;;
+    swift) launchers=$3 ;;
     *)     echo "::error::未知 framework '$FRAMEWORK'（只支持 lf / swift）"; return 1 ;;
   esac
-  local repo=${5:--}
+  local repo=${4:--}
   echo "model_type=$MODEL_TYPE framework=$FRAMEWORK run_dir=$run_dir launchers=$launchers repo=$repo"
 
   if [ "$run_dir" = "-" ] || [ ! -d "scripts/runs/$run_dir" ]; then
@@ -71,8 +72,8 @@ cmd_prepare() {
     return 1
   fi
   if [ "$launchers" = "-" ] || [ -z "$launchers" ]; then
-    echo "::error::$MODEL_TYPE 在 $FRAMEWORK 下没有启动脚本（第 3/4 列为 '-'）"
-    echo "            同一行：run_dir=$run_dir lf=[$3] swift=[$4]"
+    echo "::error::$MODEL_TYPE 在 $FRAMEWORK 下没有启动脚本（映射表里 ${FRAMEWORK} 字段为 '-'）"
+    echo "            同一行：run_dir=$run_dir lf=[$2] swift=[$3]"
     return 1
   fi
 

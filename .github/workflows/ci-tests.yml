@@ -1,4 +1,4 @@
-name: ci-pytest
+name: CI · 测试（三条泳道入口）
 
 # **所有测试的唯一入口**：三条泳道共用一份输入声明、一份结果解析、一个手动入口。
 #
@@ -10,12 +10,12 @@ name: ci-pytest
 #   · **两条 unit 泳道的差别只在「在哪跑」**，跑什么（分片 / marker / junit）
 #     完全一样。拆开就要么复制一份 step，要么再抽一层——前者必然漂，后者
 #     等于把这一层又写回来。
-#   · **手动入口只能有一个**。拆成 ci-pytest + ci-train 时，两套默认值互相
+#   · **手动入口只能有一个**。早先拆成「pytest」「train」两个文件时，两套默认值互相
 #     打架（手动跑被 45 min 截断 / PR 被 300 min 拖死），只能靠「dispatch 的
 #     默认值不影响调用方」这种口头约定，而约定不会报错。
 #
 # npu-model 的实现体很复杂（取权重 / 减层 / sp-ep 收敛 / 看门狗 / 收尾），
-# 所以它**不在本文件里**：这里只保留一个 `uses:` 转发到 npu-model-tests.yml。
+# 所以它**不在本文件里**：这里只保留一个 `uses:` 转发到 ci-tests-model.yml。
 # 本文件负责「选哪条泳道」，复杂度留在各自的实现里。
 #
 # kind 同时承担了原来的 `use_container`：cpu-unit 一定裸机、npu-unit 一定容器。
@@ -74,7 +74,7 @@ on:
 
       # ----------------------------------------------------------- model 专用
       model_type:
-        description: '@register_model 的名字，model_map.tsv 的键'
+        description: '@register_model 的名字，model_map.json 里 models 的键'
         required: false
         default: 'qwen3_5'
         type: string
@@ -89,7 +89,7 @@ on:
         default: ''
         type: string
       hf_repo_override:
-        description: '覆盖 model_map.tsv 第 5 列的 hf_repo'
+        description: '覆盖 model_map.json 里的 hf_repo 字段'
         required: false
         default: ''
         type: string
@@ -449,12 +449,12 @@ jobs:
             --model-type "pytest-${{ inputs.kind }}" || true
 
   # --------------------------------------------------------- npu-model-tests
-  # 只做转发。实现体（取权重 / 减层 / 看门狗 / 收尾）在 npu-model-tests.yml，
+  # 只做转发。实现体（取权重 / 减层 / 看门狗 / 收尾）在 ci-tests-model.yml，
   # 那里没有手动入口 —— 手动入口只在本文件，避免两套默认值再次分叉。
   npu_model_tests:
     name: npu-model-tests（${{ inputs.model_type }}/${{ inputs.framework }}）
     if: ${{ inputs.kind == 'npu-model' }}
-    uses: ./.github/workflows/npu-model-tests.yml
+    uses: ./.github/workflows/ci-tests-model.yml
     with:
       runner_label: ${{ inputs.runner_label }}
       image: ${{ inputs.image }}
