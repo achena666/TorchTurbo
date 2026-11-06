@@ -4,6 +4,9 @@ name: CI / PR
 # select does static checks + planning on one runner; the three lanes run in
 # parallel and depend only on select. A skipped lane must carry a reason,
 # otherwise gate fails -- that is what keeps lanes from being disabled silently.
+#
+# Job keys are numbered because the graph orders sibling jobs by key: that is
+# what pins cpu-unit -> npu-unit -> model-unit top to bottom.
 
 on:
   pull_request:
@@ -16,7 +19,7 @@ on:
         default: false
         type: boolean
 
-# A new push cancels the old run; E2E is the expensive part.
+# A new push cancels the old run; model-unit is the expensive part.
 concurrency:
   group: ci-pr-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -35,16 +38,12 @@ jobs:
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 20
     outputs:
-      mode: ${{ steps.pick.outputs.mode }}
-      npu: ${{ steps.pick.outputs.npu }}
       e2e: ${{ steps.pick.outputs.e2e }}
       stage: ${{ steps.stage.outputs.stage }}
       cpu_unit_run: ${{ steps.pick.outputs.cpu_unit_run }}
       npu_unit_run: ${{ steps.pick.outputs.npu_unit_run }}
       npu_model_run: ${{ steps.pick.outputs.npu_model_run }}
       cpu_unit_files: ${{ steps.pick.outputs.cpu_unit_files }}
-      test_files: ${{ steps.pick.outputs.test_files }}
-      shard_list: ${{ steps.pick.outputs.shard_list }}
       image: ${{ steps.image.outputs.image }}
       summary: ${{ steps.pick.outputs.summary }}
     steps:
@@ -131,7 +130,6 @@ jobs:
           | mode | \`${{ steps.pick.outputs.mode }}\` |
           | lanes | \`${{ steps.pick.outputs.cpu_unit_run }} / ${{ steps.pick.outputs.npu_unit_run }} / ${{ steps.pick.outputs.npu_model_run }}\` |
           | e2e | \`${{ steps.pick.outputs.e2e }}\` |
-          | shards | \`${{ steps.pick.outputs.shard_list }}\` |
           | image | \`$REF\` |
           | summary | \`${{ steps.pick.outputs.summary }}\` |
 
@@ -160,26 +158,22 @@ jobs:
             echo "stage=ok" >> "$GITHUB_OUTPUT"
           fi
 
-  cpu_unit_tests:
-    name: cpu-unit-tests (${{ matrix.shard }})
+  # One call, one job: each lane file declares exactly one job, and the CPU
+  # lane is not sharded. No matrix anywhere, so the graph stays one box per lane.
+  l1_cpu_unit:
+    name: '1. cpu-unit'
     needs: select
     if: |
       always() && needs.select.result == 'success' &&
       needs.select.outputs.cpu_unit_run == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: ${{ fromJSON(needs.select.outputs.shard_list) }}
-    uses: ./.github/workflows/ci-tests.yml
+    uses: ./.github/workflows/ci-tests-cpu.yml
     with:
-      kind: cpu-unit
       runner_label: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
       test_files: ${{ needs.select.outputs.cpu_unit_files }}
-      shard: ${{ matrix.shard }}
       timeout_minutes: 40
 
-  npu_unit_tests:
-    name: npu-unit-tests
+  l2_npu_unit:
+    name: '2. npu-unit'
     needs: select
     # Fork PRs get no secrets, and passing secrets to fork code is RCE.
     if: |
@@ -187,9 +181,8 @@ jobs:
       needs.select.outputs.npu_unit_run == 'true' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
-    uses: ./.github/workflows/ci-tests.yml
+    uses: ./.github/workflows/ci-tests-npu.yml
     with:
-      kind: npu-unit
       image: ${{ needs.select.outputs.image }}
       runner_label: ${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}
       test_files: '[]'
@@ -198,33 +191,25 @@ jobs:
       SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
       SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}
 
-  npu_model_tests:
-    name: npu-model-tests (${{ matrix.profile.model_type }})
+  l3_model_unit:
+    name: '3. model-unit'
     needs: select
     if: |
       always() && needs.select.result == 'success' &&
       needs.select.outputs.npu_model_run == 'true' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
-    strategy:
-      # Serial: the NPU pool shares HBM, so two at once is slower in wall time.
-      max-parallel: 1
-      fail-fast: false
-      matrix:
-        profile: ${{ fromJSON(needs.select.outputs.e2e) }}
-    uses: ./.github/workflows/ci-tests.yml
+    uses: ./.github/workflows/ci-tests-model.yml
     with:
-      kind: npu-model
       runner_label: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
       image: ${{ needs.select.outputs.image }}
-      model_type: ${{ matrix.profile.model_type }}
+      profiles: ${{ needs.select.outputs.e2e }}
       framework: lf
-      trim_layers: ${{ matrix.profile.layers }}
       train_seq_len: '1024'
       train_dataset: 'gsm8k'
       train_finetuning_type: 'full'
       timeout_minutes: 45
-      train_timeout_minutes: 10
+      train_timeout_minutes: 25
       fetch_timeout_seconds: 600
     secrets:
       SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
@@ -238,7 +223,7 @@ jobs:
   # reporting the result in seconds instead of minutes.
   gate:
     name: gate
-    needs: [select, cpu_unit_tests, npu_unit_tests, npu_model_tests]
+    needs: [select, l1_cpu_unit, l2_npu_unit, l3_model_unit]
     if: always()
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10
@@ -254,13 +239,13 @@ jobs:
         env:
           R_SEL: ${{ needs.select.result }}
           SEL_STAGE: ${{ needs.select.outputs.stage }}
-          R_CPU_UNIT: ${{ needs.cpu_unit_tests.result }}
-          R_NPU_UNIT: ${{ needs.npu_unit_tests.result }}
-          R_NPU_MODEL: ${{ needs.npu_model_tests.result }}
+          R_CPU_UNIT: ${{ needs.l1_cpu_unit.result }}
+          R_NPU_UNIT: ${{ needs.l2_npu_unit.result }}
+          R_NPU_MODEL: ${{ needs.l3_model_unit.result }}
           CPU_UNIT_RUN: ${{ needs.select.outputs.cpu_unit_run }}
           NPU_UNIT_RUN: ${{ needs.select.outputs.npu_unit_run }}
           NPU_MODEL_RUN: ${{ needs.select.outputs.npu_model_run }}
-          SKIP_REASON: ${{ needs.npu_model_tests.outputs.skip_reason }}
+          SKIP_REASON: ${{ needs.l3_model_unit.outputs.skip_reason }}
           STRICT: ${{ contains(github.event.pull_request.labels.*.name, 'ci:e2e:strict') }}
           IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
           SUMMARY: ${{ needs.select.outputs.summary }}

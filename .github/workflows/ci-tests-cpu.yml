@@ -1,0 +1,154 @@
+name: CI / cpu-unit
+
+# One job. This file is called directly by ci-pr.yml and ci-full.yml, and can
+# be dispatched on its own to debug a single test path.
+#
+# No reusable-workflow fan-out here on purpose: a call expands into every job
+# the callee declares, so a multiplexer file would put N boxes in the graph
+# per lane. One file, one job, one box.
+
+on:
+  workflow_call:
+    inputs:
+      runner_label:
+        description: 'Runner label'
+        required: true
+        type: string
+      test_files:
+        description: 'JSON array; empty = everything'
+        required: false
+        default: '[]'
+        type: string
+      test_path:
+        description: 'Single path / node id; overrides test_files'
+        required: false
+        default: ''
+        type: string
+      pytest_args:
+        description: 'Extra pytest args (split on spaces on purpose)'
+        required: false
+        default: '-v --durations=20'
+        type: string
+      transformers_spec:
+        description: 'Extra transformers constraint; empty = image default'
+        required: false
+        default: ''
+        type: string
+      timeout_minutes:
+        description: 'Job hard limit'
+        required: false
+        default: 40
+        type: number
+
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: 'Runner label'
+        required: true
+        default: 'ubuntu-22.04-arm'
+        type: choice
+        options:
+          - ubuntu-22.04-arm
+          - linux-aarch64-cpu-4
+          - linux-aarch64-cpu-24
+      test_path:
+        description: 'Dir / file / node id; "-" means every test'
+        required: false
+        default: '-'
+        type: string
+      pytest_args:
+        description: 'Extra pytest args'
+        required: false
+        default: '-v --durations=20'
+        type: string
+      transformers_spec:
+        description: 'Extra transformers constraint'
+        required: false
+        default: ''
+        type: string
+      timeout_minutes:
+        description: 'Job hard limit'
+        required: false
+        default: 60
+        type: number
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  CI_SCRIPTS: ${{ github.workspace }}/scripts/ci
+  RESULT_JSON: /tmp/ci-result.json
+
+jobs:
+  cpu_unit_tests:
+    name: run
+    runs-on: ${{ inputs.runner_label }}
+    # fromJSON is required: a number input arrives as a string and GitHub
+    # silently drops the whole job if timeout-minutes gets one.
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 40) }}
+    # No job-level concurrency: within a group only the last pending job is
+    # kept, which cancelled queued runs in an earlier attempt.
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: install
+        env:
+          TRANSFORMERS_SPEC: ${{ inputs.transformers_spec }}
+        run: |
+          set -uo pipefail
+          python3 "$CI_SCRIPTS/result.py" init --file "$RESULT_JSON" \
+            kind=pytest model_type='pytest-cpu-unit' \
+            mode=cpu runner_label='${{ inputs.runner_label }}'
+
+          START=$(date +%s)
+          # Install torch first: the extras below declare torch deps, and
+          # resolving them together pulls a full CUDA build.
+          python -m pip install torch 2>&1 | tee /tmp/turbo.log
+          RC=${PIPESTATUS[0]}
+          # Same extras as the container lane, otherwise the same test is green
+          # on one lane and red on the other.
+          if [ "$RC" -eq 0 ]; then
+            python -m pip install --no-build-isolation -e ".[test]" 2>&1 | tee -a /tmp/turbo.log
+            RC=${PIPESTATUS[0]}
+          fi
+          if [ "$RC" -eq 0 ] && [ -n "${TRANSFORMERS_SPEC}" ]; then
+            python -m pip install "${TRANSFORMERS_SPEC}" 2>&1 | tee -a /tmp/turbo.log
+            RC=${PIPESTATUS[0]}
+          fi
+          # Print the real version: transformers arrives transitively, so
+          # without this line drift only shows up as a batch of red tests.
+          python -c "import transformers; print('transformers =', transformers.__version__)" || true
+
+          python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
+            --name 'install' --seconds "$(( $(date +%s) - START ))" --rc "$RC"
+          exit "$RC"
+
+      - name: pytest
+        env:
+          MODE: cpu
+          TEST_FILES: ${{ inputs.test_files }}
+          TEST_PATH: ${{ inputs.test_path }}
+          PYTEST_ARGS: ${{ inputs.pytest_args }}
+        run: bash "$CI_SCRIPTS/pytest.sh"
+
+      - name: summary
+        if: always()
+        run: |
+          set -uo pipefail
+          python3 "$CI_SCRIPTS/result.py" report --file "$RESULT_JSON" \
+            --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
+          python3 "$CI_SCRIPTS/result.py" notice --file "$RESULT_JSON" \
+            --model-type 'pytest-cpu-unit' || true

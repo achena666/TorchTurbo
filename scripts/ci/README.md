@@ -23,12 +23,12 @@
 被下面这些 workflow 调用，`.github/workflows` 里的入口只负责声明输入：
 
 ```
-ci-pr.yml           PR 门禁   select -> {cpu-unit, npu-unit, npu-model} -> gate
+ci-pr.yml           PR 门禁   select -> {1. cpu-unit, 2. npu-unit, 3. model-unit} -> gate
 ci-full.yml         main 全量（当前只手动）
 ci-image.yml        构建基础镜像（**只手动 dispatch**）
-ci-tests.yml        三条测试泳道的唯一入口（workflow_call + dispatch）
-                    kind=cpu-unit / npu-unit / npu-model
-ci-tests-model.yml  npu-model 的实现体（workflow_call，无手动入口）
+ci-tests-cpu.yml    cpu-unit（workflow_call + dispatch，一个 job，不分片）
+ci-tests-npu.yml    npu-unit（workflow_call + dispatch，一个 job）
+ci-tests-model.yml  model-unit（workflow_call + dispatch，一个 job，内部循环 profiles）
 model_map.json      模型 -> 启动脚本 / 权重 / 端到端画像（被上面几个读）
 ```
 

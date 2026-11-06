@@ -8,8 +8,9 @@
   ci-pr.yml           PR 门禁（唯一 required check：gate）
   ci-full.yml         main 全量（调试期只手动）
   ci-image.yml        构建基础镜像（只手动）
-  ci-tests.yml        三条测试泳道的唯一入口（kind 选择）
-  ci-tests-model.yml  npu-model 的实现体（被 ci-tests.yml 调用，无 dispatch）
+  ci-tests-cpu.yml    cpu-unit：一个 job，不分片
+  ci-tests-npu.yml    npu-unit：一个 job
+  ci-tests-model.yml  model-unit：一个 job，内部按 profiles 循环
   model_map.json      模型 -> 启动脚本 / 权重 / 端到端画像
 
 pull_request ──► ci-pr.yml
@@ -17,13 +18,17 @@ pull_request ──► ci-pr.yml
                    │           + actionlint + hadolint）
                    │           然后算改动 → 出计划（泳道开关 + 文件清单）
                    │           两者**同一个 job、同一个 runner**
-                   ├─ cpu-unit-tests   CPU pytest（affected 选中的文件 ×N 片）
-                   ├─ npu-unit-tests   NPU pytest（一旦开跑就泳道内全跑）
-                   ├─ npu-model-tests  E2E：一个族内小模型跑一步
+                   ├─ 1. cpu-unit    CPU pytest（affected 选中的文件，不分片）
+                   ├─ 2. npu-unit    NPU pytest（一旦开跑就泳道内全跑）
+                   ├─ 3. model-unit  E2E：按 profiles 逐个跑一步
                    └─ gate     唯一 required check
 
-手动 ─────────────► ci-full.yml / ci-image.yml / ci-tests.yml
+手动 ─────────────► ci-full.yml / ci-image.yml / 三条泳道各自 dispatch
 ```
+
+**每条泳道在图上只有一个盒子。** 可复用 workflow 会把被调文件的**所有** job
+展开成图上的盒子，矩阵再乘一遍；所以泳道文件一律只声明一个 job，且调用方不用
+矩阵。CPU 不分片也是为了这个——5 个分片就是 5 个盒子。
 
 ### 文件名规范
 
@@ -113,36 +118,35 @@ job 输出，`gate.py` 用它决定摘要该写「静态检查未通过」还是
 PR ──────────────► ci-pr.yml（select[静态+计划] -> {三条测试泳道} -> gate）
 每晚 ─────────────► ci-full.yml（全量，不选测）
 每晚 ─────────────► ci-image.yml（基础镜像，内容没变就跳过）
-手动 ─────────────► ci-tests.yml（kind 选一条泳道）
+手动 ─────────────► ci-tests-{cpu,npu,model}.yml（各自一条泳道）
 ```
 
 
-`ci-tests.yml` 同时是 `workflow_call`（给门禁调用）与 `workflow_dispatch`
-（给自己排查用）：**手动入口全仓只有一个**。合成一个文件而不是维护两个入口，
-是因为**两边的默认值刚好相反**：
+### 为什么每条泳道一个文件
 
-| | 调用方要的 | 手动要的 |
-|---|---|---|
-| 训练超时 | 45 min（截死就跑不完了） | 300 min（全量权重 255 GB） |
-| 模型获取超时 | 跳过并判绿 | 判红（不能把网络问题当通过） |
-| pytest 目标 | 选中的分片 | 一个目录 / node id |
+因为**图的形状由文件结构决定**。可复用 workflow 的一个 `uses:` 会把被调文件的
+**全部** job 展开成图上的盒子，`strategy.matrix` 再把它乘以条目数。早先一个
+`ci-tests.yml` 用 `kind` 选泳道，结果每条泳道都带上了另外两条的盒子；CPU 再
+按 5 个分片展开，一张图里就变成 15 个 job。
 
-拆成两个文件就得人肉维护一份重复的输入声明，而且两份会慢慢漂。
-合成一个后，dispatch 的默认值只影响手动跑，调用方永远显式传值。
+所以现在的规则是：
 
-### 为什么 `ci-tests-model.yml` 又是单独一个文件
+- 每条泳道一个文件，每个文件**只声明一个 job**；
+- 调用方**不用矩阵**，CPU 也**不分片**；
+- 多画像（model-unit）在 job 内部循环（`train.sh lane`），不是矩阵。
+
+三个调用方（`ci-pr.yml` / `ci-full.yml`）都直连这三个文件。手动排查时直接
+dispatch 对应泳道即可，不再有一个总入口。
+
+### 为什么 `ci-tests-model.yml` 是个大文件
 
 因为它**不是同一个问题**：单位测试的差别只在「在哪跑、跑哪些」，而模型测试
 要取权重、减层、按卡数收敛 sp/ep、看门狗、超时收尾 —— 实现体比两条 unit 泳道
-加起来还长。塞进 `ci-tests.yml` 只会让「哪条泳道」和「训练怎么跑」这两件事
-互相牵制。
+加起来还长。塞进 `ci-tests-cpu.yml` 只会让两件事互相牵制。
 
-所以分界线是：**`ci-tests.yml` 负责「选哪条泳道」，`ci-tests-model.yml`
-负责「模型测试怎么跑」**。前者用一个 `kind` 输入 + 一个 `uses:` 转发，
-后者的输入原样透传；后者**没有** `workflow_dispatch`，避免默认值再次分叉。
-
-`kind` 同时吸收了原来的 `use_container`：`cpu-unit` 一定裸机、`npu-unit` 一定
-容器。少一个布尔输入，就少一类「cpu-unit 却给了镜像」的无效组合。
+- `ci-tests-cpu.yml` / `ci-tests-npu.yml`：装依赖 + 跑 pytest，差别只有
+  「裸机 / 容器」；容器是 job 级字段，没法用 `if` 切换，所以只能分两个文件。
+- `ci-tests-model.yml`：JOB 里循环 profiles，逐个 prepare / install / run / report。
 
 ## 决策层：一个计划，三个开关
 
@@ -150,7 +154,8 @@ PR ──────────────► ci-pr.yml（select[静态+计�
 
 ```
 cpu_unit_run=true   npu_unit_run=true   npu_model_run=false
-cpu_unit_files=["tests/ops/cpu/test_x.py", ...]     shard_list=["0/5","1/5",...]
+cpu_unit_files=["tests/ops/cpu/test_x.py", ...]
+e2e=[{"model_type": "qwen3_5", "layers": 0}, ...]
 ```
 
 yaml 里**只读布尔值，不做任何判断**。没有 `if: contains(github.event.pull_request.labels...)`，
@@ -247,7 +252,7 @@ cpu-unit 只跑选中的文件，所以「一个改文档的 PR」连 CPU 泳道
 5. 改动 **> 300 文件**
 
 第 5 条的方向是审过的：**大 PR 该跑更多测试，不是更少**。改 1000 个文件的 PR
-往往是大重构，正是全量最能抓问题的时候；全量分片后也就 8~10 min。
+往往是大重构，正是全量最能抓问题的时候；全量不分片，CPU 也就 5~8 min。
 
 ## 标签
 
@@ -273,7 +278,8 @@ git push origin ci/pr-123
 gh workflow run ci-pr.yml -F ref=ci/pr-123
 ```
 
-或者直接手动跑 `ci-tests.yml`（用 `kind` 选泳道）。
+或者直接 dispatch 对应泳道：`ci-tests-cpu.yml` / `ci-tests-npu.yml` /
+`ci-tests-model.yml`。
 
 ## 时间预算
 
@@ -295,18 +301,18 @@ gh workflow run ci-pr.yml -F ref=ci/pr-123
 
 ## NPU 池串行：不要用 job 级 `concurrency`
 
-第一版在 `ci-tests.yml` 里按 runner 标签分过组
+第一版在泳道文件里按 runner 标签分过组
 （`ci-tests-<label>`，`cancel-in-progress: false`），想的是"让手动跑和 PR 排同一个队"。
-实测**这个做法会吃掉分片**：
+实测**这个做法会吃掉并发**：
 
 > 同一个 concurrency group 里，GitHub 只保留**一个** pending 的 job；
 > 新排进来的会把前一个 pending 的 cancel 掉（`cancel-in-progress: false` 只保证
 > 不打断 *正在跑* 的那个）。
 
-`ci-full` 第一次 run 就是这么挂的：5 个 cpu-unit 分片在 12:19:20 同时入队，
-2/3/4 在 1 秒后全部变成 `cancelled`，只剩 0 和 1 真的跑了。
+`ci-full` 第一次 run 就是这么挂的：同时在队的 job 只剩最后一个，其余的都被
+`cancelled`。
 
-所以现在两个可复用泳道里**没有任何 `concurrency`**。串行本来就由 runner 提供：
+所以现在三个泳道文件里**没有任何 `concurrency`**。串行本来就由 runner 提供：
 self-hosted runner 忙着的时候，下一个 job 天然停在 `queued`。要给某个池限并发，
 应该去 ARC / runner group 那一层做，而不是在被调用的 workflow 里。
 
@@ -335,7 +341,7 @@ timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
 `fromJSON` 对 number 和字符串两种输入都成立（number 输入在 `workflow_call` 下
 仍然走这条路，实测同样正常），所以两条触发链可以用同一份表达式。
 
-这个 bug 让 `ci-tests.yml` 的**手动入口**完全不可用 —— 提交
+这个 bug 让泳道文件的**手动入口**完全不可用 —— 提交
 `f2acd5d` 之后的三次 dispatch 全是这个原因。定位过程：二分探针（`applied` 过的
 `zz-probe*.yml` 已删除），`p`/`q` 两个不带 `timeout-minutes` 的 job 正常创建，
 而带表达式的 `r` 直接消失。
@@ -385,7 +391,7 @@ run failure select  skipped skipped skipped true  true  true   # 计划没算出
 
 ## 一个刻意的取舍
 
-`ci-tests.yml` 的**裸机**泳道不用 `pip install -e ".[dev]"`，而是先装
+`ci-tests-cpu.yml` 的**裸机**泳道不用 `pip install -e ".[dev]"`，而是先装
 「可用版本」的 torch，再 `--no-deps` 装本包。
 
 原因：`pyproject` 钉的是 `torch>=2.10.0`（NPU 镜像里那套），GH 托管机只能从 PyPI 拿

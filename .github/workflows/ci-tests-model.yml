@@ -1,12 +1,13 @@
-name: CI / model tests
+name: CI / model-unit
 
-# "Install a real training stack, then run one step."
-# Called by ci-tests.yml with kind=npu-model. No dispatch here on purpose: the
-# single manual entry point stays ci-tests.yml, so the two default sets cannot
-# drift apart.
+# "Install a real training stack, then run one step" -- one job, N profiles.
+# Called by ci-pr.yml / ci-full.yml, or dispatched on its own.
+#
+# Profiles are looped inside the job (train.sh lane), not expanded by a matrix:
+# a matrix would put one box per profile in the graph.
 #
 # All orchestration lives in scripts/ci:
-#   train.sh             prepare / probe / install / run / report
+#   train.sh             prepare / probe / install / run / report / lane
 #   model.py             probe / find / mark / fetch / trim
 #   env.py               verify / capture / check / cleanup
 #   parallel_plan.py     cards -> sp/ep
@@ -28,13 +29,14 @@ on:
         description: 'Base image; use repo@sha256:... for an exact repro'
         required: true
         type: string
-      model_type:
-        description: '@register_model name, key of model_map.json models'
+      profiles:
+        description: 'JSON array of {model_type, layers}'
         required: true
         type: string
       framework:
         description: 'lf or swift'
-        required: true
+        required: false
+        default: 'lf'
         type: string
       train_model_path:
         description: 'Explicit model dir; empty = look up hf_repo'
@@ -46,11 +48,6 @@ on:
         required: false
         default: ''
         type: string
-      trim_layers:
-        description: 'Keep the first N layers; 0 = full download'
-        required: false
-        default: 0
-        type: number
       train_seq_len:
         required: false
         default: '1024'
@@ -88,12 +85,12 @@ on:
         default: 45
         type: number
       train_timeout_minutes:
-        description: 'Hard limit for one training step'
+        description: 'Hard limit for the whole lane (install + train per profile)'
         required: false
-        default: 10
+        default: 25
         type: number
       fetch_timeout_seconds:
-        description: 'Model fetch timeout; on timeout the lane is skipped'
+        description: 'Model fetch timeout; on timeout the profile is skipped'
         required: false
         default: 600
         type: number
@@ -104,8 +101,65 @@ on:
         required: true
     outputs:
       skip_reason:
-        description: 'Non-empty when this run did not really train'
+        description: 'Non-empty when nothing really trained'
         value: ${{ jobs.npu_model_tests.outputs.skip_reason }}
+
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: 'Runner label (trailing number is the card count)'
+        required: true
+        default: 'linux-aarch64-a3-800i-8'
+        type: choice
+        options:
+          - linux-aarch64-a3-800i-2
+          - linux-aarch64-a3-800i-4
+          - linux-aarch64-a3-800i-8
+          - linux-aarch64-a3-800i-16
+      image:
+        description: 'Base image'
+        required: false
+        default: 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest'
+        type: string
+      profiles:
+        description: 'JSON array, e.g. [{"model_type":"qwen3_5","layers":0}]'
+        required: true
+        type: string
+      framework:
+        description: 'lf or swift'
+        required: false
+        default: 'lf'
+        type: choice
+        options:
+          - lf
+          - swift
+      train_dataset:
+        description: 'Dataset key from dataset/dataset_info.json'
+        required: false
+        default: 'gsm8k'
+        type: string
+      train_seq_len:
+        description: 'cutoff_len'
+        required: false
+        default: '1024'
+        type: string
+      train_finetuning_type:
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - lora
+      strict:
+        description: 'true = model fetch timeout fails'
+        required: false
+        default: true
+        type: boolean
+      timeout_minutes:
+        description: 'Job hard limit'
+        required: false
+        default: 120
+        type: number
 
 permissions:
   contents: read
@@ -129,14 +183,15 @@ env:
 
 jobs:
   npu_model_tests:
-    name: npu-model-tests (${{ inputs.model_type }}/${{ inputs.framework }} / ${{ inputs.runner_label }})
+    name: run
     runs-on: ${{ inputs.runner_label }}
-    # fromJSON is required; see ci-tests.yml.
+    # fromJSON is required: a number input arrives as a string and GitHub
+    # silently drops the whole job if timeout-minutes gets one.
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 45) }}
     # No job-level concurrency: serial access to the NPU pool is provided by
     # the runner queue itself.
     outputs:
-      skip_reason: ${{ steps.run.outputs.skip_reason }}
+      skip_reason: ${{ steps.lane.outputs.skip_reason }}
 
     container:
       image: ${{ inputs.image }}
@@ -152,61 +207,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # First, so a run that dies here still has a result file.
-      - name: resolve map and launch script
-        id: resolve
-        env:
-          MODEL_TYPE: ${{ inputs.model_type }}
-          FRAMEWORK: ${{ inputs.framework }}
-          RUNNER_LABEL: ${{ inputs.runner_label }}
-          IMAGE: ${{ inputs.image }}
-          LAYERS: ${{ inputs.trim_layers }}
-          DATASET: ${{ inputs.train_dataset }}
-        run: bash "$CI_SCRIPTS/train.sh" prepare
-
       # 20 s to detect "no NPU" beats discovering it after installing deps.
       - name: npu and stack self-check
         run: bash "$CI_SCRIPTS/train.sh" probe
 
-      # pip resolving deps can silently replace the self-built NPU torch with
-      # the PyPI one, so the source is verified after every install.
-      - name: install
-        id: deps
-        env:
-          INSTALL_SCRIPT: ${{ steps.resolve.outputs.install_script }}
-        run: bash "$CI_SCRIPTS/train.sh" install
-
+      # prepare / install / run / report per profile, aggregated into one rc.
       - name: train
-        id: run
-        timeout-minutes: ${{ fromJSON(inputs.train_timeout_minutes || 10) }}
+        id: lane
+        timeout-minutes: ${{ fromJSON(inputs.train_timeout_minutes || 25) }}
         env:
+          E2E_PROFILES: ${{ inputs.profiles }}
+          FRAMEWORK: ${{ inputs.framework }}
           MODEL_HINT: ${{ inputs.train_model_path }}
-          REPO_MAP: ${{ steps.resolve.outputs.hf_repo }}
           REPO_IN: ${{ inputs.hf_repo_override }}
           SP_IN: ${{ inputs.train_sp_size }}
           EP_IN: ${{ inputs.train_ep_size }}
           SEQ_LEN: ${{ inputs.train_seq_len }}
           FINETUNING_TYPE: ${{ inputs.train_finetuning_type }}
           RUNNER_LABEL: ${{ inputs.runner_label }}
-          MODEL_TYPE: ${{ inputs.model_type }}
-          TRAIN_SCRIPT: ${{ steps.resolve.outputs.train_script }}
+          IMAGE: ${{ inputs.image }}
           DATASET_IN: ${{ inputs.train_dataset }}
-          LAYERS: ${{ inputs.trim_layers }}
           DIAG: ${{ inputs.diag }}
           FETCH_TIMEOUT: ${{ inputs.fetch_timeout_seconds || 600 }}
           STRICT: ${{ inputs.strict }}
-        run: bash "$CI_SCRIPTS/train.sh" run
+        run: bash "$CI_SCRIPTS/train.sh" lane
 
-      # Summary before cleanup: cleanup removes derived config and half a checkpoint.
-      - name: summary
-        if: always()
-        env:
-          MODEL_TYPE: ${{ inputs.model_type }}
-        run: bash "$CI_SCRIPTS/train.sh" report
-
-      # timeout-minutes only kills the process. A killed training leaves child
-      # processes holding cards, unreleased HBM and a partial checkpoint, which
-      # makes the next job fail for unrelated reasons. Must be last and always().
+      # Cleanup removes derived config and half a checkpoint, so it runs last.
+      # timeout-minutes only kills the process: a killed training leaves child
+      # processes holding cards and HBM, which makes the next job fail for
+      # unrelated reasons.
       - name: cleanup
         if: always()
         continue-on-error: true

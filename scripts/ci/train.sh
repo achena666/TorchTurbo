@@ -351,6 +351,57 @@ cmd_report() {
   result notice --file "$RESULT_JSON" --model-type "${MODEL_TYPE:-}" || true
 }
 
+# ---------------------------------------------------------------- lane
+# One job, N profiles.
+# A reusable workflow call expands into *all* of its jobs, and a matrix
+# expands once per entry, so selecting profiles with a matrix turns one lane
+# into one box per profile. The loop lives here instead: the graph always
+# shows exactly one box per lane.
+cmd_lane() {
+  local rc=0 total=0 skipped=0 per mt layers
+
+  while IFS=$'\t' read -r mt layers; do
+    [ -n "$mt" ] || continue
+    total=$((total + 1))
+    per="/tmp/profile-$total.env"; : > "$per"
+    echo "::group::profile $total: $mt (layers=${layers:-0})"
+    export MODEL_TYPE="$mt" LAYERS="${layers:-0}"
+
+    # prepare/run talk to $GITHUB_OUTPUT; point it at a temp file so the
+    # resolved script paths can be read back per profile.
+    if ! GITHUB_OUTPUT="$per" cmd_prepare; then
+      rc=1
+    else
+      set -a
+      # shellcheck disable=SC1090
+      . "$per"              # run_dir / install_script / train_script / hf_repo
+      set +a
+      if ! cmd_install; then
+        rc=1
+      else
+        # cmd_run exits on a skipped fetch; the subshell keeps the loop alive.
+        ( GITHUB_OUTPUT="$per" cmd_run ) || rc=1
+        grep -q '^skip_reason=' "$per" && skipped=$((skipped + 1))
+      fi
+    fi
+
+    cmd_report || true
+    echo "::endgroup::"
+  done < <(python3 -c '
+import json, sys
+for p in json.loads(sys.argv[1] or "[]"):
+    print("%s\t%s" % (p["model_type"], p.get("layers", 0)))
+' "${E2E_PROFILES:-[]}")
+
+  if [ "$total" -eq 0 ]; then
+    echo "::notice::no profile selected, nothing to train"
+    echo "skip_reason=no profile selected" >> "$GITHUB_OUTPUT"
+  elif [ "$skipped" -eq "$total" ]; then
+    echo "skip_reason=all $total profile(s) skipped" >> "$GITHUB_OUTPUT"
+  fi
+  return "$rc"
+}
+
 # ---------------------------------------------------------------- 调度
 case "${1:-}" in
   prepare) cmd_prepare ;;
@@ -358,8 +409,9 @@ case "${1:-}" in
   install) cmd_install ;;
   run)     cmd_run ;;
   report)  cmd_report ;;
+  lane)    cmd_lane ;;
   *)
-    echo "用法：$0 {prepare|probe|install|run|report}" >&2
+    echo "用法：$0 {prepare|probe|install|run|report|lane}" >&2
     exit 2
     ;;
 esac

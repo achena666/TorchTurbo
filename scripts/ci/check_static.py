@@ -126,6 +126,16 @@ def check_model_map() -> list[str]:
     return bad
 
 
+def read_jobs(rel: str) -> dict:
+    """读一个 workflow 的 jobs；路径是 caller 里的 `./.github/workflows/x.yml`。"""
+    import yaml  # noqa: PLC0415
+
+    path = ROOT / (rel[2:] if rel.startswith("./") else rel)
+    if not path.exists():
+        return {}
+    return (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("jobs") or {}
+
+
 def check_contract() -> list[str]:
     """workflow 读的 select 输出必须真的被声明；决策层必须能算出来。
 
@@ -201,7 +211,7 @@ def check_contract() -> list[str]:
         # 5. 三条泳道必须**并行**：都只依赖 select，谁也不依赖谁。
         #    串起来不会报错，但 L1 红会白等，且 L2a/L2b 的 if 要多写一层
         #    「上游是否挂了」的判断——那是这轮特意去掉的东西。
-        lanes = ("cpu_unit_tests", "npu_unit_tests", "npu_model_tests")
+        lanes = ("l1_cpu_unit", "l2_npu_unit", "l3_model_unit")
         if "select" in jobs and set(lanes) <= set(jobs):
             for lane in lanes:
                 deps = jobs[lane].get("needs") or []
@@ -211,6 +221,17 @@ def check_contract() -> list[str]:
                     bad.append(
                         f"{rel}: {lane} 的 needs 应为 [select]（三条泳道并行），实为 {list(deps)}"
                     )
+                # 矩阵 = 一张卡片变多个 job，图上一条泳道会炸成一堆盒子。
+                if "strategy" in jobs[lane]:
+                    bad.append(f"{rel}: {lane} 不能用 strategy/matrix（每条泳道只能有一个 job）")
+                uses = jobs[lane].get("uses")
+                if uses:
+                    inner = list(read_jobs(uses))
+                    if len(inner) != 1:
+                        bad.append(
+                            f"{rel}: {lane} 调用的 {uses} 有 {len(inner)} 个 job"
+                            "（可复用 workflow 会把它全部展开成图上盒子）"
+                        )
 
         # 6. select 必须直连 gate：否则它失败时 gate 要多等三条已 skipped 的边。
         if "gate" in jobs and "select" in jobs:
