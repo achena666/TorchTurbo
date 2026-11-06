@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib.util
 import json
 import math
 import subprocess
@@ -302,19 +303,35 @@ def _tokens(stem: str) -> set[str]:
 _NPU_CACHE: dict[Path, bool] = {}
 
 
-def has_torch_npu(path: Path) -> bool:
-    """源码里出现过 `torch_npu` 就算 NPU 泳道的文件。
+def _load_npu_rule():
+    """加载唯一判据模块。
 
-    判定特征必须与 `tests/conftest.py` 完全一致 —— 两处都用同一个字符串，
-    否则「被选进 NPU 泳道的文件」和「被 pytest 打上 npu 标记的测试」会不一致。
-    不用维护第二份清单：清单一定会漂。
+    规则写在 `npu_rule.py` 一份里，conftest / pytest.sh / 这里都调它。
+    原先三处各写一遍「文件里含 torch_npu」—— 那份规则把注释里提了一句的
+    CPU 测试拖上了卡，又把要 `fla_npu` / `torch.npu` 的文件漏在两条泳道之外。
+    按路径加载而不是 import：scripts/ci 不是包，直接 import 会依赖 sys.path[0]。
+    """
+    spec = importlib.util.spec_from_file_location(
+        "ci_npu_rule", Path(__file__).with_name("npu_rule.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_NPU_RULE = _load_npu_rule()
+
+
+def has_torch_npu(path: Path) -> bool:
+    """这个测试文件是否必须跑在真 NPU 机器上。
+
+    判据本体在 `scripts/ci/npu_rule.py`（去注释、保留字符串，认
+    torch_npu / torch.npu / fla_npu / device="npu"）。这里只做缓存，
+    避免 select() 反复读同一个文件。
     """
     hit = _NPU_CACHE.get(path)
     if hit is None:
-        try:
-            hit = "torch_npu" in path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            hit = False
+        hit = _NPU_RULE.needs_device(path)
         _NPU_CACHE[path] = hit
     return hit
 
@@ -487,11 +504,11 @@ def select(index: Index, changed: list[str], force_all: bool = False,
             "selected": len(npu_targets),
             "why": (
                 "ci:skip-npu 标签" if no_npu else
-                f"命中 {len(npu_targets)} 个含 torch_npu 的文件（泳道内全跑）"
+                f"命中 {len(npu_targets)} 个需要真卡的测试文件（泳道内全跑）"
                 if npu_targets else
                 "镜像配方变更（泳道内全跑）" if image_changed else
                 "全量模式（泳道内全跑）" if mode == "all" else
-                "没有选中任何含 torch_npu 的文件"
+                "没有选中任何需要真卡的测试文件"
             ),
         },
         "l2b": {

@@ -171,12 +171,77 @@ def check_selector_guard() -> list[str]:
     return bad
 
 
+def check_npu_rule() -> list[str]:
+    """「要不要真卡」只能有一份判据，否则漂了不会报错。
+
+    这条规则原先在 tests/conftest.py、affected.py、pytest.sh 各写了一遍
+    （都是 `"torch_npu" in ...`）。三份独立实现不会互相报错，只会
+    **静默换掉跑的集合**：实测它把仅有注释提及 torch_npu 的 CPU 测试拖上了卡，
+    又把要 `fla_npu` / `torch.npu` 的文件漏在两条泳道之外。
+
+    现在判据只在 `scripts/ci/npu_rule.py`，另外三处必须调它。这里扫一遍，
+    谁把字符串判据写回去了就红。
+    """
+    bad: list[str] = []
+    rule = ROOT / "scripts" / "ci" / "npu_rule.py"
+    if not rule.exists():
+        return ["scripts/ci/npu_rule.py 不见了：三处泳道判据会重新各写一遍"]
+
+    consumers = {
+        "tests/conftest.py": "npu_rule",
+        "scripts/ci/affected.py": "npu_rule",
+        "scripts/ci/pytest.sh": "npu_rule.py",
+    }
+    for rel, marker in consumers.items():
+        path = ROOT / rel
+        if not path.exists():
+            bad.append(f"{rel}: 文件不存在")
+            continue
+        text = path.read_text(encoding="utf-8")
+        if marker not in text:
+            bad.append(f"{rel}: 没有调 npu_rule，判据可能又写了一份")
+        # 字符串判据只允许出现在 npu_rule.py 里。
+        if '"torch_npu" in' in text or "'torch_npu' in" in text:
+            bad.append(f"{rel}: 又出现了字符串判据 `torch_npu in ...`，请改调 npu_rule")
+
+    # 规则本身要对得上一份基准：这 5 个例子就是当初判错的用例。
+    import importlib.util  # noqa: PLC0415
+
+    spec = importlib.util.spec_from_file_location("ci_npu_rule_check", rule)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    expected = {
+        # 注释里提了一句 torch_npu → 纯 CPU，不能占卡
+        "tests/models/deepseek_v4/test_turbo_vs_base_precision.py": False,
+        # 全程 monkeypatch 假模块
+        "tests/ops/test_npu_matmul_add.py": False,
+        "tests/models/test_attention_npu.py": False,
+        # 只认 torch_npu 会漏掉这两个，它们两条泳道都不跑
+        "tests/ops/providers/npu/test_varlen_metadata.py": True,
+        "tests/engine/test_muon_offload_distributed.py": True,
+        # 标准情况
+        "tests/ops/npu/test_fused_rms_norm.py": True,
+    }
+    for rel, want in expected.items():
+        path = ROOT / rel
+        if not path.exists():
+            bad.append(f"{rel}: 基准用例不存在了，请更新 npu-rule 的样本")
+            continue
+        got = module.needs_device(path)
+        if got != want:
+            bad.append(f"{rel}: 判成 {got}，期望 {want}")
+
+    print(f"npu-rule: {len(consumers)} 个调用方 / {len(bad)} 个问题")
+    return bad
+
+
 CHECKS = {
     "compile": check_compile,
     "workflows": check_workflows,
     "map": check_model_map,
     "contract": check_contract,
     "selector": check_selector_guard,
+    "npu-rule": check_npu_rule,
 }
 
 

@@ -159,7 +159,7 @@ def judge_pr() -> int:
             "L2a NPU", results["L2A"],
             expect_skip=(want["L2A"] != "true") or cpu_bad,
             why="上游未通过，按串行链跳过" if cpu_bad
-            else "未选中含 torch_npu 的文件",
+            else "未选中需要真卡的测试文件",
         )
         rep.optional(
             "L2b E2E", results["L2B"],
