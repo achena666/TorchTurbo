@@ -238,9 +238,15 @@ cmd_run() {
   else
     python3 "$CI_SCRIPTS/model.py" find --repo "$hf_repo" \
       --marker "$marker" --output "$cache_out"
+    # find writes uppercase MODEL / BYTES / SHARDS / HIT; the rest of this
+    # function works in lowercase. Sourcing alone leaves `model` empty, which
+    # silently exports MODEL="" and the launcher falls back to a path that
+    # does not exist (HFValidationError on '/models/...' several minutes in).
     # shellcheck disable=SC1090
     . "$cache_out"
     if [ "${HIT:-no}" = yes ]; then
+      model="${MODEL:-}"; bytes="${BYTES:-0}"; shards="${SHARDS:-0}"
+      [ -n "$model" ] || { echo "::error::model.py find 报了 HIT 但没给 MODEL"; return 1; }
       echo "缓存命中：$model"
     else
       local fetch_start trc

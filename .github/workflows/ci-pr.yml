@@ -421,7 +421,7 @@ jobs:
           FRAMEWORK: lf
           RUNNER_LABEL: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
           IMAGE: ${{ needs.select.outputs.image }}
-          SEQ_LEN: '1024'
+          SEQ_LEN: '4096'
           DATASET_IN: 'gsm8k'
           FINETUNING_TYPE: 'full'
           FETCH_TIMEOUT: '600'
