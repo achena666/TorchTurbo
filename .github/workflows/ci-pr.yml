@@ -30,9 +30,9 @@ on:
         default: false
         type: boolean
       with_e2e:
-        description: 'full only: run every e2e profile'
+        description: 'pr: one cheapest profile; full: every profile'
         required: false
-        default: true
+        default: false
         type: boolean
       # Smoke switch: one dir / file / node id instead of the whole selection.
       # '-' keeps the normal selection. Takes precedence over everything else
@@ -119,7 +119,8 @@ jobs:
         env:
           LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
           FORCE_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.force_all }}
-          WITH_E2E: ${{ github.event_name != 'workflow_dispatch' || inputs.with_e2e }}
+          # PRs must never get e2e for free: only an explicit dispatch or label does.
+          WITH_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.with_e2e }}
         run: |
           set -uo pipefail
 
@@ -137,6 +138,8 @@ jobs:
             # force_all means "all unit tests", not "all e2e as well": the
             # 8-card lane is the expensive part and stays opt-in.
             [ "${FORCE_INPUT}" = "true" ] && EXTRA+=(--force-all)
+            # One cheapest profile only: enough to prove the lane works.
+            [ "${WITH_E2E}" = "true" ] && EXTRA+=(--e2e-force)
           fi
 
           # An empty diff means "not enough information" -> full run (fail-open).
