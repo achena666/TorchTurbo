@@ -78,7 +78,11 @@ printf '  %s\n' "${FILES[@]}" | head -30
 
 # ---- marker 过滤 ------------------------------------------------------------
 # cpu：排除需要 torch_npu 的；npu：只要那些。
-if [ "$MODE" = "npu" ]; then
+# 显式 TEST_PATH 时不适用：那是「我就要跑这一个」，marker 分流会把一个纯 CPU
+# 文件在 npu 泳道里 deselect 干净，结果 rc=5 —— 看起来像泳道坏了，其实只是过滤。
+if [ -n "$TEST_PATH" ]; then
+  MARK=()
+elif [ "$MODE" = "npu" ]; then
   MARK=(-m npu)
 else
   MARK=(-m "not npu")

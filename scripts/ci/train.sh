@@ -10,6 +10,7 @@
 #   install  ③④ pip 装 torchturbo 与模型依赖（torch 归属校验）
 #   run      ⑤  取模型 → 推并行策略 → 起训练 → 落事实
 #   report   ⑥  渲染 Job Summary 与注解
+#   lane     prepare → install → run → report，按 E2E_PROFILES 逐个跑
 #
 # 事实写进 $RESULT_JSON 而不是 step outputs：step 失败时 outputs 是空的，
 # 而失败的那次恰恰是唯一会被人翻出来看的。
@@ -20,6 +21,18 @@ CI_SCRIPTS="${CI_SCRIPTS:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 RESULT_JSON="${RESULT_JSON:-/tmp/ci-result.json}"
 GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
 MAP="${MAP:-.github/workflows/model_map.json}"
+
+# set -u turns any missing input into a crash halfway through a 20 min job.
+# Default everything the functions read, in one place.
+: "${MODEL_TYPE:=}"; : "${FRAMEWORK:=lf}"; : "${RUNNER_LABEL:=}"
+: "${IMAGE:=}"; : "${LAYERS:=0}"
+: "${MODEL_HINT:=}"; : "${REPO_MAP:=}"; : "${REPO_IN:=}"
+: "${SP_IN:=auto}"; : "${EP_IN:=auto}"; : "${SEQ_LEN:=1024}"
+: "${FINETUNING_TYPE:=full}"; : "${DATASET_IN:=gsm8k}"
+# DATASET = what the launchers read; DATASET_IN = the workflow input name.
+: "${DATASET:=${DATASET_IN}}"
+: "${DIAG:=false}"; : "${FETCH_TIMEOUT:=600}"; : "${STRICT:=false}"
+: "${INSTALL_SCRIPT:=}"; : "${TRAIN_SCRIPT:=}"; : "${E2E_PROFILES:=[]}"
 
 result() { python3 "$CI_SCRIPTS/result.py" "$@"; }
 
@@ -359,6 +372,10 @@ cmd_report() {
 # shows exactly one box per lane.
 cmd_lane() {
   local rc=0 total=0 skipped=0 per mt layers
+
+  # Callers pass the *_IN spellings (they mirror the workflow input names);
+  # the inner functions read the short ones.
+  export DATASET="${DATASET_IN:-${DATASET:-gsm8k}}"
 
   while IFS=$'\t' read -r mt layers; do
     [ -n "$mt" ] || continue
