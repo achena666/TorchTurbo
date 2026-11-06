@@ -7,6 +7,8 @@
 #   MODE        cpu | npu          cpu 加 -m "not npu"，npu 加 -m npu
 #   TEST_FILES  JSON 数组；空 = 跑全部
 #   TEST_PATH   单个 path / node id；非空则忽略 TEST_FILES 与 SHARD
+#               `-` = 显式要「整条泳道」（dispatch 的默认值是具体路径，
+#               传空串会被 GitHub 当成未提供而回落默认值，所以需要这个哨兵）
 #   SHARD       "0/3" 形式；空 = 不切
 #   PYTEST_ARGS 额外参数（按空格拆是有意的）
 #   JUNIT_OUT   junit 输出路径
@@ -17,6 +19,12 @@ CI_SCRIPTS="${CI_SCRIPTS:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 MODE="${MODE:-cpu}"
 TEST_FILES="${TEST_FILES:-}"
 TEST_PATH="${TEST_PATH:-}"
+# `-` = 显式请求整条泳道。workflow_dispatch 的空字符串输入会被当成
+# 「未提供」而回落成默认值（实测：传 "" 实际拿到 tests/ops/npu，
+# 只跑了 1 个文件），所以手动入口需要一个不可能和真实路径冲突的哨兵。
+if [ "$TEST_PATH" = "-" ]; then
+  TEST_PATH=""
+fi
 SHARD="${SHARD:-}"
 PYTEST_ARGS="${PYTEST_ARGS:--v --durations=20}"
 JUNIT_OUT="${JUNIT_OUT:-/tmp/pytest.xml}"

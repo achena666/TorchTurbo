@@ -88,7 +88,7 @@ on:
           - npu
           - cpu
       test_path:
-        description: 'pytest 目标：目录 / 文件 / node id；留空 = 全部'
+        description: 'pytest 目标：目录 / 文件 / node id；填 - 表示整条泳道（留空会回落成本默认值）'
         required: false
         default: 'tests/ops/npu'
         type: string
