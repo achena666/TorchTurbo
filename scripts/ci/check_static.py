@@ -423,6 +423,32 @@ def check_naming() -> list[str]:
     return bad
 
 
+def check_interpreter() -> list[str]:
+    """`.py` 只能用 python3 调，`.sh` 才能用 bash。
+
+    改名时最容易漏的错：文件从 `lint.sh` 变成 `check_static.py`，调用处只换了
+    文件名、没换解释器 —— `bash x.py` 在 YAML 里合法、actionlint 也不管，只能
+    等 CI 真跑到那一步才红，而且报的是看不懂的 bash 语法错。
+    """
+    bad: list[str] = []
+    # `bash xxx.py` / `sh xxx.py` / `source xxx.py`
+    wrong = re.compile(
+        r"(?:^|[\s;&|(])(?:bash|sh|source|\.)\s+[\w\"'$/{}.\-]*?([\w\-]+\.py)\b",
+        re.MULTILINE,
+    )
+    for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+        rel = path.relative_to(ROOT).as_posix()
+        for num, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            for m in wrong.finditer(line):
+                bad.append(
+                    f"{rel}:{num}: 用 bash/sh 调 {m.group(1)}，应改用 python3"
+                )
+    print(f"interpreter: {len(bad)} 个问题")
+    return bad
+
+
 CHECKS = {
     "compile": check_compile,
     "workflows": check_workflows,
@@ -431,6 +457,7 @@ CHECKS = {
     "selector": check_selector_guard,
     "npu-rule": check_npu_rule,
     "naming": check_naming,
+    "interpreter": check_interpreter,
 }
 
 

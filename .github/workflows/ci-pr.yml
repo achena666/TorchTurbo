@@ -84,7 +84,7 @@ jobs:
           ./actionlint -color
 
       - name: hadolint
-        run: bash scripts/ci/check_static.py hadolint docker/npu/Dockerfile_aarch64
+        run: python3 scripts/ci/check_static.py hadolint docker/npu/Dockerfile_aarch64
 
       - name: resolve image
         id: image
@@ -125,7 +125,7 @@ jobs:
           JOB_STATUS: ${{ job.status }}
           STATIC_OUTCOME: ${{ steps.static.outcome }}
           PICK_OUTCOME: ${{ steps.pick.outcome }}
-        run: bash scripts/ci/check_static.py stage
+        run: python3 scripts/ci/check_static.py stage
 
   # No matrix, no shards: either would put one box per entry on the graph.
   l1_cpu_unit:
