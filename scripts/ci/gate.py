@@ -127,6 +127,14 @@ def judge_pr() -> int:
     rep.required("L0 静态", results["L0"])
     rep.required("L1 CPU", results["L1"])
 
+    # 三条泳道现在是串行门控（L1 -> L2a -> L2b）。上游红了，下游一定 skipped，
+    # 那是「按设计没跑」，不是「不知道为什么没跑」—— 否则摘要会在真正的原因
+    # （L1 红）旁边再挂一个 skipped-unknown，把人引到错的地方去。
+    # 只影响措辞，不影响结论：上游本身红了这一轮仍然是失败。
+    cpu_bad = results["L0"] not in ("success", "skipped") or \
+        results["L1"] not in ("success", "skipped")
+    npu_bad = cpu_bad or results["L2A"] not in ("success", "skipped")
+
     if _env("IS_FORK") == "true":
         # fork PR 的 L2 不执行是设计，不是故障。
         for name, key in (("L2a NPU", "L2A"), ("L2b E2E", "L2B")):
@@ -141,13 +149,14 @@ def judge_pr() -> int:
     else:
         rep.optional(
             "L2a NPU", results["L2A"],
-            expect_skip=_env("WANT_NPU") != "true",
-            why="路径不含 ops/镜像/依赖",
+            expect_skip=(_env("WANT_NPU") != "true") or cpu_bad,
+            why="上游未通过，按串行链跳过" if cpu_bad
+            else "路径不含 ops/镜像/依赖",
         )
         rep.optional(
             "L2b E2E", results["L2B"],
-            expect_skip=_env("WANT_E2E") == "[]",
-            why="无匹配画像",
+            expect_skip=(_env("WANT_E2E") == "[]") or npu_bad,
+            why="上游未通过，按串行链跳过" if npu_bad else "无匹配画像",
         )
 
     # 跑起来了但自己宣告跳过（模型获取超时）：记 skipped-reason，
@@ -179,9 +188,22 @@ def judge_full() -> int:
     rep.required("select", req["SEL"])
     rep.required("L0 静态", req["L0"])
     rep.required("L1 CPU", req["L1"])
-    rep.required("L2a NPU", req["L2A"])
+
+    # 串行门控后，上游红了下游一定是 skipped。这里不重复记一笔「未执行」，
+    # 只把真正的红标出来，免得摘要里同一件事说两遍。
+    upstream_failed = any(
+        req[k] not in ("success", "skipped") for k in ("SEL", "L0", "L1")
+    )
+    if upstream_failed and req["L2A"] == "skipped":
+        rep.rows.append(f"| L2a NPU | {SKIP} | 上游未通过，按串行链跳过 |")
+    else:
+        rep.required("L2a NPU", req["L2A"])
+
     # 全量里 E2E 也可能因为「今天没有画像要跑」而跳过，属正常。
-    rep.optional("L2b E2E", _env("R_L2B"), expect_skip=True, why="无匹配画像")
+    rep.optional(
+        "L2b E2E", _env("R_L2B"), expect_skip=True,
+        why="上游未通过，按串行链跳过" if upstream_failed else "无匹配画像",
+    )
 
     rep.render("main 全量结果", _env("SUMMARY"))
     print(f"::notice title=ci-full::{_env('SUMMARY') or 'select-failed'}")

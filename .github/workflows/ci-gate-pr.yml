@@ -201,12 +201,16 @@ jobs:
   # ------------------------------------------------------------------ L2a
   l2a:
     name: L2a NPU 特性
-    needs: select
+    # 串行门控：CPU 没过就不开 NPU。两个泳道其实不抢资源（L1 在托管机、
+    # L2a 在自建池），串起来的唯一目的是「前面红了就别再烧卡」。
+    # needs 自带失败传播：l1 挂了 l2a 自动 skipped，不用写 if。
+    needs: [select, l1]
     # fork PR 不起 L2：secrets 不给 fork，而「把 secrets 递到 fork 的代码上」
     # 等于把 RCE 送人（pull_request_target 就是这么出事的，已明确禁用）。
     # 要求 maintainer 把 commit 推进本仓分支再跑，见 docs/ci/README.md。
     if: |
-      needs.select.result == 'success' && needs.select.outputs.npu == 'true' &&
+      needs.select.result == 'success' && needs.l1.result == 'success' &&
+      needs.select.outputs.npu == 'true' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
     uses: ./.github/workflows/ci-pytest.yml
@@ -225,9 +229,18 @@ jobs:
   # ------------------------------------------------------------------ L2b
   l2b:
     name: L2b E2E（${{ matrix.profile.model_type }}）
-    needs: select
+    # 链尾：CPU 红了不跑，NPU 特性红了也不跑（特性 2 卡 ~2 min，E2E 8 卡
+    # ~10 min，这一层门控省得最多）。
+    # 为什么用 always() 而不是靠 needs 的隐式跳过：l2a 在「npu=false」时是
+    # skipped，而 needs 里任何 skipped 都会把 l2b 一起带下去 —— 但 E2E 与
+    # 特性是两条互不依赖的判断（改 engine/ 会起 E2E 却不起特性）。所以这里
+    # 自己写条件：l2a 只要不是 failure/cancelled 就放行。
+    needs: [select, l1, l2a]
     if: |
-      needs.select.result == 'success' && needs.select.outputs.e2e != '[]' &&
+      always() && needs.select.result == 'success' &&
+      needs.l1.result == 'success' &&
+      needs.l2a.result != 'failure' && needs.l2a.result != 'cancelled' &&
+      needs.select.outputs.e2e != '[]' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
     strategy:

@@ -18,9 +18,43 @@ pull_request ──► ci-gate-pr.yml
                     ci-train.yml   训练一个模型
 ```
 
-**调试期所有自动触发都已注释掉**（`push` / `schedule`），只留手动 —— 一次全量
-要占 1 个 2 卡 + 1 个 8 卡十几分钟，而 CI 本身还在改。恢复时解开原处注释即可，
-`ci-full.yml` 与 `ci-image.yml` 里都写清了那几行该写什么。
+## 三条泳道是**串行门控**，不是并行
+
+```
+select ─► L0 ─► L1(CPU) ─► L2a(NPU 特性) ─► L2b(NPU 端到端)
+```
+
+用 `needs` 串起来，语义是**前面没过就不开后面的卡**：
+
+| 前一级 | 后一级 | 被拦住时省下 |
+|---|---|---|
+| L1 CPU | L2a / L2b | 2 卡 ~2 min + 8 卡 ~10 min |
+| L2a 特性 | L2b | 8 卡 ~10 min |
+
+两点必须注意：
+
+1. **`needs` 只保证"失败时不跑"**，不保证排队执行 —— L1 在 GH 托管机、
+   L2a/L2b 在自建池，本来就不抢资源。串起来纯粹是省钱，不改善墙钟
+   （CPU 那 ~90 s 会变成 NPU 的等待时间）。
+2. **L2b 不能用 `needs: [select, l1, l2a]` 的隐式跳过**：L2a 在"本次不需要
+   NPU 特性"时是 `skipped`，而 `needs` 里任何 skipped 都会把 L2b 一起带下去。
+   但 E2E 与特性是两条独立判断（改 `engine/` 会起 E2E 却不起特性），所以
+   L2b 用 `if: always() && ... needs.l2a.result != 'failure'` 自己写条件。
+
+`gate.py` 对这个模式有专门的措辞：上游红了导致的下游 `skipped` 记成
+"上游未通过，按串行链跳过"，而不是 `skipped-unknown`（后者意味着"没人知道
+为什么没跑"，那才是真问题）。
+
+**当前（调试期）所有 workflow 都只手动触发**：`push` / `schedule` 已全部注释掉，
+写在哪里、怎么恢复都留在原处。恢复后应该是：
+
+```
+PR ──────────────► ci-gate-pr.yml（select -> L0 -> L1 -> L2a -> L2b -> gate）
+每晚 ─────────────► ci-full.yml（全量，不选测）
+每晚 ─────────────► ci-image.yml（基础镜像，内容没变就跳过）
+手动 ─────────────► ci-pytest.yml / ci-train.yml
+```
+
 
 后两个同时是 `workflow_call`（给门禁调用）与 `workflow_dispatch`（给自己排查用）。
 合成一个文件而不是维护两个入口，是因为**两边的默认值刚好相反**：
