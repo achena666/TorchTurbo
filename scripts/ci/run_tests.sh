@@ -12,7 +12,7 @@
 #   SHARD       "0/3" 形式；空 = 不切
 #   PYTEST_ARGS 额外参数（按空格拆是有意的）
 #   JUNIT_OUT   junit 输出路径
-#   RESULT_JSON result.py 的结果文件
+#   RESULT_JSON report_result.py 的结果文件
 set -uo pipefail
 
 CI_SCRIPTS="${CI_SCRIPTS:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
@@ -30,7 +30,7 @@ PYTEST_ARGS="${PYTEST_ARGS:--v --durations=20}"
 JUNIT_OUT="${JUNIT_OUT:-/tmp/pytest.xml}"
 RESULT_JSON="${RESULT_JSON:-/tmp/ci-result.json}"
 
-python3 "$CI_SCRIPTS/result.py" init --file "$RESULT_JSON" \
+python3 "$CI_SCRIPTS/report_result.py" init --file "$RESULT_JSON" \
   kind=pytest model_type="pytest-${MODE}" mode="$MODE" shard="${SHARD:--}"
 
 # ---- 决定跑哪些文件 ---------------------------------------------------------
@@ -49,7 +49,7 @@ if not files:
     files = sorted(glob.glob("tests/**/test_*.py", recursive=True))
     if mode == "npu":
         # npu 泳道只收「必须真跑在卡上」的文件。判据不在这里写：
-        # 调 scripts/ci/npu_rule.py（与 conftest.py、affected.py 同一份），
+        # 调 scripts/ci/npu_rule.py（与 conftest.py、select_plan.py 同一份），
         # 否则三处会慢慢漂，漂了也不报错，只会静默换掉跑的集合。
         # 全量 glob 后不筛会把整个 tests/ 导一遍，缺 peft / PIL 这类
         # 可选依赖的模块会变成 collection error，看起来像 NPU 坏了。
@@ -68,7 +68,7 @@ fi
 mapfile -t FILES < /tmp/tt_pytest_files.txt
 if [ "${#FILES[@]}" -eq 0 ]; then
   echo "::error::没有可跑的测试文件（选择器和全量兜底都为空）"
-  python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
+  python3 "$CI_SCRIPTS/report_result.py" phase --file "$RESULT_JSON" \
     --name '④ pytest' --seconds 0 --rc 1
   exit 1
 fi
@@ -102,12 +102,12 @@ python -m pytest "${FILES[@]}" "${MARK[@]}" ${PYTEST_ARGS} \
 RC=${PIPESTATUS[0]}
 ELAPSED=$(( $(date +%s) - START ))
 
-python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
+python3 "$CI_SCRIPTS/report_result.py" phase --file "$RESULT_JSON" \
   --name "④ pytest (${MODE})" --seconds "$ELAPSED" --rc "$RC"
 echo "::notice::pytest mode=${MODE} rc=${RC} in ${ELAPSED}s"
 
 echo "--- junit ---"
-python3 "$CI_SCRIPTS/result.py" junit --junit "$JUNIT_OUT" || true
+python3 "$CI_SCRIPTS/report_result.py" junit --junit "$JUNIT_OUT" || true
 
 echo "rc=${RC}" >> "${GITHUB_OUTPUT:-/dev/null}"
 exit "$RC"

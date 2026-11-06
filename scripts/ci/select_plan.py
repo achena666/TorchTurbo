@@ -20,11 +20,11 @@
 （映射表一定会随重构腐烂，而腐烂是静默的）。
 
 用法：
-    affected.py --changed-file a.py --changed-file b.py
-    git diff --name-only base...HEAD | affected.py --changed-from -
-    affected.py --changed-file x.py --explain      # 打印每个文件命中了哪层
-    affected.py --audit                            # 覆盖体检（不进 PR 门禁）
-    affected.py --self-test                        # 断言算法没退化
+    select_plan.py --changed-file a.py --changed-file b.py
+    git diff --name-only base...HEAD | select_plan.py --changed-from -
+    select_plan.py --changed-file x.py --explain      # 打印每个文件命中了哪层
+    select_plan.py --audit                            # 覆盖体检（不进 PR 门禁）
+    select_plan.py --self-test                        # 断言算法没退化
 """
 
 from __future__ import annotations
@@ -306,7 +306,7 @@ _NPU_CACHE: dict[Path, bool] = {}
 def _load_npu_rule():
     """加载唯一判据模块。
 
-    规则写在 `npu_rule.py` 一份里，conftest / pytest.sh / 这里都调它。
+    规则写在 `npu_rule.py` 一份里，conftest / run_tests.sh / 这里都调它。
     原先三处各写一遍「文件里含 torch_npu」—— 那份规则把注释里提了一句的
     CPU 测试拖上了卡，又把要 `fla_npu` / `torch.npu` 的文件漏在两条泳道之外。
     按路径加载而不是 import：scripts/ci 不是包，直接 import 会依赖 sys.path[0]。
@@ -605,7 +605,7 @@ def self_test(root: Path) -> int:
         if not cond:
             failures.append(name)
 
-    print("affected.py --self-test")
+    print("select_plan.py --self-test")
 
     # ---- 泳道开关（yaml 只读这四个值） ------------------------------------
     def lane_runs(r: dict) -> dict[str, bool]:
@@ -643,7 +643,7 @@ def self_test(root: Path) -> int:
     r = select(index, ["docker/npu/Dockerfile_aarch64"])
     check("镜像配方 -> 起 npu-unit（选不中测试也要跑）", r["lanes"]["npu_unit"]["run"], str(lane_runs(r)))
 
-    r = select(index, ["scripts/ci/affected.py"])
+    r = select(index, ["scripts/ci/select_plan.py"])
     check("CI 自身改动 -> 全量 CPU", r["mode"] == "all", r["mode"])
     check("CI 自身改动 -> 不起 npu-model", r["e2e"] == [], str(r["e2e"]))
 
@@ -967,7 +967,7 @@ def main(argv: list[str]) -> int:
             fh.write(f"npu={str(result['npu']).lower()}\n")
             fh.write(f"targets={json.dumps(result['targets'], ensure_ascii=False)}\n")
             fh.write(f"e2e={json.dumps(result['e2e'], ensure_ascii=False)}\n")
-            # 保底：pytest.sh 在不给 TEST_FILES 时自己 glob 全量，这里保留原语义。
+            # 保底：run_tests.sh 在不给 TEST_FILES 时自己 glob 全量，这里保留原语义。
             fh.write(f"test_files={json.dumps(index.test_files, ensure_ascii=False)}\n")
             fh.write(f"summary={result['mode']} {result['counts']['files']}f "
                      f"{result['counts']['tests']}/{result['counts']['total']}f "
@@ -979,6 +979,6 @@ if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]))
     except BrokenPipeError:
-        # `affected.py --explain | head` 会提前关掉管道；别让它刷一堆噪音。
+        # `select_plan.py --explain | head` 会提前关掉管道；别让它刷一堆噪音。
         sys.stdout = None
         sys.exit(0)

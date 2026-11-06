@@ -27,7 +27,7 @@ pull_request ──► ci-pr.yml
 - 可复用 workflow 会把被调文件的**所有** job 展开成图上的盒子，而 `uses:` 的
   job 一律显示成 `调用方名 / 被调方名`，两段合不成一段 —— 所以泳道必须**内联**。
 - `strategy.matrix` 会把一个 job 乘以条目数 —— 所以 CPU **不分片**，model 的多
-  画像在 job 内部循环（`train.sh lane`）。
+  画像在 job 内部循环（`run_train.sh lane`）。
 - job key 带 `l1_` / `l2_` / `l3_` 前缀：图上的同级 job 按 key 排序，这是
   cpu → npu-unit → npu-model 从上到下的唯一保证。
 
@@ -68,7 +68,7 @@ select（静态检查 → 算计划） ─┼─► npu-unit-tests         ─�
 
 代价只有一处：job 红了只看 `needs.select.result` 分不清倒在哪一步。所以最后
 一步用 `if: always()` 把 `stage`（`ok` / `static` / `select` / `cancelled`）写进
-job 输出，`gate.py` 用它决定摘要该写「静态检查未通过」还是「计划未算出」。
+job 输出，`report_gate.py` 用它决定摘要该写「静态检查未通过」还是「计划未算出」。
 
 同时，`actionlint` / `hadolint` 是**无条件跑**的（早先靠 `ci_changed` /
 `docker_changed` 判断，那两个输出已经删除）：为省一次 2 s 的二进制下载去复制
@@ -76,8 +76,8 @@ job 输出，`gate.py` 用它决定摘要该写「静态检查未通过」还是
 
 `check_static.py` 的 `contract` 检查守这个拓扑，写错会当场报错：
 
-1. 跑 `check_static.py` 的 job 必须**同时**跑 `affected.py`（别拆成两个 job）；
-2. 同一个 job 里 `check_static.py` 必须**排在** `affected.py` 之前；
+1. 跑 `check_static.py` 的 job 必须**同时**跑 `select_plan.py`（别拆成两个 job）；
+2. 同一个 job 里 `check_static.py` 必须**排在** `select_plan.py` 之前；
 3. 算计划的入口只能有一处（`--changed-from git` 不许出现两次）；
 4. `l1` / `l2a` / `l2b` 的 `needs` 必须**恰好**是 `[select]`（并行，不许串起来）；
 5. `gate.needs` 必须包含 `select`（提前结束通路）。
@@ -103,7 +103,7 @@ job 输出，`gate.py` 用它决定摘要该写「静态检查未通过」还是
 
 ### gate 的判定
 
-并行之后不再有「上游红了所以下游 skipped」这种因果，所以 `gate.py` 里也**不再
+并行之后不再有「上游红了所以下游 skipped」这种因果，所以 `report_gate.py` 里也**不再
 有** `cpu_bad` / `npu_bad` 这类传递判断。跳过只剩两种原因：
 
 | 情形 | 结论 |
@@ -141,7 +141,7 @@ PR ──────────────► ci-pr.yml（select[静态+计�
 
 ## 决策层：一个计划，三个开关
 
-分支判断**只允许存在一处**，在 `scripts/ci/affected.py` 里。它输出一份计划：
+分支判断**只允许存在一处**，在 `scripts/ci/select_plan.py` 里。它输出一份计划：
 
 ```
 cpu_unit_run=true   npu_unit_run=true   npu_model_run=false
@@ -168,13 +168,13 @@ if: |
 显式拦住「计划没算出来」这一种，所以第一行永远是
 `needs.select.result == 'success'`。
 
-`gate.py` 拿同样的开关做判定：该跑却 `skipped` 是 `skipped-unknown`（红），
+`report_gate.py` 拿同样的开关做判定：该跑却 `skipped` 是 `skipped-unknown`（红），
 不该跑而 `skipped` 是 ⏭（绿）。两边用**同一组变量名**，否则摘要会给出
 和实际执行相反的解释。
 
 ### 决策层契约由 select 里的静态检查看守
 
-`check_static.py` 的 `contract` 项会**真的跑一次** `affected.py`，断言那四个
+`check_static.py` 的 `contract` 项会**真的跑一次** `select_plan.py`，断言那四个
 输出真的被写出来，再逐个 workflow 校验 `needs.select.outputs.X` 都已声明。
 
 这类 bug 的特点就是「能跑、能绿」：拼错一个输出名 → GitHub 给空字符串 →
@@ -206,8 +206,8 @@ npu-unit 一旦开跑就是**泳道内全跑**（17 个含 `torch_npu` 的文件
 cpu-unit 只跑选中的文件，所以「一个改文档的 PR」连 CPU 泳道都不开——静态那 15 s
 就是它的全部成本。
 
-两张表对应两个脚本：路径 → 用例是 `scripts/ci/affected.py`，路径 → 画像在
-`affected.py` 的 `pick_e2e()` 里，画像本身写在 `model_map.json` 的 `e2e` 字段。
+两张表对应两个脚本：路径 → 用例是 `scripts/ci/select_plan.py`，路径 → 画像在
+`select_plan.py` 的 `pick_e2e()` 里，画像本身写在 `model_map.json` 的 `e2e` 字段。
 
 改 CI 自身为什么跑全量 CPU：这些脚本就是「怎么跑测试」本身，改错了会**静默少跑**，
 只有全量能看出来。但它们不烧 NPU。
@@ -225,7 +225,7 @@ cpu-unit 只跑选中的文件，所以「一个改文档的 PR」连 CPU 泳道
 构建成功后会把 `{ref, tag, digest}` 写成 `base-image-ref` artifact（保留 90 天）。
 **生产开着、消费暂关**：`ci-image.yml` 照旧发布，但 PR / 全量的 `select`
 不读它，只用上面的固定链接。要接上时把 `--repo "$GITHUB_REPOSITORY"` 加回
-`image.py resolve` 那一行即可（解析顺序：人工覆盖 → artifact → 固定链接）。
+`build_image.py resolve` 那一行即可（解析顺序：人工覆盖 → artifact → 固定链接）。
 **整条链路不需要任何长期凭据** —— `gh variable set` 对 `GITHUB_TOKEN` 是 403，
 所以才走 artifact。
 
@@ -254,7 +254,7 @@ cpu-unit 只跑选中的文件，所以「一个改文档的 PR」连 CPU 泳道
 | `ci:e2e:strict` | E2E 因模型超时跳过时**判红**；默认是「跳过但绿」 |
 | `ci:skip-npu` | 强制关掉 L2（hotfix 用） |
 
-标签的语义在 `scripts/ci/affected.py` 的 `flags_from_event()` 里，**不在 yaml**
+标签的语义在 `scripts/ci/select_plan.py` 的 `flags_from_event()` 里，**不在 yaml**
 里：yaml 只把标签拼成字符串传过去。这样 `--self-test` 能把 8 种组合钉死，
 而「加一个标签」只需要改一处，不会出现 yaml 和文档两套说法。
 
@@ -291,7 +291,7 @@ gh workflow run ci-pr.yml -F ref=ci/pr-123
 超时只负责**拦住卡死**，不负责卡住正常但较慢的运行——所以 step 级超时给到实测值的
 3~4 倍，而不是贴着实测值。
 
-超时之后一定有收尾（`if: always()` → `scripts/ci/env.py cleanup`）：被杀掉的训练会
+超时之后一定有收尾（`if: always()` → `scripts/ci/env_pod.py cleanup`）：被杀掉的训练会
 留下占卡的子进程、没释放的显存和半个 checkpoint，下个 job 会以完全无关的方式失败。
 
 ## NPU 池串行：不要用 job 级 `concurrency`
@@ -356,18 +356,18 @@ timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
 
 ```bash
 python3 scripts/ci/check_static.py            # 静态六项（含跑一次选择器验契约）
-python3 scripts/ci/affected.py --self-test    # 选测算法没退化（24 条断言）
-python3 scripts/ci/affected.py --audit        # 覆盖体检
-bash scripts/ci/pytest.sh                     # 真在本机跑一遍（MODE=cpu）
-python3 scripts/ci/gate.py judge --mode pr    # 用手写的 env 验判定
-python3 scripts/ci/image.py tag --dry-run     # 看当前内容的镜像 tag
+python3 scripts/ci/select_plan.py --self-test    # 选测算法没退化（24 条断言）
+python3 scripts/ci/select_plan.py --audit        # 覆盖体检
+bash scripts/ci/run_tests.sh                     # 真在本机跑一遍（MODE=cpu）
+python3 scripts/ci/report_gate.py judge --mode pr    # 用手写的 env 验判定
+python3 scripts/ci/build_image.py tag --dry-run     # 看当前内容的镜像 tag
 
 # 某个改动会被怎么选（含四个泳道开关）
-python3 scripts/ci/affected.py --changed-file src/torchturbo/engine/core.py --explain
+python3 scripts/ci/select_plan.py --changed-file src/torchturbo/engine/core.py --explain
 
 # 装完依赖 torch 有没有被 pip 换掉
-python3 scripts/ci/env.py capture --file /tmp/t.json
-python3 scripts/ci/env.py check   --file /tmp/t.json
+python3 scripts/ci/env_pod.py capture --file /tmp/t.json
+python3 scripts/ci/env_pod.py check   --file /tmp/t.json
 ```
 
 验泳道判定最快的方法（不跑 CI，只看 gate 怎么说）：
@@ -375,7 +375,7 @@ python3 scripts/ci/env.py check   --file /tmp/t.json
 ```bash
 run() { env R_SEL=$1 SEL_STAGE=$2 R_CPU_UNIT=$3 R_NPU_UNIT=$4 R_NPU_MODEL=$5 \
   CPU_UNIT_RUN=$6 NPU_UNIT_RUN=$7 NPU_MODEL_RUN=$8 STRICT=false SUMMARY=t \
-  python3 scripts/ci/gate.py judge --mode pr; }
+  python3 scripts/ci/report_gate.py judge --mode pr; }
 
 run success ok      skipped skipped skipped false false false  # 改文档：什么都不跑
 run success ok      success skipped skipped true  false false  # 改模型：cpu-unit

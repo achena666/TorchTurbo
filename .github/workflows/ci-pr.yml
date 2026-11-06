@@ -45,7 +45,7 @@ permissions:
   actions: read          # gate timing reads created_at / run_started_at
 
 env:
-  # Not MODE: pytest.sh reads MODE as cpu/npu.
+  # Not MODE: run_tests.sh reads MODE as cpu/npu.
   CI_MODE: ${{ github.event_name == 'pull_request' && 'pr' || inputs.mode }}
 
 jobs:
@@ -84,19 +84,19 @@ jobs:
           ./actionlint -color
 
       - name: hadolint
-        run: bash scripts/ci/lint.sh hadolint docker/npu/Dockerfile_aarch64
+        run: bash scripts/ci/check_static.py hadolint docker/npu/Dockerfile_aarch64
 
       - name: resolve image
         id: image
         env:
           OVERRIDE: ${{ vars.BASE_IMAGE_TAG }}
         run: |
-          REF=$(python3 scripts/ci/image.py resolve --override "$OVERRIDE" \
+          REF=$(python3 scripts/ci/build_image.py resolve --override "$OVERRIDE" \
             --fallback 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest')
           echo "image=$REF" >> "$GITHUB_OUTPUT"
           echo "image: $REF"
 
-      # Labels -> flags live in affected.py; a copy here would be a second
+      # Labels -> flags live in select_plan.py; a copy here would be a second
       # definition of what ci:e2e means.
       - name: resolve plan
         id: pick
@@ -107,7 +107,7 @@ jobs:
         run: |
           set -uo pipefail
           # Empty diff (no history / no info) -> full run: fail-open on purpose.
-          python3 scripts/ci/affected.py --changed-from git \
+          python3 scripts/ci/select_plan.py --changed-from git \
             --dump-changed /tmp/changed.txt \
             --mode "$CI_MODE" --labels "$LABELS" \
             --with-e2e "$WITH_E2E" --force-all "$FORCE_INPUT" \
@@ -115,7 +115,7 @@ jobs:
             --summary-file "$GITHUB_STEP_SUMMARY" \
             --image-ref '${{ steps.image.outputs.image }}'
 
-          python3 scripts/ci/affected.py --self-test
+          python3 scripts/ci/select_plan.py --self-test
 
       # Last and always(): outputs are still published when the job fails.
       - name: record stage
@@ -125,7 +125,7 @@ jobs:
           JOB_STATUS: ${{ job.status }}
           STATIC_OUTCOME: ${{ steps.static.outcome }}
           PICK_OUTCOME: ${{ steps.pick.outcome }}
-        run: bash scripts/ci/lint.sh stage
+        run: bash scripts/ci/check_static.py stage
 
   # No matrix, no shards: either would put one box per entry on the graph.
   l1_cpu_unit:
@@ -156,10 +156,10 @@ jobs:
           RESULT_JSON: /tmp/ci-result.json
         run: |
           set -uo pipefail
-          python3 scripts/ci/result.py init --file "$RESULT_JSON" \
+          python3 scripts/ci/report_result.py init --file "$RESULT_JSON" \
             kind=pytest model_type=pytest-cpu-unit mode=cpu \
             runner_label="${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}"
-          bash scripts/ci/deps.sh install
+          bash scripts/ci/install_deps.sh install
 
       - name: pytest
         env:
@@ -167,7 +167,7 @@ jobs:
           TEST_FILES: ${{ needs.select.outputs.cpu_unit_files }}
           TEST_PATH: ${{ inputs.test_path }}
           RESULT_JSON: /tmp/ci-result.json
-        run: bash scripts/ci/pytest.sh
+        run: bash scripts/ci/run_tests.sh
 
       - name: summary
         if: always()
@@ -175,9 +175,9 @@ jobs:
           RESULT_JSON: /tmp/ci-result.json
         run: |
           set -uo pipefail
-          python3 scripts/ci/result.py report --file "$RESULT_JSON" \
+          python3 scripts/ci/report_result.py report --file "$RESULT_JSON" \
             --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
-          python3 scripts/ci/result.py notice --file "$RESULT_JSON" \
+          python3 scripts/ci/report_result.py notice --file "$RESULT_JSON" \
             --model-type pytest-cpu-unit || true
 
   # Containerised, and the whole lane runs once it starts: operators and images
@@ -213,24 +213,24 @@ jobs:
           RESULT_JSON: /tmp/ci-result.json
         run: |
           set -uo pipefail
-          python3 scripts/ci/result.py init --file "$RESULT_JSON" \
+          python3 scripts/ci/report_result.py init --file "$RESULT_JSON" \
             kind=pytest model_type=pytest-npu-unit mode=npu \
             runner_label="${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}" \
             image="${{ needs.select.outputs.image }}"
 
           # Snapshot torch first; a swapped torch looks like a code bug.
-          python3 scripts/ci/env.py capture --file /tmp/torch-before.json || true
+          python3 scripts/ci/env_pod.py capture --file /tmp/torch-before.json || true
 
           uname -m; nproc; free -h | head -2; df -h / | tail -1; python -V
 
       - name: npu self-check
-        run: bash scripts/ci/train.sh probe
+        run: bash scripts/ci/run_train.sh probe
 
       - name: install
         env:
           MODE: npu
           RESULT_JSON: /tmp/ci-result.json
-        run: bash scripts/ci/deps.sh install
+        run: bash scripts/ci/install_deps.sh install
 
       - name: pytest
         env:
@@ -238,7 +238,7 @@ jobs:
           TEST_FILES: '[]'
           TEST_PATH: ${{ inputs.test_path }}
           RESULT_JSON: /tmp/ci-result.json
-        run: bash scripts/ci/pytest.sh
+        run: bash scripts/ci/run_tests.sh
 
       - name: summary
         if: always()
@@ -246,12 +246,12 @@ jobs:
           RESULT_JSON: /tmp/ci-result.json
         run: |
           set -uo pipefail
-          python3 scripts/ci/result.py report --file "$RESULT_JSON" \
+          python3 scripts/ci/report_result.py report --file "$RESULT_JSON" \
             --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
-          python3 scripts/ci/result.py notice --file "$RESULT_JSON" \
+          python3 scripts/ci/report_result.py notice --file "$RESULT_JSON" \
             --model-type pytest-npu-unit || true
 
-  # Profiles loop inside the job (train.sh lane): a matrix would put one box per
+  # Profiles loop inside the job (run_train.sh lane): a matrix would put one box per
   # profile on the graph.
   l3_npu_model:
     name: npu-model-tests
@@ -282,7 +282,7 @@ jobs:
 
       # 20 s to find "no NPU" beats discovering it after installing deps.
       - name: npu and stack self-check
-        run: bash scripts/ci/train.sh probe
+        run: bash scripts/ci/run_train.sh probe
 
       - name: train
         id: lane
@@ -298,15 +298,15 @@ jobs:
           FETCH_TIMEOUT: '600'
           DIAG: 'true'
           RESULT_JSON: /tmp/ci-result.json
-        run: bash scripts/ci/train.sh lane
+        run: bash scripts/ci/run_train.sh lane
 
       # timeout-minutes only kills the process; children would keep the cards.
       - name: cleanup
         if: always()
         continue-on-error: true
-        run: python3 scripts/ci/env.py cleanup
+        run: python3 scripts/ci/env_pod.py cleanup
 
-  # Sole required check; the rules live in gate.py so pr/full cannot drift.
+  # Sole required check; the rules live in report_gate.py so pr/full cannot drift.
   # select is a direct dep: a failed plan skips the lanes in seconds.
   gate:
     name: gate
@@ -320,7 +320,7 @@ jobs:
       - name: timing
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 scripts/ci/gate.py timing
+        run: python3 scripts/ci/report_gate.py timing
 
       - name: judge
         env:
@@ -333,8 +333,8 @@ jobs:
           NPU_UNIT_RUN: ${{ needs.select.outputs.npu_unit_run }}
           NPU_MODEL_RUN: ${{ needs.select.outputs.npu_model_run }}
           SKIP_REASON: ${{ needs.l3_npu_model.outputs.skip_reason }}
-          # Only the string is passed; gate.py decides what ci:e2e:strict means.
+          # Only the string is passed; report_gate.py decides what ci:e2e:strict means.
           LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
           IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
           SUMMARY: ${{ needs.select.outputs.summary }}
-        run: python3 scripts/ci/gate.py judge --mode "$CI_MODE"
+        run: python3 scripts/ci/report_gate.py judge --mode "$CI_MODE"

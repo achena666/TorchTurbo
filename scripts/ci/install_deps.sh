@@ -9,7 +9,7 @@
 #   MODE                cpu | npu
 #   TRANSFORMERS_SPEC   可选的额外版本约束（空 = 用镜像自带的）
 #   RESULT_JSON         事实文件
-#   TORCH_BEFORE        npu 泳道的 torch 快照（env.py capture 产出）
+#   TORCH_BEFORE        npu 泳道的 torch 快照（env_pod.py capture 产出）
 #
 # 为什么这些不能留在 yaml 里：`PIPESTATUS`、`tee` 与 `set -o pipefail` 的
 # 组合很容易写错一步就把失败吞掉，而失败吞掉的后果是「装了一半也继续跑」，
@@ -24,7 +24,7 @@ TRANSFORMERS_SPEC="${TRANSFORMERS_SPEC:-}"
 TORCH_BEFORE="${TORCH_BEFORE:-/tmp/torch-before.json}"
 LOG="${LOG:-/tmp/turbo.log}"
 
-result() { python3 "$CI_SCRIPTS/result.py" "$@"; }
+result() { python3 "$CI_SCRIPTS/report_result.py" "$@"; }
 
 # 跑一条 pip，日志 tee 出去（失败时是唯一线索），rc 走 PIPESTATUS。
 pip_run() {                         # pip_run <首次?> <参数...>
@@ -55,7 +55,7 @@ cmd_install() {
     print_versions
     if [ "$rc" -eq 0 ]; then
       # pip 解依赖时可能一声不响地把自建 wheel 换成 PyPI 的。
-      python3 "$CI_SCRIPTS/env.py" check --file "$TORCH_BEFORE" || rc=1
+      python3 "$CI_SCRIPTS/env_pod.py" check --file "$TORCH_BEFORE" || rc=1
     fi
   else
     # 裸机：pyproject 钉的 torch 只有 NPU 镜像里才有，GH 托管机装不上，

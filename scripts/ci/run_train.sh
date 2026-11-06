@@ -34,7 +34,7 @@ MAP="${MAP:-.github/workflows/model_map.json}"
 : "${DIAG:=false}"; : "${FETCH_TIMEOUT:=600}"; : "${STRICT:=false}"
 : "${INSTALL_SCRIPT:=}"; : "${TRAIN_SCRIPT:=}"; : "${E2E_PROFILES:=[]}"
 
-result() { python3 "$CI_SCRIPTS/result.py" "$@"; }
+result() { python3 "$CI_SCRIPTS/report_result.py" "$@"; }
 
 # 每步都落一条 phase，摘要里按执行顺序列表。
 phase_run() {                       # phase_run <名字> <命令...>
@@ -51,7 +51,7 @@ phase_run() {                       # phase_run <名字> <命令...>
 
 # ---------------------------------------------------------------- prepare
 # 先确认这个 model_type 真能跑，再去装依赖；否则白等几十分钟。
-# 字段：run_dir lf swift hf_repo e2e（顺序由 result.py 的 _MAP_FIELDS 决定）
+# 字段：run_dir lf swift hf_repo e2e（顺序由 report_result.py 的 _MAP_FIELDS 决定）
 cmd_prepare() {
   result init --file "$RESULT_JSON" \
     kind=train model_type="$MODEL_TYPE" framework="$FRAMEWORK" \
@@ -61,7 +61,7 @@ cmd_prepare() {
   [ -f "$MAP" ] || { echo "::error::缺少 $MAP"; return 1; }
 
   # 映射表是 JSON，用 awk 取字段就得现写一个 JSON 解析器 —— 所以让
-  # result.py 读，shell 只负责把值读进变量。字段顺序见 _MAP_FIELDS。
+  # report_result.py 读，shell 只负责把值读进变量。字段顺序见 _MAP_FIELDS。
   local row
   if ! row=$(result map-row --map "$MAP" --model-type "$MODEL_TYPE"); then
     echo "::error::model_type '$MODEL_TYPE' 不在 $MAP 里；可选项："
@@ -129,17 +129,17 @@ cmd_prepare() {
 
 # ---------------------------------------------------------------- probe
 # 花 20 s 发现「没有 NPU」，比装完两套依赖再发现省一整轮超时，
-# 而且那时的报错长得像训练 bug。env.py verify 会真的在每张卡上算一次 matmul，
+# 而且那时的报错长得像训练 bug。env_pod.py verify 会真的在每张卡上算一次 matmul，
 # 这是唯一能区分「没设备」和「有设备但栈坏了」的检查。
 cmd_probe() {
   # 在任何 pip 之前记录；install 会拿它比对。
-  python3 "$CI_SCRIPTS/env.py" capture --file /tmp/torch-before.json
+  python3 "$CI_SCRIPTS/env_pod.py" capture --file /tmp/torch-before.json
 
   ls /dev/davinci* >/dev/null 2>&1 \
     || { echo "::error::no /dev/davinci*, NPUs not mapped into the pod"; return 1; }
   echo "davinci count: $(ls /dev/davinci* | wc -l)"
 
-  phase_run '②b NPU 自检' python3 "$CI_SCRIPTS/env.py" verify
+  phase_run '②b NPU 自检' python3 "$CI_SCRIPTS/env_pod.py" verify
 }
 
 # ---------------------------------------------------------------- install
@@ -180,7 +180,7 @@ PROBE
   cat /tmp/after.txt
 
   if [ "$rc" -eq 0 ]; then
-    python3 "$CI_SCRIPTS/env.py" check --file /tmp/torch-before.json || rc=1
+    python3 "$CI_SCRIPTS/env_pod.py" check --file /tmp/torch-before.json || rc=1
   fi
   result phase --file "$RESULT_JSON" --name "$name" --seconds "$elapsed" --rc "$rc"
   echo "::notice::${name} 耗时 ${elapsed}s（rc=${rc}）"
@@ -229,14 +229,14 @@ cmd_run() {
   : > "$cache_out"
 
   if [ -n "$MODEL_HINT" ]; then
-    if r=$(python3 "$CI_SCRIPTS/model.py" probe --dir "$MODEL_HINT"); then
+    if r=$(python3 "$CI_SCRIPTS/fetch_model.py" probe --dir "$MODEL_HINT"); then
       model=$MODEL_HINT; bytes=${r% *}; shards=${r#* }; hit=yes
       echo "使用显式模型：$model  bytes=$bytes shards=$shards"
     else
       echo "::error::train_model_path 不完整：$MODEL_HINT"; return 1
     fi
   else
-    python3 "$CI_SCRIPTS/model.py" find --repo "$hf_repo" \
+    python3 "$CI_SCRIPTS/fetch_model.py" find --repo "$hf_repo" \
       --marker "$marker" --output "$cache_out"
     # find writes uppercase MODEL / BYTES / SHARDS / HIT; the rest of this
     # function works in lowercase. Sourcing alone leaves `model` empty, which
@@ -246,7 +246,7 @@ cmd_run() {
     . "$cache_out"
     if [ "${HIT:-no}" = yes ]; then
       model="${MODEL:-}"; bytes="${BYTES:-0}"; shards="${SHARDS:-0}"
-      [ -n "$model" ] || { echo "::error::model.py find 报了 HIT 但没给 MODEL"; return 1; }
+      [ -n "$model" ] || { echo "::error::fetch_model.py find 报了 HIT 但没给 MODEL"; return 1; }
       echo "缓存命中：$model"
     else
       local fetch_start trc
@@ -254,13 +254,13 @@ cmd_run() {
       if [ -z "${LAYERS:-0}" ] || [ "${LAYERS:-0}" -eq 0 ]; then
         model="/root/.cache/models/$hf_repo"
         echo "::notice::缓存未命中（sfs=${uuid:-?}），下载 $hf_repo"
-        timeout "$FETCH_TIMEOUT" python3 "$CI_SCRIPTS/model.py" fetch \
+        timeout "$FETCH_TIMEOUT" python3 "$CI_SCRIPTS/fetch_model.py" fetch \
           --repo "$hf_repo" --dir "$model"
         trc=$?
       else
         model="/root/.cache/models/$(basename "$hf_repo")-L${LAYERS}"
         echo "::notice::缓存未命中（sfs=${uuid:-?}），裁剪 $hf_repo 到 $LAYERS 层"
-        timeout "$FETCH_TIMEOUT" python3 "$CI_SCRIPTS/model.py" trim \
+        timeout "$FETCH_TIMEOUT" python3 "$CI_SCRIPTS/fetch_model.py" trim \
           --repo "$hf_repo" --dir "$model" --layers "$LAYERS"
         trc=$?
       fi
@@ -272,11 +272,11 @@ cmd_run() {
         echo "::error::模型获取失败（rc=${trc}）：$hf_repo"
         return 1
       fi
-      if ! r=$(python3 "$CI_SCRIPTS/model.py" probe --dir "$model"); then
+      if ! r=$(python3 "$CI_SCRIPTS/fetch_model.py" probe --dir "$model"); then
         echo "::error::模型不完整：$model"; return 1
       fi
       bytes=${r% *}; shards=${r#* }
-      python3 "$CI_SCRIPTS/model.py" mark --dir "$model" --text "$marker"
+      python3 "$CI_SCRIPTS/fetch_model.py" mark --dir "$model" --text "$marker"
     fi
   fi
   echo "model: $model  bytes=$bytes shards=$shards  layers=${LAYERS:-0}"
@@ -296,14 +296,14 @@ cmd_run() {
 
   plan_out=/tmp/plan.out
   : > "$plan_out"
-  python3 "$CI_SCRIPTS/parallel_plan.py" \
+  python3 "$CI_SCRIPTS/plan_parallel.py" \
     --yaml "$src" --cards "$NPUS_PER_NODE" \
     --sp "$SP_IN" --ep "$EP_IN" --layers "${LAYERS:-0}" \
     --out "/tmp/tt_${MODEL_TYPE}.yaml" --output "$plan_out"
   # shellcheck disable=SC1090
   . "$plan_out"
   [ -n "${SP:-}" ] && [ -n "${EP:-}" ] \
-    || { echo "::error::并行策略推导失败（见上面的 parallel_plan.py 输出）"; return 1; }
+    || { echo "::error::并行策略推导失败（见上面的 plan_parallel.py 输出）"; return 1; }
   echo "train script: $TRAIN_SCRIPT"
   echo "tt_config: $TT_CONFIG"
 
@@ -325,7 +325,7 @@ cmd_run() {
 
   local train_out=/tmp/train_meta.out elapsed=0 last_loss="" watchdog=no stuck=no
   : > "$train_out"
-  bash "$CI_SCRIPTS/train_supervisor.sh" \
+  bash "$CI_SCRIPTS/supervise_train.sh" \
     --script "$TRAIN_SCRIPT" --log /tmp/train.log --output "$train_out"
   local rc=$?
   # shellcheck disable=SC1090

@@ -1,14 +1,20 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Lint 静态检查：不跑模型、不起 NPU，几十秒内把「结构性错误」挡住。
 
-五项：
+子命令（默认 static）：
+
+    static            六项静态检查
+    static --only X   只跑其中一项（训练侧只用 map）
+    hadolint [Docker] Dockerfile 检查，二进制而不是镜像：hadolint/hadolint
+                      只有 amd64，而 CI_CPU_RUNNER 默认是 arm64 托管机
+    stage             把「倒在哪一步」写成 step output（select 的收尾）
+
+六项：
 
 1. 语法编译      —— src / scripts / tests 全部 py_compile
 2. workflow 解析 —— .github/workflows/*.yml 能被 YAML 解析，且有 on / jobs
 3. 映射表漂移    —— 代码里 @register_model 的名字必须都在 model_map.json 里
 4. 决策层契约    —— workflow 读的 `needs.select.outputs.X` 必须真的被声明。
-   这一条踩过：`affected.py` 算了 `targets` 却没人读，`select` 输出的是
+   这一条踩过：`select_plan.py` 算了 `targets` 却没人读，`select` 输出的是
    全部 144 个文件，选测静默失效了好几天。现在只要有一边拼错就红。
 5. 选择器防篡改  —— `scripts/ci/**` 改动必须走全量（`ci-config-changed` 阀门）。
    否则一个 PR 可以把自己的选择器改成「永远选 0 个测试」并且全绿。
@@ -21,15 +27,22 @@ from __future__ import annotations
 
 import glob
 import json
+import os
+import platform
 import py_compile
 import re
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 MAP = ROOT / ".github" / "workflows" / "model_map.json"
 PKG = "torchturbo"
+
+# 注册了但刻意不进映射表的模型：它们没有独立启动脚本、也不参与 CI。
+# 放进映射表反而会让选测把它们算进 E2E，而它们跑不起来。
+NOT_IN_CI = {"qwen3_5_moe_text"}
 
 
 def check_compile() -> list[str]:
@@ -86,6 +99,7 @@ def check_model_map() -> list[str]:
     for path in sorted((ROOT / "src" / PKG / "models").glob("*/model.py")):
         src = path.read_text(encoding="utf-8")
         registered.update(re.findall(r'@register_model\(\s*["\']([^"\']+)["\']', src))
+    registered -= NOT_IN_CI
 
     bad: list[str] = []
     mapped: set[str] = set()
@@ -148,12 +162,12 @@ def check_contract() -> list[str]:
     out = Path("/tmp/tt_lane_probe.txt")
     out.unlink(missing_ok=True)
     rc = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "ci" / "affected.py"),
+        [sys.executable, str(ROOT / "scripts" / "ci" / "select_plan.py"),
          "--changed-file", "pyproject.toml", "--github-output", str(out)],
         capture_output=True, text=True,
     ).returncode
     if rc != 0:
-        bad.append(f"affected.py 跑不通（rc={rc}），决策层不可用")
+        bad.append(f"select_plan.py 跑不通（rc={rc}），决策层不可用")
     else:
         written = {
             line.split("=", 1)[0]
@@ -161,7 +175,7 @@ def check_contract() -> list[str]:
         }
         for key in needed:
             if key not in written:
-                bad.append(f"affected.py 没有产出 {key}（工作流会拿到空字符串 → 静默不跑）")
+                bad.append(f"select_plan.py 没有产出 {key}（工作流会拿到空字符串 → 静默不跑）")
 
     # 2. 每个 workflow：读到的 needs.select.outputs.X 必须已声明
     for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
@@ -187,10 +201,10 @@ def check_contract() -> list[str]:
         for name, body in dump.items():
             if "check_static.py" not in body:
                 continue
-            if "affected.py" not in body:
+            if "select_plan.py" not in body:
                 bad.append(f"{rel}: {name} 只跑静态检查、不算计划 —— 两者应同 job")
-            elif body.index("check_static.py") > body.index("affected.py"):
-                bad.append(f"{rel}: {name} 里 affected.py 排在 check_static.py 之前")
+            elif body.index("check_static.py") > body.index("select_plan.py"):
+                bad.append(f"{rel}: {name} 里 select_plan.py 排在 check_static.py 之前")
 
         # 4. 计划只能有一个地方算：两处各算一次，必然慢慢分叉。
         planners = [n for n, body in dump.items() if "--changed-from git" in body]
@@ -230,7 +244,7 @@ def check_contract() -> list[str]:
                 bad.append(f"{rel}: gate 的 needs 缺 select（提前结束通路断了）")
 
         # 6. 事件语义不许回到 yaml。标签 -> 开关的换算只在
-        #    affected.py 的 flags_from_event() 里；yaml 里再写一遍就是两份
+        #    select_plan.py 的 flags_from_event() 里；yaml 里再写一遍就是两份
         #    实现，加一个标签必然漏改一边，而漏改不会报错，只会少跑。
         bad += _check_no_event_semantics(rel, text)
 
@@ -246,7 +260,7 @@ RUN_BLOCK_LIMIT = 14      # 含 set -uo pipefail 之类的骨架行
 
 
 def _check_no_event_semantics(rel: str, text: str) -> list[str]:
-    """标签名不该出现在 workflow 的**逻辑**里 —— 它只属于 affected.py。
+    """标签名不该出现在 workflow 的**逻辑**里 —— 它只属于 select_plan.py。
 
     `description:` 里的提及是文档（给人看的手动触发说明），不算判定。
     """
@@ -258,7 +272,7 @@ def _check_no_event_semantics(rel: str, text: str) -> list[str]:
                 continue
             if tag in body:
                 bad.append(f"{rel}: workflow 里出现标签判定 `{tag}`，"
-                           "应交给 affected.py 的 flags_from_event")
+                           "应交给 select_plan.py 的 flags_from_event")
                 break
     return bad
 
@@ -283,13 +297,13 @@ def check_selector_guard() -> list[str]:
     `ci-config-changed` 是唯一拦住这个的口子：它把 `.github/**` 与
     `scripts/ci/**` 的改动一律当全量。
     """
-    src = (ROOT / "scripts" / "ci" / "affected.py").read_text(encoding="utf-8")
+    src = (ROOT / "scripts" / "ci" / "select_plan.py").read_text(encoding="utf-8")
     bad: list[str] = []
     if "ci-config-changed" not in src:
-        bad.append("affected.py 丢了 ci-config-changed 阀门：改选择器不再触发全量")
+        bad.append("select_plan.py 丢了 ci-config-changed 阀门：改选择器不再触发全量")
     for prefix in (".github/", "scripts/ci/"):
         if prefix not in src:
-            bad.append(f"affected.py 的 ci-config-changed 没覆盖 {prefix}")
+            bad.append(f"select_plan.py 的 ci-config-changed 没覆盖 {prefix}")
     print(f"selector: {len(bad)} 个问题")
     return bad
 
@@ -297,7 +311,7 @@ def check_selector_guard() -> list[str]:
 def check_npu_rule() -> list[str]:
     """「要不要真卡」只能有一份判据，否则漂了不会报错。
 
-    这条规则原先在 tests/conftest.py、affected.py、pytest.sh 各写了一遍
+    这条规则原先在 tests/conftest.py、select_plan.py、run_tests.sh 各写了一遍
     （都是 `"torch_npu" in ...`）。三份独立实现不会互相报错，只会
     **静默换掉跑的集合**：实测它把仅有注释提及 torch_npu 的 CPU 测试拖上了卡，
     又把要 `fla_npu` / `torch.npu` 的文件漏在两条泳道之外。
@@ -312,8 +326,8 @@ def check_npu_rule() -> list[str]:
 
     consumers = {
         "tests/conftest.py": "npu_rule",
-        "scripts/ci/affected.py": "npu_rule",
-        "scripts/ci/pytest.sh": "npu_rule.py",
+        "scripts/ci/select_plan.py": "npu_rule",
+        "scripts/ci/run_tests.sh": "npu_rule.py",
     }
     for rel, marker in consumers.items():
         path = ROOT / rel
@@ -358,6 +372,57 @@ def check_npu_rule() -> list[str]:
     return bad
 
 
+# 动词在前，读者第一眼就知道这个文件「做什么」。跟 transformers 的
+# check_*.py / pytorch 的 win-test.sh 同一个套路。
+NAME_PREFIXES = (
+    "check", "select", "report", "fetch", "plan",
+    "build", "install", "run", "supervise", "env", "npu",
+)
+
+
+def check_naming() -> list[str]:
+    """文件名要能自解释，而且不能有没人调用的死脚本。
+
+    两个理由：
+
+    * 文件名是读者唯一一定看到的东西。`lane`、`checks` 这种词是项目黑话，
+      三个月后连作者也要点进去才知道它干什么。
+    * 下沉到这里的脚本一旦没人调用，就是悄悄腐化的开始 —— 它不在任何 CI 路径
+      上，改坏了不会红。这条检查把「删掉」变成默认动作。
+    """
+    bad: list[str] = []
+    scripts = sorted(
+        p for p in (ROOT / "scripts" / "ci").iterdir()
+        if p.suffix in {".py", ".sh"}
+    )
+
+    for path in scripts:
+        if path.stem.split("_")[0] not in NAME_PREFIXES:
+            bad.append(
+                f"scripts/ci/{path.name}: 前缀必须是 "
+                + " / ".join(f"{p}_" for p in NAME_PREFIXES)
+            )
+
+    # 被谁引用：workflow、其它脚本、或 tests（npu_rule 就是 conftest.py 调的）。
+    sources: dict[Path, str] = {}
+    for pattern, base in (
+        (".github/workflows/*.yml", ROOT),
+        ("scripts/ci/*.py", ROOT),
+        ("scripts/ci/*.sh", ROOT),
+        ("tests/**/*.py", ROOT),
+    ):
+        for f in base.glob(pattern):
+            sources[f] = f.read_text(encoding="utf-8", errors="ignore")
+
+    for path in scripts:
+        blob = "\n".join(text for f, text in sources.items() if f != path)
+        if path.name not in blob:
+            bad.append(f"scripts/ci/{path.name}: 没有任何调用方，删除或接进 CI")
+
+    print(f"naming: {len(scripts)} 个脚本 / {len(bad)} 个问题")
+    return bad
+
+
 CHECKS = {
     "compile": check_compile,
     "workflows": check_workflows,
@@ -365,10 +430,68 @@ CHECKS = {
     "contract": check_contract,
     "selector": check_selector_guard,
     "npu-rule": check_npu_rule,
+    "naming": check_naming,
 }
 
 
+# ---------------------------------------------------------------- hadolint
+HADOLINT_VERSION = os.environ.get("HADOLINT_VERSION", "v2.15.1")
+
+
+def cmd_hadolint(dockerfile: str) -> int:
+    """二进制而不是 docker run：镜像只有 amd64，runner 默认 arm64。"""
+    arch = {"aarch64": "arm64", "arm64": "arm64",
+            "x86_64": "x86_64", "amd64": "x86_64"}.get(platform.machine())
+    if not arch:
+        print(f"::error::unsupported arch {platform.machine()}")
+        return 1
+    url = (f"https://github.com/hadolint/hadolint/releases/download/"
+           f"{HADOLINT_VERSION}/hadolint-linux-{arch}")
+    bin_path = "/tmp/hadolint"
+    try:
+        urllib.request.urlretrieve(url, bin_path)
+    except Exception as exc:                       # noqa: BLE001
+        print(f"::error::下载 hadolint 失败（{arch}）：{exc}")
+        return 1
+    os.chmod(bin_path, 0o755)
+    # --failure-threshold error：只拦解析类问题，不拦「建议钉版本」这类风格告警。
+    return subprocess.run(
+        [bin_path, "--failure-threshold", "error", dockerfile], check=False
+    ).returncode
+
+
+# ---------------------------------------------------------------- stage
+def cmd_stage() -> int:
+    """select 的收尾。必须 always()：失败之后 job status 才是 failure，
+    这一步正是用来分辨「静态挂了」和「计划挂了」。"""
+    def env(name: str) -> str:
+        return os.environ.get(name, "")
+
+    if env("JOB_STATUS") == "cancelled":
+        stage = "cancelled"
+    elif env("STATIC_OUTCOME") != "success":
+        stage = "static"
+    elif env("PICK_OUTCOME") != "success":
+        stage = "select"
+    else:
+        stage = "ok"
+
+    path = env("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"stage={stage}\n")
+    print(f"stage: {stage}")
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    if argv and argv[0] == "hadolint":
+        return cmd_hadolint(argv[1] if len(argv) > 1
+                            else "docker/npu/Dockerfile_aarch64")
+    if argv and argv[0] == "stage":
+        return cmd_stage()
+
+    argv = [a for a in argv if a != "static"]      # `static` 是默认，可写可不写
     # 训练侧只需要 map 那一项（它不跑全仓编译），其余调用方不带参数跑全部。
     only = ""
     if "--only" in argv:
