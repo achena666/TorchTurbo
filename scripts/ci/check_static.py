@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""L0 静态检查：不跑模型、不起 NPU，几十秒内把「结构性错误」挡住。
+"""Lint 静态检查：不跑模型、不起 NPU，几十秒内把「结构性错误」挡住。
 
 五项：
 
@@ -14,7 +14,7 @@
    否则一个 PR 可以把自己的选择器改成「永远选 0 个测试」并且全绿。
 
 第 3 项原本写在训练 workflow 的 ② 里，跑到那里才发现要白等一轮装依赖；
-放到 L0 才能在 20 s 内报出来。训练侧仍保留同样的检查（那里是最终防线）。
+放到 Lint 才能在 20 s 内报出来。训练侧仍保留同样的检查（那里是最终防线）。
 """
 
 from __future__ import annotations
@@ -112,7 +112,7 @@ def check_contract() -> list[str]:
         return []
 
     bad: list[str] = []
-    needed = ("l0_run", "l1_run", "l2a_run", "l2b_run", "l1_files")
+    needed = ("lint_run", "l1_run", "l2a_run", "l2b_run", "l1_files")
 
     # 1. 决策层真的会写这些 key 吗 —— 直接跑一次，别猜源码长什么样。
     #    这是唯一能同时挡住「忘了写」和「写错名字」的办法。
@@ -149,6 +149,34 @@ def check_contract() -> list[str]:
         # merge-base 需要历史；fetch-depth: 1 会让 diff 失败 → 静默退回全量。
         if "--changed-from git" in text and "fetch-depth: 0" not in text:
             bad.append(f"{rel}: 用了 --changed-from git 但 checkout 没设 fetch-depth: 0")
+
+        # 3. 拓扑：lint 必须排在 select **前面**（select 靠 needs 依赖它）。
+        #    写反了不会报错，只会变成「select 红了 lint 才跑」，等于白置一道闸。
+        jobs = doc.get("jobs") or {}
+        if "select" in jobs and "lint" in jobs:
+            sel_needs = jobs["select"].get("needs") or []
+            if isinstance(sel_needs, str):
+                sel_needs = [sel_needs]
+            if "lint" not in sel_needs:
+                bad.append(f"{rel}: select 没有 needs: lint（lint 就不是前置闸了）")
+            lint_needs = jobs["lint"].get("needs") or []
+            if isinstance(lint_needs, str):
+                lint_needs = [lint_needs]
+            if lint_needs:
+                bad.append(f"{rel}: lint 不应有 needs（它必须是链头），实为 {lint_needs}")
+
+        # 4. lint 阶段不允许去读 select 的输出（那时还没有 select）。
+        #    用 yaml dump 出来找，比按行切块稳——job 在文件里的物理顺序无关，
+        #    GitHub 只认 needs。
+        if "lint" in jobs:
+            lint_body = yaml.safe_dump(jobs["lint"], allow_unicode=True)
+            for name in sorted(set(
+                re.findall(r"needs\.select\.outputs\.([A-Za-z0-9_]+)", lint_body)
+            )):
+                bad.append(
+                    f"{rel}: lint 读了 needs.select.outputs.{name}，"
+                    f"但 lint 在 select 之前跑（该值恒为空）"
+                )
 
     print(f"contract: {len(needed)} 个 lane 输出 / {len(bad)} 个问题")
     return bad
@@ -254,7 +282,7 @@ def main(argv: list[str]) -> int:
     picked = [CHECKS[only]] if only in CHECKS else list(CHECKS.values())
     problems = [p for check in picked for p in check()]
     if not problems:
-        print("L0 OK")
+        print("Lint OK")
         return 0
     for p in problems:
         print(f"::error::{p}")

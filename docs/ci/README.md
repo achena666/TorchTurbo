@@ -5,9 +5,9 @@
 
 ```
 pull_request ──► ci-gate-pr.yml
+                   ├─ lint     编译 / workflow 解析 / 映射表 / 决策层契约 / 选择器防篡改
+                   │           (+actionlint +hadolint)   ← 链头，先跑
                    ├─ select   算改动 → 出计划（四个泳道开关 + 文件清单）
-                   ├─ L0       编译 / workflow 解析 / 映射表 / 决策层契约 / 选择器防篡改
-                   │           (+actionlint +hadolint)
                    ├─ L1       CPU pytest（affected 选中的文件 ×N 片）
                    ├─ L2a      NPU pytest（一旦开跑就泳道内全跑）
                    ├─ L2b      E2E：一个族内小模型跑一步
@@ -19,16 +19,38 @@ pull_request ──► ci-gate-pr.yml
                     ci-train.yml   训练一个模型
 ```
 
-## 三条泳道是**串行门控**，不是并行
+## 拓扑：lint 前置闸 + 三条泳道串行
 
 ```
-select ─► L0 ─► L1(CPU) ─► L2a(NPU 特性) ─► L2b(NPU 端到端)
+lint ─► select ─► L1(CPU) ─► L2a(NPU 特性) ─► L2b(NPU 端到端)
 ```
 
-用 `needs` 串起来，语义是**前面没过就不开后面的卡**：
+### 为什么 lint 在 select **前面**
+
+`select` 本身就是要跑的一段 Python（`affected.py`）。先跑 `check_static.py`，
+等于先验证「算计划的那个脚本能跑」，再拿它算计划；反过来写，语法错会先以一个
+难读的 traceback 冒出来，而且是在一个本该只负责"算计划"的 job 里。
+
+代价是 `lint` 读不到 `needs.select.outputs`（那时还没有 select）。所以：
+
+- `actionlint` / `hadolint` 改成**无条件跑**。原来靠 `ci_changed` / `docker_changed`
+  判断，那是为了省掉一次二进制下载（各 ~2 s）；为这点时间在 lint 里复制一份
+  diff 逻辑，等于给选择器开第二个实现——那正是本仓最想避免的漂移来源。
+- `ci_changed` / `docker_changed` 这两个 select 输出随之删除（已经没有消费者）。
+
+`check_static.py` 的 `contract` 检查里加了两条断言守这个拓扑，写反会当场报错：
+
+1. `select.needs` 必须包含 `lint`；`lint` 自己不许有 `needs`（它必须是链头）。
+2. `lint` 的 job 正文里不许出现 `needs.select.outputs.*`（那时恒为空）。
+
+### `needs` 串行带来的节省
+
+语义是**前面没过就不开后面的卡**：
 
 | 前一级 | 后一级 | 被拦住时省下 |
 |---|---|---|
+| lint | select / L1 / L2a / L2b | 全部（lint 只要 13 s，0 卡） |
+| select | L1 / L2a / L2b | 全部（计划没算出来就不知道该跑什么） |
 | L1 CPU | L2a / L2b | 2 卡 ~2 min + 8 卡 ~10 min |
 | L2a 特性 | L2b | 8 卡 ~10 min |
 
@@ -50,7 +72,7 @@ select ─► L0 ─► L1(CPU) ─► L2a(NPU 特性) ─► L2b(NPU 端到端)
 写在哪里、怎么恢复都留在原处。恢复后应该是：
 
 ```
-PR ──────────────► ci-gate-pr.yml（select -> L0 -> L1 -> L2a -> L2b -> gate）
+PR ──────────────► ci-gate-pr.yml（lint -> select -> L1 -> L2a -> L2b -> gate）
 每晚 ─────────────► ci-full.yml（全量，不选测）
 每晚 ─────────────► ci-image.yml（基础镜像，内容没变就跳过）
 手动 ─────────────► ci-pytest.yml / ci-train.yml
@@ -106,7 +128,7 @@ if: |
 不该跑而 `skipped` 是 ⏭（绿）。两边用**同一组变量名**，否则摘要会给出
 和实际执行相反的解释。
 
-### 决策层契约由 L0 看守
+### 决策层契约由 lint 看守
 
 `check_static.py` 的 `contract` 项会**真的跑一次** `affected.py`，断言那五个
 输出真的被写出来，再逐个 workflow 校验 `needs.select.outputs.X` 都已声明。
@@ -123,7 +145,7 @@ if: |
 表中 ✅ = 该泳道会跑；「—」= `*_run=false`，job 直接 skipped（带原因）。
 L2a 一旦开跑就是**泳道内全跑**（17 个含 `torch_npu` 的文件），不再往下筛。
 
-| 改动 | L0 | L1 CPU | L2a NPU | L2b E2E |
+| 改动 | lint | L1 CPU | L2a NPU | L2b E2E |
 |---|:--:|:--:|---|:--:|
 | `src/torchturbo/ops/**` | ✅ | 选中的 CPU 文件 | **✅ 全跑** | 最便宜画像 |
 | `src/torchturbo/models/<族>/**` | ✅ | 选中的 CPU 文件 | — | 该族画像 |
@@ -137,7 +159,7 @@ L2a 一旦开跑就是**泳道内全跑**（17 个含 `torch_npu` 的文件）�
 | `tests/**` | ✅ | affected | — | — |
 | `docs/**`、`*.md` | ✅ | — | — | — |
 
-L1 只跑选中的文件，所以「一个改文档的 PR」连 CPU 泳道都不开——L0 那 8 s
+L1 只跑选中的文件，所以「一个改文档的 PR」连 CPU 泳道都不开——lint 那 13 s
 就是它的全部成本。
 
 两张表对应两个脚本：路径 → 用例是 `scripts/ci/affected.py`，路径 → 画像在
@@ -283,7 +305,7 @@ timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
 ## 本地怎么验
 
 ```bash
-python3 scripts/ci/check_static.py            # L0 五项（含跑一次选择器验契约）
+python3 scripts/ci/check_static.py            # lint 六项（含跑一次选择器验契约）
 python3 scripts/ci/affected.py --self-test    # 选测算法没退化（24 条断言）
 python3 scripts/ci/affected.py --audit        # 覆盖体检
 bash scripts/ci/pytest.sh                     # 真在本机跑一遍（MODE=cpu）
@@ -301,14 +323,15 @@ python3 scripts/ci/env.py check   --file /tmp/t.json
 验泳道判定最快的方法（不跑 CI，只看 gate 怎么说）：
 
 ```bash
-run() { env R_SEL=success R_L0=$1 R_L1=$2 R_L2A=$3 R_L2B=$4 \
-  L1_RUN=$5 L2A_RUN=$6 L2B_RUN=$7 STRICT=false SUMMARY=t \
+run() { env R_LINT=$1 R_SEL=$2 R_L1=$3 R_L2A=$4 R_L2B=$5 \
+  L1_RUN=$6 L2A_RUN=$7 L2B_RUN=$8 STRICT=false SUMMARY=t \
   python3 scripts/ci/gate.py judge --mode pr; }
 
-run success skipped skipped skipped false false false   # 改文档：只有 L0
-run success success success skipped true  false true    # 改模型：L0+L1+L2b
-run success success skipped success true  true  true    # 改 ops：L0+L2a+L2b
-run success success success success true  true  true    # 全绿
+run success success skipped skipped skipped false false false  # 改文档：只有 lint
+run success success success skipped skipped true  false false  # 改模型：lint+L1
+run success success skipped success success false true  true   # 改 ops：lint+L2a+L2b
+run success success success success success true  true  true   # 全绿
+run failure skipped skipped skipped skipped true  true  true   # lint 红：后三条按设计未启动
 ```
 
 ## 一个刻意的取舍

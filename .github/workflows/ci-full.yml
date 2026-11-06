@@ -35,10 +35,12 @@ permissions:
 jobs:
   select:
     name: 全量选择
+    # 与 PR 门禁同构：lint 先跑，红了就没计划。
+    needs: lint
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10
     outputs:
-      l0_run: ${{ steps.pick.outputs.l0_run }}
+      lint_run: ${{ steps.pick.outputs.lint_run }}
       l1_run: ${{ steps.pick.outputs.l1_run }}
       l2a_run: ${{ steps.pick.outputs.l2a_run }}
       l2b_run: ${{ steps.pick.outputs.l2b_run }}
@@ -79,8 +81,8 @@ jobs:
           echo "image=$REF" >> "$GITHUB_OUTPUT"
           echo "镜像：$REF"
 
-  l0:
-    name: L0 静态检查
+  lint:
+    name: Lint 静态检查
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 15
     steps:
@@ -112,9 +114,9 @@ jobs:
 
   l1:
     name: L1 CPU（${{ matrix.shard }}）
-    needs: [select, l0]
+    needs: [select, lint]
     if: |
-      always() && needs.select.result == 'success' && needs.l0.result == 'success' &&
+      always() && needs.select.result == 'success' && needs.lint.result == 'success' &&
       needs.select.outputs.l1_run == 'true'
     strategy:
       fail-fast: false
@@ -132,9 +134,9 @@ jobs:
   l2a:
     name: L2a NPU 特性
     # 与 PR 门禁同一条链：CPU 绿了才开 NPU。
-    needs: [select, l0, l1]
+    needs: [select, lint, l1]
     if: |
-      always() && needs.select.result == 'success' && needs.l0.result == 'success' &&
+      always() && needs.select.result == 'success' && needs.lint.result == 'success' &&
       (needs.l1.result == 'success' ||
        (needs.l1.result == 'skipped' && needs.select.outputs.l1_run == 'false')) &&
       needs.select.outputs.l2a_run == 'true'
@@ -154,9 +156,9 @@ jobs:
     name: L2b E2E（${{ matrix.profile.model_type }}）
     # 链尾。always() 的理由同 ci-gate-pr.yml：L1/L2a 可能因为「本次不需要」
     # 而 skipped，不能被 needs 的隐式跳过带走。
-    needs: [select, l0, l1, l2a]
+    needs: [select, lint, l1, l2a]
     if: |
-      always() && needs.select.result == 'success' && needs.l0.result == 'success' &&
+      always() && needs.select.result == 'success' && needs.lint.result == 'success' &&
       (needs.l1.result == 'success' ||
        (needs.l1.result == 'skipped' && needs.select.outputs.l1_run == 'false')) &&
       (needs.l2a.result == 'success' ||
@@ -186,7 +188,7 @@ jobs:
 
   gate:
     name: gate
-    needs: [select, l0, l1, l2a, l2b]
+    needs: [select, lint, l1, l2a, l2b]
     if: always()
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10
@@ -203,7 +205,7 @@ jobs:
       - name: 判定
         env:
           R_SEL: ${{ needs.select.result }}
-          R_L0: ${{ needs.l0.result }}
+          R_LINT: ${{ needs.lint.result }}
           R_L1: ${{ needs.l1.result }}
           R_L2A: ${{ needs.l2a.result }}
           R_L2B: ${{ needs.l2b.result }}

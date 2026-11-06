@@ -485,7 +485,7 @@ def select(index: Index, changed: list[str], force_all: bool = False,
     l2b_run = bool(e2e)
 
     lanes = {
-        "l0": {
+        "lint": {
             "run": True,
             "why": "总是跑：只做静态检查，不执行仓库代码",
         },
@@ -613,10 +613,10 @@ def self_test(root: Path) -> int:
 
     # ---- 泳道开关（yaml 只读这四个值） ------------------------------------
     def lane_runs(r: dict) -> dict[str, bool]:
-        return {k: r["lanes"][k]["run"] for k in ("l0", "l1", "l2a", "l2b")}
+        return {k: r["lanes"][k]["run"] for k in ("lint", "l1", "l2a", "l2b")}
 
     r = select(index, ["docs/ci/README.md"])
-    check("文档 -> 只有 L0", lane_runs(r) == {"l0": True, "l1": False, "l2a": False, "l2b": False},
+    check("文档 -> 只有 lint", lane_runs(r) == {"lint": True, "l1": False, "l2a": False, "l2b": False},
           str(lane_runs(r)))
 
     r = select(index, ["src/torchturbo/ops/cross_entropy_loss.py"])
@@ -825,7 +825,7 @@ def main(argv: list[str]) -> int:
                 [f"{i}/{result['shards']}" for i in range(result['shards'])]
             ) + "\n")
             # 泳道开关：yaml 只读这四个值，不做任何判断。
-            for name in ("l0", "l1", "l2a", "l2b"):
+            for name in ("lint", "l1", "l2a", "l2b"):
                 fh.write(f"{name}_run={str(lanes[name]['run']).lower()}\n")
             # 这个名字是为了区分「L1 真的拿到了文件」与「L1 拿到全量」。
             # 因为 --github-output 一次只能写一行，用 JSON 数组传过去。

@@ -3,7 +3,7 @@ name: CI · PR 门禁
 # PR 只留一个 required check：gate。
 # 三条泳道并行，谁该跑由改动路径决定：
 #
-#   L0 静态     语法 / workflow 解析 / 映射表漂移    永远跑，几十秒
+#   Lint 静态   语法 / workflow 解析 / 映射表漂移    永远跑，几十秒，在 select 之前
 #   L1 CPU      affected 选中的用例（或全量分片）    gh 托管 arm64，裸机
 #   L2a NPU     需要 torch_npu 的那批用例            只有碰了 ops / 镜像 / 依赖才起
 #   L2b E2E     一个族内小模型跑一步                 只有路径命中才起
@@ -35,25 +35,26 @@ permissions:
 
 jobs:
   # ------------------------------------------------------------------ 选择
+  # 只在 lint 之后启动：lint 红了就不算计划。`needs` 的默认语义正好是
+  # 「上游不成功就不跑」，所以这里不写 if —— 少一个条件就少一处能写错的地方。
   select:
     name: 选择（select）
+    needs: lint
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10
     outputs:
       mode: ${{ steps.pick.outputs.mode }}
       npu: ${{ steps.pick.outputs.npu }}
       e2e: ${{ steps.pick.outputs.e2e }}
-      # l*_run 是决策层唯一需要下游读的东西：yaml 只读这四个布尔值，
-      # 不自己拼路径规则。四个值都在 scripts/ci/affected.py 里算。
-      l0_run: ${{ steps.pick.outputs.l0_run }}
+      # l*_run 是决策层唯一需要下游读的东西：yaml 只读这几个布尔值，
+      # 不自己拼路径规则。它们的值都在 scripts/ci/affected.py 里算。
+      lint_run: ${{ steps.pick.outputs.lint_run }}
       l1_run: ${{ steps.pick.outputs.l1_run }}
       l2a_run: ${{ steps.pick.outputs.l2a_run }}
       l2b_run: ${{ steps.pick.outputs.l2b_run }}
       l1_files: ${{ steps.pick.outputs.l1_files }}
       test_files: ${{ steps.pick.outputs.test_files }}
       shard_list: ${{ steps.pick.outputs.shard_list }}
-      ci_changed: ${{ steps.pick.outputs.ci_changed }}
-      docker_changed: ${{ steps.pick.outputs.docker_changed }}
       image: ${{ steps.image.outputs.image }}
       summary: ${{ steps.pick.outputs.summary }}
     steps:
@@ -87,19 +88,6 @@ jobs:
           echo "改动 $(wc -l < /tmp/changed.txt) 个文件"
           head -40 /tmp/changed.txt
 
-          # L0 的两个 lint 只在相关文件变了才跑：它们各需要下载一次二进制 /
-          # 拉一次镜像，日常 PR 不值得花这个时间。
-          if grep -qE '^\.github/|^scripts/ci/' /tmp/changed.txt; then
-            echo "ci_changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ci_changed=false" >> "$GITHUB_OUTPUT"
-          fi
-          if grep -qE '^docker/npu/' /tmp/changed.txt; then
-            echo "docker_changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "docker_changed=false" >> "$GITHUB_OUTPUT"
-          fi
-
           # 选择器自己也要被门禁：算法退化会静默少跑用例。
           python3 scripts/ci/affected.py --self-test
 
@@ -127,7 +115,7 @@ jobs:
             echo '| 项 | 值 |'
             echo '|---|---|'
             echo "| mode | \`${{ steps.pick.outputs.mode }}\` |"
-            echo "| L0 / L1 / L2a / L2b | \`${{ steps.pick.outputs.l0_run }} / ${{ steps.pick.outputs.l1_run }} / ${{ steps.pick.outputs.l2a_run }} / ${{ steps.pick.outputs.l2b_run }}\` |"
+            echo "| Lint / L1 / L2a / L2b | \`${{ steps.pick.outputs.lint_run }} / ${{ steps.pick.outputs.l1_run }} / ${{ steps.pick.outputs.l2a_run }} / ${{ steps.pick.outputs.l2b_run }}\` |"
             echo "| E2E | \`${{ steps.pick.outputs.e2e }}\` |"
             echo "| 分片 | \`${{ steps.pick.outputs.shard_list }}\` |"
             echo "| 镜像 | \`$REF\` |"
@@ -141,11 +129,19 @@ jobs:
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ------------------------------------------------------------------ L0
-  l0:
-    name: L0 静态检查
-    needs: select
-    if: always()
+  # ------------------------------------------------------------------ Lint
+  # 整条链的第一道闸。它只跑 13 s、不占卡，却能把「编译不过 / workflow 写错 /
+  # 映射表漂移 / 选择器被改坏」挡在任何卡启动之前。
+  #
+  # 为什么放在 select **前面**：select 本身就是一段要跑的 Python。先跑静态，
+  # 等于先验证「算计划的脚本能跑」，再拿它算计划；反过来语法错会先以一个
+  # 难读的 traceback 报出来。
+  #
+  # actionlint / hadolint 改成**无条件**跑（原来靠 needs.select.outputs 判断）：
+  # lint 在 select 之前，读不到它的输出；而为了一个「要不要跑 2 秒」的判断
+  # 去复制一份 diff 逻辑，等于给选择器开了第二个实现。两个都是秒级工具。
+  lint:
+    name: Lint 静态检查
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 15
     steps:
@@ -154,15 +150,14 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 语法 / workflow / 映射表
+      - name: 语法 / workflow / 映射表 / 决策层契约
         run: |
           set -uo pipefail
           python -m pip install --quiet pyyaml
           python3 scripts/ci/check_static.py
 
       # workflow 是近 300 次提交里改动最频繁的文件，写错了只能等下次跑起来才发现。
-      - name: actionlint（只在 .github/ 或 scripts/ci/ 变更时）
-        if: ${{ needs.select.outputs.ci_changed == 'true' }}
+      - name: actionlint
         run: |
           bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
           ./actionlint -color
@@ -173,8 +168,7 @@ jobs:
       # CI_CPU_RUNNER 默认是 arm64 托管机，跑起来只剩 exec format error。
       # --failure-threshold error：只拦「Dockerfile 解析不了」这类真实问题；
       # 钉版本（DL3008）之类的风格告警对自建镜像没有意义。
-      - name: hadolint（只在 docker/npu/ 变更时）
-        if: ${{ needs.select.outputs.docker_changed == 'true' }}
+      - name: hadolint
         run: |
           set -uo pipefail
           case "$(uname -m)" in
@@ -190,12 +184,12 @@ jobs:
   # ------------------------------------------------------------------ L1
   l1:
     name: L1 CPU（${{ matrix.shard }}）
-    # 链头：L0 没过就不占托管机。L0 只要 10 s，串起来的代价很小。
-    needs: [select, l0]
+    # 第一道闸：lint 没过就没计划，也就没 CPU 子集可跑。
+    needs: [select, lint]
     # `l1_run` 为 false 时这个 job 本就不该存在（本次没选中 CPU 测试），
     # 与「上游挂了」是两回事 —— 区分靠 select 的输出（详见 docs/ci/README.md）。
     if: |
-      always() && needs.select.result == 'success' && needs.l0.result == 'success' &&
+      always() && needs.select.result == 'success' && needs.lint.result == 'success' &&
       needs.select.outputs.l1_run == 'true'
     strategy:
       fail-fast: false
@@ -214,14 +208,14 @@ jobs:
   # ------------------------------------------------------------------ L2a
   l2a:
     name: L2a NPU 特性
-    needs: [select, l0, l1]
+    needs: [select, lint, l1]
     # 两件事分开写：
     #   1) L1 要么跑成功，要么是「本次本来就没有 CPU 测试」（l1_run=false）——
     #      后者不能拖累 NPU。`needs` 会把任何 skipped 传下去，所以得显式区分。
     #   2) fork PR 不起 L2：secrets 不给 fork，而「把 secrets 递到 fork 的
     #      代码上」等于把 RCE 送人（pull_request_target 就是这么出事的）。
     if: |
-      always() && needs.select.result == 'success' && needs.l0.result == 'success' &&
+      always() && needs.select.result == 'success' && needs.lint.result == 'success' &&
       (needs.l1.result == 'success' ||
        (needs.l1.result == 'skipped' && needs.select.outputs.l1_run == 'false')) &&
       needs.select.outputs.l2a_run == 'true' &&
@@ -246,9 +240,9 @@ jobs:
     # 链尾。为什么用 always() 而不是靠 needs 的隐式跳过：L1/L2a 都可能因为
     # 「本次不需要」而 skipped，而 needs 里任何 skipped 都会把下游一起带走。
     # E2E 与它们只是顺序关系，不是「必须都跑过」。
-    needs: [select, l0, l1, l2a]
+    needs: [select, lint, l1, l2a]
     if: |
-      always() && needs.select.result == 'success' && needs.l0.result == 'success' &&
+      always() && needs.select.result == 'success' && needs.lint.result == 'success' &&
       (needs.l1.result == 'success' ||
        (needs.l1.result == 'skipped' && needs.select.outputs.l1_run == 'false')) &&
       (needs.l2a.result == 'success' ||
@@ -286,7 +280,7 @@ jobs:
   # 会慢慢在两个文件里分叉。
   gate:
     name: gate
-    needs: [select, l0, l1, l2a, l2b]
+    needs: [select, lint, l1, l2a, l2b]
     if: always()
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10
@@ -303,11 +297,11 @@ jobs:
       - name: 判定
         env:
           R_SEL: ${{ needs.select.result }}
-          R_L0: ${{ needs.l0.result }}
+          R_LINT: ${{ needs.lint.result }}
           R_L1: ${{ needs.l1.result }}
           R_L2A: ${{ needs.l2a.result }}
           R_L2B: ${{ needs.l2b.result }}
-          L0_RUN: ${{ needs.select.outputs.l0_run }}
+          LINT_RUN: ${{ needs.select.outputs.lint_run }}
           L1_RUN: ${{ needs.select.outputs.l1_run }}
           L2A_RUN: ${{ needs.select.outputs.l2a_run }}
           L2B_RUN: ${{ needs.select.outputs.l2b_run }}
