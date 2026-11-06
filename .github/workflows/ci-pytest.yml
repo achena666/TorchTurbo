@@ -232,6 +232,10 @@ jobs:
             | tee /tmp/turbo.log
           RC=${PIPESTATUS[0]}
           ELAPSED=$(( $(date +%s) - START ))
+          # 把装完的实际版本打出来。基础镜像里的 transformers 是
+          # `pip install flash-linear-attention` 带进来的、无版本约束，
+          # 已经徙过两次；没有这一行，环境漂移只能等一堆用例变红才发现。
+          python -c "import transformers; print('transformers =', transformers.__version__)" || true
           [ "$RC" -eq 0 ] && { python3 "$CI_SCRIPTS/env.py" check --file /tmp/torch-before.json || RC=1; }
           python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
             --name '③ torchturbo 安装' --seconds "$ELAPSED" --rc "$RC"
@@ -292,7 +296,6 @@ jobs:
           # 声明对 torch 的依赖，一起解会让 pip 顺带装一份 GPU 版（几百 MB）。
           python -m pip install torch 2>&1 | tee /tmp/turbo.log
           RC=${PIPESTATUS[0]}
-          [ -n "${TRANSFORMERS_SPEC}" ] && python -m pip install "${TRANSFORMERS_SPEC}" 2>&1 | tee -a /tmp/turbo.log
           # `-e ".[test]"`：extras 里是测试真正 import 的那几个包，两条泳道
           # （镜像 / 裸机）必须装同一套，否则同一个测试一边绿一边红。
           # pyproject 里的 torch>=2.10.0 刚才已满足，不会重新下载。
@@ -300,6 +303,14 @@ jobs:
             python -m pip install --no-build-isolation -e ".[test]" 2>&1 | tee -a /tmp/turbo.log
             RC=${PIPESTATUS[0]}
           fi
+          # 手动覆盖版本时才装。默认留空 = 完全跟随 extras 解出来的版本，
+          # 与容器泳道（镜像自带）保持一致。
+          if [ "$RC" -eq 0 ] && [ -n "${TRANSFORMERS_SPEC}" ]; then
+            python -m pip install "${TRANSFORMERS_SPEC}" 2>&1 | tee -a /tmp/turbo.log
+            RC=${PIPESTATUS[0]}
+          fi
+          # 装完打一行实际版本：这是「两条泳道是否同一个 transformers」的唯一证据。
+          python -c "import transformers; print('transformers =', transformers.__version__)" || true
 
           python3 "$CI_SCRIPTS/result.py" phase --file "$RESULT_JSON" \
             --name '③ torchturbo 安装' --seconds "$(( $(date +%s) - START ))" --rc "$RC"
