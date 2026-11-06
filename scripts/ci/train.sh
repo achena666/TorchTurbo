@@ -389,10 +389,21 @@ cmd_lane() {
     if ! GITHUB_OUTPUT="$per" cmd_prepare; then
       rc=1
     else
+      # prepare writes lowercase keys (run_dir / install_script / train_script /
+      # hf_repo); install and run read the uppercase spellings. In a single
+      # workflow job the step outputs bridge the two, here nothing does, so
+      # map them explicitly -- empty values are silent (deps not installed,
+      # hf_repo='' -> HFValidationError hours later).
+      local run_dir install_script train_script hf_repo
       set -a
       # shellcheck disable=SC1090
-      . "$per"              # run_dir / install_script / train_script / hf_repo
+      . "$per"
       set +a
+      RUN_DIR="${run_dir:-}"
+      INSTALL_SCRIPT="${install_script:-}"
+      TRAIN_SCRIPT="${train_script:-}"
+      REPO_MAP="${hf_repo:-}"
+      export RUN_DIR INSTALL_SCRIPT TRAIN_SCRIPT REPO_MAP
       if ! cmd_install; then
         rc=1
       else
