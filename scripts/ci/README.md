@@ -7,11 +7,13 @@
 
 | 文件 | 回答的问题 | 子命令 |
 |---|---|---|
-| `affected.py` | 这次改动该跑什么？ | `--explain` / `--audit` / `--self-test` / `--changed-from git` |
+| `affected.py` | 这次改动该跑什么？ | `--explain` / `--audit` / `--self-test` / `--changed-from git` / `--mode pr\|full --labels …` |
 | `gate.py` | 这些结果算不算通过？ | `timing` / `judge --mode pr\|full` |
 | `check_static.py` | 语法 / workflow / 映射表对不对？ | `--only compile\|workflows\|map` |
 | `pytest.sh` | 这个泳道的测试怎么跑？ | 环境变量驱动（`MODE` / `SHARD` / …） |
-| `train.sh` | 一次训练冒烟分几步？ | `prepare` / `probe` / `install` / `run` / `report` |
+| `deps.sh` | 依赖怎么装？ | `install`（`MODE=cpu\|npu`） |
+| `lint.sh` | 静态检查工具怎么调？ | `hadolint [Dockerfile]` / `stage` |
+| `train.sh` | 一次训练冒烟分几步？ | `prepare` / `probe` / `install` / `run` / `report` / `lane` |
 | `model.py` | 模型目录能用吗？没有就弄一份 | `probe` / `find` / `mark` / `fetch` / `trim` |
 | `env.py` | 这台 pod 现在是什么状态？ | `verify` / `capture` / `check` / `cleanup` |
 | `image.py` | 基础镜像该不该建 / 怎么建 / 发什么引用 | `env` / `tag` / `build` / `verify` / `publish` / `resolve` / `summary` / `cleanup` |
@@ -52,6 +54,20 @@ yaml 里只留「输什么、调哪个脚本」，超过 10 行的 bash 一律�
 * `train.sh`（编排）与 `train_supervisor.sh`（进程监督）—— 后者带 trap 语义，
   混进编排里会让人不敢改它。
 * `result.py`（事实 → 文字）—— 其他脚本都向它写事实，它不该反过来依赖任何人。
+* `deps.sh`（装依赖）与 `pytest.sh`（跑测试）—— 装挂了和测试挂了是两类故障，
+  日志里分得开才查得动。
+
+**事件语义也只放一处**：`ci:full` / `ci:e2e` / `ci:skip-npu` 三个标签与
+`mode=pr|full` 的换算在 `affected.py` 的 `flags_from_event()` 里，`--self-test`
+把每个组合钉了一遍。放进 yaml 的话，「标签什么意思」会同时存在于 yaml 和文档，
+加一个标签就是两份实现 —— 而两份实现漂了不会报错，只会少跑。
+* `deps.sh`（装依赖）与 `pytest.sh`（跑测试）—— 装挂了和测试挂了是两类故障，
+  日志里分得开才查得动。
+
+**事件语义也只放一处**：`ci:full` / `ci:e2e` / `ci:skip-npu` 三个标签与
+`mode=pr|full` 的换算在 `affected.py` 的 `flags_from_event()` 里，自测把每个
+组合钉了一遍。放进 yaml 的话，「标签什么意思」会同时存在于 yaml 和文档，
+加一个标签就是两份实现。
 
 ## 约定
 

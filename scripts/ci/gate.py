@@ -37,6 +37,13 @@ def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default) or default
 
 
+def _has_label(tag: str) -> bool:
+    """标签判定只在这里（与 affected.py 的 flags_from_event 分工相同：
+    选什么归它，算不算过归这里）。"""
+    tags = {t.strip() for t in _env("LABELS").split(",") if t.strip()}
+    return tag in tags
+
+
 def _summary(markdown: str) -> None:
     path = _env("GITHUB_STEP_SUMMARY")
     if path:
@@ -185,7 +192,7 @@ def judge_pr() -> int:
     skip_reason = _env("SKIP_REASON")
     if skip_reason and results["NPU_MODEL"] == "success":
         rep.note("npu-model 跳过原因", f"⚠️ {skip_reason}")
-        if _env("STRICT") == "true":
+        if _has_label("ci:e2e:strict"):
             rep.failed = True
 
     # select 是计划本身：没算出来就没有「跑不跑」可言，直接判红。

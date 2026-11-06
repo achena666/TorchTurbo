@@ -254,6 +254,10 @@ cpu-unit 只跑选中的文件，所以「一个改文档的 PR」连 CPU 泳道
 | `ci:e2e:strict` | E2E 因模型超时跳过时**判红**；默认是「跳过但绿」 |
 | `ci:skip-npu` | 强制关掉 L2（hotfix 用） |
 
+标签的语义在 `scripts/ci/affected.py` 的 `flags_from_event()` 里，**不在 yaml**
+里：yaml 只把标签拼成字符串传过去。这样 `--self-test` 能把 8 种组合钉死，
+而「加一个标签」只需要改一处，不会出现 yaml 和文档两套说法。
+
 ## fork PR 的 L2 不自动跑
 
 fork PR 拿不到 secrets，而两条 NPU 泳道都需要 SWR 凭据。更关键的是：

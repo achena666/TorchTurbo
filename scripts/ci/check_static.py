@@ -229,7 +229,51 @@ def check_contract() -> list[str]:
             if "select" not in gate_deps:
                 bad.append(f"{rel}: gate 的 needs 缺 select（提前结束通路断了）")
 
+        # 6. 事件语义不许回到 yaml。标签 -> 开关的换算只在
+        #    affected.py 的 flags_from_event() 里；yaml 里再写一遍就是两份
+        #    实现，加一个标签必然漏改一边，而漏改不会报错，只会少跑。
+        bad += _check_no_event_semantics(rel, text)
+
+        # 7. 「超过 10 行的 bash 一律下沉到 scripts/ci」——这条容易被慢慢侵蚀，
+        #    所以留一条硬线。超了就把逻辑搬进脚本，那里能本地跑、过 shellcheck。
+        bad += _check_run_blocks(rel, jobs)
+
     print(f"contract: {len(needed)} 个 lane 输出 / {len(bad)} 个问题")
+    return bad
+
+
+RUN_BLOCK_LIMIT = 14      # 含 set -uo pipefail 之类的骨架行
+
+
+def _check_no_event_semantics(rel: str, text: str) -> list[str]:
+    """标签名不该出现在 workflow 的**逻辑**里 —— 它只属于 affected.py。
+
+    `description:` 里的提及是文档（给人看的手动触发说明），不算判定。
+    """
+    bad: list[str] = []
+    for tag in ("ci:full", "ci:e2e", "ci:skip-npu"):
+        for line in text.splitlines():
+            body = line.split("#", 1)[0]          # 注释里提标签是允许的
+            if "description:" in body:
+                continue
+            if tag in body:
+                bad.append(f"{rel}: workflow 里出现标签判定 `{tag}`，"
+                           "应交给 affected.py 的 flags_from_event")
+                break
+    return bad
+
+
+def _check_run_blocks(rel: str, jobs: dict) -> list[str]:
+    """yaml 里留声明，逻辑下沉到 scripts/ci。"""
+    bad: list[str] = []
+    for job_name, job in jobs.items():
+        for step in (job or {}).get("steps") or []:
+            lines = len((step.get("run") or "").splitlines())
+            if lines > RUN_BLOCK_LIMIT:
+                bad.append(
+                    f"{rel}: {job_name} 的 `{step.get('name')}` 有 {lines} 行 bash"
+                    f"（上限 {RUN_BLOCK_LIMIT}），请下沉到 scripts/ci"
+                )
     return bad
 
 
