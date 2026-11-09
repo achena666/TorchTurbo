@@ -35,8 +35,10 @@ on:
 
 # A shared group with cancel-in-progress: false still cancels *pending* jobs and
 # once wedged this queue. So: PRs cancel per PR, full runs never queue.
+# ci:manual:* labels are ci-manual.yml's triggers; a separate group keeps the
+# resulting no-op run from cancelling a real CI run.
 concurrency:
-  group: ci-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('full-{0}', github.run_id) }}
+  group: ci-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('full-{0}', github.run_id) }}${{ startsWith(github.event.label.name || '', 'ci:manual:') && '-manual-label' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -51,6 +53,9 @@ env:
 jobs:
   select:
     name: Lint_Select
+    # ci:manual:* exists to run one lane via ci-manual.yml. Without this guard a
+    # manual label also starts a full CI run, which is both slow and confusing.
+    if: ${{ !startsWith(github.event.label.name || '', 'ci:manual:') }}
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 20
     outputs:
@@ -311,7 +316,9 @@ jobs:
   gate:
     name: gate
     needs: [select, l1_cpu_unit, l2_npu_unit, l3_npu_model]
-    if: always()
+    # always() so lanes' results are judged even when select failed; the label
+    # guard mirrors select, or a manual-label run would judge an empty plan.
+    if: ${{ always() && !startsWith(github.event.label.name || '', 'ci:manual:') }}
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10
     steps:
