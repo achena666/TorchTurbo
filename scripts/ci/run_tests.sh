@@ -37,8 +37,17 @@ python3 "$CI_SCRIPTS/report_result.py" init --file "$RESULT_JSON" \
 # 两件事必须在这里做完：分片（按文件轮转，片间用例数大致均衡）和
 # 「文件列表为空就全量」（选择器没能给出结论时 fail-open）。
 # 手动排查给的是 TEST_PATH（可能是 node id），它优先于一切。
+# TEST_PATH 允许空格分隔多个 path：手动试泳道时常常只想跑几个目录，
+# 而 pytest 的单个位置参数塞不进多个（会被当成一个不存在的路径）。
+# 例外：含 `::` 的是 node id，参数化 id 里可能自带空格（test_x[a b]），
+# 拆了就变成一个不存在的路径 —— 这种一律当整体。path 不会含 `::`。
 if [ -n "$TEST_PATH" ]; then
-  printf '%s\n' "$TEST_PATH" > /tmp/tt_pytest_files.txt
+  if [[ "$TEST_PATH" == *::* ]]; then
+    printf '%s\n' "$TEST_PATH" > /tmp/tt_pytest_files.txt
+  else
+    printf '%s\n' "$TEST_PATH" | tr -s '[:space:]' '\n' \
+      | sed '/^$/d' > /tmp/tt_pytest_files.txt
+  fi
 else
 python3 - "$MODE" "$TEST_FILES" "$SHARD" >/tmp/tt_pytest_files.txt <<'PY'
 import glob, json, subprocess, sys

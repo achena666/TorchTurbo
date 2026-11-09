@@ -13,6 +13,11 @@ name: Manual lane test
 # the label and adding it again.
 #
 # Suggested order: cpu-unit -> npu-unit -> npu-model.
+#
+# Unit lanes default to `smoke`: a handful of dirs that stay green, so a red run
+# means the lane broke, not a test. `all` is the whole suite and is expected to
+# be red for reasons outside CI (see tests/scripts/test_dequant.py, which fails
+# at collection and aborts the whole session in seconds).
 
 # Without this every run in the list is just "Manual lane test".
 run-name: manual / ${{ inputs.lane || github.event.label.name }} / ${{ github.ref_name }}
@@ -31,10 +36,18 @@ on:
           - cpu-unit
           - npu-unit
           - npu-model
+      scope:
+        description: 'unit lanes: smoke = a few green dirs; all = the whole suite (slow, known red)'
+        required: true
+        default: 'smoke'
+        type: choice
+        options:
+          - smoke
+          - all
       test_path:
-        description: "unit lanes: dir / file / node id; leave '-' for the whole suite"
+        description: "unit lanes: explicit path(s) or node ids, space separated; overrides scope"
         required: false
-        default: '-'
+        default: ''
         type: string
       profiles:
         description: 'npu-model: JSON list of {model_type, layers}; layers=0 keeps all layers'
@@ -57,6 +70,11 @@ permissions:
 
 env:
   E2E_PROFILE: '[{"model_type":"qwen3_5","layers":0}]'
+  # Dirs with no optional deps and no known failures. Keep this list short: it
+  # answers "does the lane work", not "is the code correct".
+  SMOKE_CPU: 'tests/detector tests/registry tests/engine/test_freeze.py'
+  SMOKE_NPU: 'tests/ops/npu tests/ops/providers/npu'
+  SUITE_ALL: '-'
 
 jobs:
   cpu_unit:
@@ -94,7 +112,7 @@ jobs:
       - name: pytest
         env:
           MODE: cpu
-          TEST_PATH: ${{ inputs.test_path || '-' }}
+          TEST_PATH: ${{ inputs.test_path || (inputs.scope == 'all' && env.SUITE_ALL || env.SMOKE_CPU) }}
           RESULT_JSON: /tmp/ci-result.json
         run: bash scripts/ci/run_tests.sh
 
@@ -158,7 +176,7 @@ jobs:
       - name: pytest
         env:
           MODE: npu
-          TEST_PATH: ${{ inputs.test_path || '-' }}
+          TEST_PATH: ${{ inputs.test_path || (inputs.scope == 'all' && env.SUITE_ALL || env.SMOKE_NPU) }}
           RESULT_JSON: /tmp/ci-result.json
         run: bash scripts/ci/run_tests.sh
 
