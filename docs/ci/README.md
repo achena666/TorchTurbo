@@ -199,12 +199,19 @@ npu-unit 一旦开跑就是**泳道内全跑**（17 个含 `torch_npu` 的文件
 | `docker/npu/**` | ✅ | 选中的 CPU 文件 | **✅ 全跑** | 最便宜画像 |
 | `pyproject.toml` | ✅ | **全量** | **✅ 全跑** | 最便宜画像 |
 | `.github/**`、`scripts/ci/**` | ✅ | **全量** | — | — |
-| `scripts/runs/<dir>/**` | ✅ | `tests/scripts` | — | 该 `run_dir` 的模型 |
+| `scripts/runs/<dir>/**` | ✅ | 源码里真引用它的测试 | — | 该 `run_dir` 的模型 |
+| 其它 `scripts/**` | ✅ | 源码里真引用它的测试 | — | — |
 | `tests/**` | ✅ | affected | — | — |
 | `docs/**`、`*.md` | ✅ | — | — | — |
 
 cpu-unit 只跑选中的文件，所以「一个改文档的 PR」连 CPU 泳道都不开——静态那 15 s
 就是它的全部成本。
+
+`scripts/**` 不按目录名映射。这些脚本是用 `importlib` 按路径加载的，import 图里
+根本没有边，所以只能查测试源码的文本：命中完整路径或文件名才算相关。早先这里是
+「`scripts/runs/**` → `tests/scripts/**`」，但后者实际测的是
+`scripts/{checkpoint,dataset,dequant}` —— 纯属 `scripts` 这个词撞车，改一个启动
+脚本会白白拉进三个无关文件（其中一个还在收集阶段就报错）。
 
 两张表对应两个脚本：路径 → 用例是 `scripts/ci/select_plan.py`，路径 → 画像在
 `select_plan.py` 的 `pick_e2e()` 里，画像本身写在 `model_map.json` 的 `e2e` 字段。

@@ -57,6 +57,9 @@ class Index:
         self.tests: dict[str, set[str]] = {}   # 测试相对路径 -> 它 import 的 torchturbo 模块
         self.cases: dict[str, int] = {}         # 测试相对路径 -> 静态 test_ 函数数
         self.test_files: list[str] = []
+        # 测试源码原文。import 图看不到「用 importlib 按路径加载脚本」这种关系，
+        # 只能查文本；建图时顺手存下来，省得再读一遍 144 个文件。
+        self.texts: dict[str, str] = {}
         self._build()
 
     # ---- 建图 ------------------------------------------------------------
@@ -72,7 +75,9 @@ class Index:
         for path in sorted(tests_root.rglob("test_*.py")):
             rel = path.relative_to(self.root).as_posix()
             self.test_files.append(rel)
-            tree = self._parse(path)
+            text = path.read_text(encoding="utf-8", errors="replace")
+            self.texts[rel] = text
+            tree = self._parse_text(text)
             self.tests[rel] = self._imports_from(tree, path, None)
             # 静态计数：pytest 的实际用例数还要乘 parametrize 展开，这里只用来
             # 报「选中率」，不需要精确；选测/执行单位始终是文件。
@@ -109,10 +114,38 @@ class Index:
     def _imports(self, path: Path, modname: str | None) -> set[str]:
         return self._imports_from(self._parse(path), path, modname)
 
+    def script_referrers(self, changed: list[str]) -> set[str]:
+        """改了 scripts/ 下的文件，找出源码里真提到它的测试。
+
+        这些脚本是用 `importlib.util.spec_from_file_location` 按路径加载的，
+        import 图里根本没有边，所以只能查文本。两种写法都认：
+
+            Path(...) / "scripts" / "runs" / "run_swift.py"     -> 只认文件名
+            "scripts/checkpoint/dcp_to_hf.py"                   -> 认完整路径
+
+        不按目录名做映射：`tests/scripts/` 测的是 `scripts/{checkpoint,dataset,
+        dequant}`，与 `scripts/runs/` 无关 —— 那是 “scripts” 这个词撞车。
+        """
+        probes = [p for p in changed
+                  if p.startswith("scripts/") and not p.startswith("scripts/ci/")]
+        if not probes:
+            return set()
+        needles = set(probes) | {Path(p).name for p in probes}
+        # `__init__.py` 这类名字到处都是，按文件名匹配只会引入噪声。
+        needles = {n for n in needles if n != "__init__.py"}
+        if not needles:
+            return set()
+        return {rel for rel, text in self.texts.items()
+                if any(n in text for n in needles)}
+
     @staticmethod
     def _parse(path: Path) -> ast.AST:
+        return Index._parse_text(path.read_text(encoding="utf-8", errors="replace"))
+
+    @staticmethod
+    def _parse_text(text: str) -> ast.AST:
         try:
-            return ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+            return ast.parse(text)
         except SyntaxError:
             return ast.Module(body=[], type_ignores=[])
 
@@ -421,11 +454,10 @@ def select(index: Index, changed: list[str], force_all: bool = False,
         if not covered:
             c_tests.update(t for t in index.test_files if t.startswith(probe + "/"))
 
-    # ---- 直接改测试 / 改启动脚本 ----------------------------------------
+    # ---- 直接改测试 / 改脚本 ----------------------------------------------
     direct = [p for p in changed if p.startswith("tests/") and Path(p).name.startswith("test_")]
-    script_tests: set[str] = set()
-    if any(p.startswith("scripts/runs/") for p in changed):
-        script_tests = {t for t in index.test_files if t.startswith("tests/scripts/")}
+    # scripts/ 下的脚本按路径加载，import 图里没有边，只能按源码文本找引用者。
+    script_tests = index.script_referrers(changed)
 
     targets = sorted(set(direct) | a_tests | b_tests | c_tests | script_tests)
 
@@ -646,6 +678,19 @@ def self_test(root: Path) -> int:
     r = select(index, ["scripts/ci/select_plan.py"])
     check("CI 自身改动 -> 全量 CPU", r["mode"] == "all", r["mode"])
     check("CI 自身改动 -> 不起 npu-model", r["e2e"] == [], str(r["e2e"]))
+
+    # scripts/ 下的脚本按路径加载，靠源码文本找引用者。曾经按目录名把
+    # scripts/runs/** 一律映射到 tests/scripts/**，而后者测的是
+    # scripts/{checkpoint,dataset,dequant} —— 纯属 "scripts" 这个词撞车。
+    r = select(index, ["scripts/runs/run_swift.py"])
+    check("改启动器 -> 只选真引用它的测试",
+          r["lanes"]["cpu_unit"]["files"] == ["tests/adapters/msswift/test_launcher.py"],
+          str(r["lanes"]["cpu_unit"]["files"]))
+
+    r = select(index, ["scripts/runs/qwen3_5_dense/install_lf_deps.sh"])
+    check("改无人引用的启动脚本 -> 不选 CPU 用例（E2E 兜）",
+          r["lanes"]["cpu_unit"]["files"] == [] and bool(r["e2e"]),
+          f"{r['lanes']['cpu_unit']['files']} / e2e={[e['model_type'] for e in r['e2e']]}")
 
     r = select(index, ["README.md"])
     check("文档 -> 0 用例 0 泳道",

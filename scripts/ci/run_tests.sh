@@ -97,16 +97,22 @@ else
   MARK=(-m "not npu")
 fi
 
+# 一个文件在收集阶段报错（缺依赖、import 不到模块）默认会**中断整个 session**：
+# 结果是 rc=2、跑 0 个用例，跟「泳道坏了」长得一模一样。加上这个标志后，
+# 坏文件自己记 ERROR，其余用例照常跑，退出码仍然是 1 —— 依然红，但红得有信息。
+# 放在命令行而不是 PYTEST_ARGS：调用方覆盖 PYTEST_ARGS 时不该把它丢掉。
+COLLECT_FLAGS=(--continue-on-collection-errors)
+
 echo "--- collected ---"
 # shellcheck disable=SC2086  # PYTEST_ARGS 故意不进数组，要按空格拆
-python -m pytest "${FILES[@]}" "${MARK[@]}" ${PYTEST_ARGS} --collect-only -q 2>&1 \
+python -m pytest "${FILES[@]}" "${MARK[@]}" ${PYTEST_ARGS} "${COLLECT_FLAGS[@]}" --collect-only -q 2>&1 \
   | tail -20 || true
 
 echo "--- run ---"
 START=$(date +%s)
 set +e
 # shellcheck disable=SC2086
-python -m pytest "${FILES[@]}" "${MARK[@]}" ${PYTEST_ARGS} \
+python -m pytest "${FILES[@]}" "${MARK[@]}" ${PYTEST_ARGS} "${COLLECT_FLAGS[@]}" \
   --junitxml="$JUNIT_OUT" 2>&1 | tee /tmp/pytest.log
 RC=${PIPESTATUS[0]}
 ELAPSED=$(( $(date +%s) - START ))
