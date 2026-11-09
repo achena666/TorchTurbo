@@ -1,16 +1,21 @@
 name: Manual lane test
 
-# Hand-run ONE lane at a time: no selection, no gate, no sibling lanes, so a red
-# run points at the lane instead of the diff. ci-pr.yml stays the only PR entry.
+# Run ONE lane by hand: no selection, no gate, no sibling lanes, so a red run
+# points at the lane instead of the diff. ci-pr.yml stays the only PR entry.
 #
-# Two ways in, both landing on the same three jobs:
-#   label     add ci:manual:<lane> to a PR. pull_request workflows are read from
-#             the PR head, so this works even before the file reaches main.
-#   dispatch  pick `lane` in the UI (needs this file on the default branch).
+# Web UI: Actions -> "Manual lane test" -> Run workflow -> pick lane -> branch.
+# The branch selector picks which code runs, so any branch can be tested without
+# touching it. If the run still uses the old script names, the branch predates
+# the scripts/ci rename.
 #
-# Re-run after a fix: remove the label, then add it again.
+# Label: add ci:manual:<lane> to a PR (pull_request workflows are read from the
+# PR head, so this works even before the file reaches main). Re-run by removing
+# the label and adding it again.
 #
 # Suggested order: cpu-unit -> npu-unit -> npu-model.
+
+# Without this every run in the list is just "Manual lane test".
+run-name: manual / ${{ inputs.lane || github.event.label.name }} / ${{ github.ref_name }}
 
 on:
   pull_request:
@@ -18,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       lane:
-        description: 'lane to run'
+        description: 'which lane to run'
         required: true
         default: 'cpu-unit'
         type: choice
@@ -27,17 +32,17 @@ on:
           - npu-unit
           - npu-model
       test_path:
-        description: "unit lanes: dir / file / node id; '-' = whole suite"
+        description: "unit lanes: dir / file / node id; leave '-' for the whole suite"
         required: false
         default: '-'
         type: string
       profiles:
-        description: 'npu-model: JSON list of {model_type, layers}'
+        description: 'npu-model: JSON list of {model_type, layers}; layers=0 keeps all layers'
         required: false
         default: '[{"model_type":"qwen3_5","layers":0}]'
         type: string
       image:
-        description: 'npu lanes: container image'
+        description: 'npu lanes: container image (empty = repo default)'
         required: false
         default: 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest'
         type: string
