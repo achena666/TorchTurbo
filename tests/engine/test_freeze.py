@@ -1,4 +1,7 @@
-"""Tests for engine-owned freeze policy application."""
+"""Tests for engine-owned freeze policy application.
+
+CI demo: one .py change on the fork, to exercise the self-verification loop.
+"""
 
 import os
 
