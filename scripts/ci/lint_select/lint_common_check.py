@@ -76,15 +76,35 @@ def _arch() -> str:
     raise RuntimeError(f"unsupported architecture: {machine}")
 
 
-def _tool_path(name: str) -> Path | None:
+# Version probes for the tools that bootstrap themselves. A runner image may
+# already ship an older build on PATH, and shellcheck/hadolint/actionlint all
+# change which rules fire between releases, so a mismatch must not be used.
+PROBE = {"actionlint": "-version", "hadolint": "--version",
+         "shellcheck": "--version"}
+
+
+def _tool_path(name: str, version: str | None = None) -> Path | None:
     candidates = [
         os.environ.get(f"{name.upper()}_BIN"),
         TOOL_DIR / name,
         Path("/tmp") / name,
         shutil.which(name),
     ]
-    for candidate in candidates:
-        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
+    for index, candidate in enumerate(candidates):
+        if not candidate or not Path(candidate).is_file():
+            continue
+        if not os.access(candidate, os.X_OK):
+            continue
+        # An explicit *_BIN override is honoured as-is; everything else must
+        # report the pinned version or the download below supplies it instead.
+        if index == 0 or version is None:
+            return Path(candidate)
+        try:
+            probe = run([str(candidate), PROBE[name]], timeout=30)
+            reported = probe.stdout + probe.stderr
+        except (OSError, subprocess.SubprocessError):
+            reported = ""
+        if version in reported:
             return Path(candidate)
     return None
 
@@ -123,7 +143,7 @@ def _extract_binary(archive: Path, target: Path, member_name: str) -> Path:
 
 
 def _ensure_actionlint() -> Path:
-    found = _tool_path("actionlint")
+    found = _tool_path("actionlint", ACTIONLINT_VERSION)
     if found:
         return found
     arch = _arch()
@@ -136,7 +156,7 @@ def _ensure_actionlint() -> Path:
 
 
 def _ensure_hadolint() -> Path:
-    found = _tool_path("hadolint")
+    found = _tool_path("hadolint", HADOLINT_VERSION)
     if found:
         return found
     arch = "arm64" if _arch() == "arm64" else "x86_64"
@@ -148,7 +168,7 @@ def _ensure_hadolint() -> Path:
 
 
 def _ensure_shellcheck() -> Path:
-    found = _tool_path("shellcheck")
+    found = _tool_path("shellcheck", SHELLCHECK_VERSION)
     if found:
         return found
     arch = "aarch64" if _arch() == "arm64" else "x86_64"
