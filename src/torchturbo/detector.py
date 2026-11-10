@@ -8,6 +8,7 @@ Usage::
     from torchturbo.detector import FrameworkDetector
 
     name = FrameworkDetector.detect()          # -> "llamafactory_v0" or None
+    # Adapters are tried in priority order; the first match wins.
     all_names = FrameworkDetector.detect_all() # -> ["llamafactory_v0", ...]
 """
 
