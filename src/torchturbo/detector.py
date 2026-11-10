@@ -8,7 +8,6 @@ Usage::
     from torchturbo.detector import FrameworkDetector
 
     name = FrameworkDetector.detect()          # -> "llamafactory_v0" or None
-    # Adapters are tried in priority order; the first match wins.
     all_names = FrameworkDetector.detect_all() # -> ["llamafactory_v0", ...]
 """
 
@@ -17,6 +16,8 @@ from __future__ import annotations
 from .logging import get_logger
 from .registry import BaseAdapter, get_adapter, get_adapters_by_priority
 
+
+__all__ = ["FrameworkDetector"]
 
 logger = get_logger(__name__)
 
