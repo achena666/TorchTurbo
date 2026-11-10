@@ -16,6 +16,10 @@ from torchturbo.models.qwen4_exp.model import TurboQwen4ExpForConditionalGenerat
 from .test_model import _small_config
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class _CheckpointProbe(nn.Module):
     def __init__(self):
         super().__init__()

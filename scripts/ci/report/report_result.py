@@ -29,15 +29,13 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-DIAG_PREFIX = "[ttdiag]"
-
 # Two job shapes share this file. `kind` decides which summary layout is used, so a
 # pytest run never prints a table of "?" for model-cache columns it has no concept of.
 KIND_TRAIN = "train"
 KIND_PYTEST = "pytest"
 
-# 映射表的字段顺序。run_train.sh 的 cmd_prepare 按这个顺序 set -- 分区，
-# 所以只能往后追加，不能插队。
+# Field order for model-map rows. run_train.sh reads fields in this order,
+# so append new fields at the end instead of reordering them.
 _MAP_FIELDS = ("run_dir", "lf", "swift", "hf_repo", "e2e")
 
 
@@ -100,21 +98,6 @@ def _tail(path: Path, lines: int) -> str:
     return "\n".join(text.splitlines()[-lines:])
 
 
-def _grep(path: Path, needle: str, limit: int) -> str:
-    if not path.is_file():
-        return ""
-    hits = []
-    try:
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            if needle in line:
-                hits.append(line)
-                if len(hits) >= limit:
-                    break
-    except Exception:
-        return ""
-    return "\n".join(hits)
-
-
 def _getter(doc: dict):
     def get(key: str, default: str = "?") -> str:
         value = doc.get(key, "")
@@ -141,7 +124,7 @@ def _phase_block(phases: list[dict]) -> tuple[list[str], int]:
     return lines, total
 
 
-def _render_train(doc: dict, *, log: Path, traceback: Path, versions: Path) -> str:
+def _render_train(doc: dict, *, log: Path, versions: Path) -> str:
     get = _getter(doc)
     phases = doc.get("phases", [])
 
@@ -181,18 +164,6 @@ def _render_train(doc: dict, *, log: Path, traceback: Path, versions: Path) -> s
         "```",
         _tail(log, 40) or "(no train log)",
         "```",
-        "",
-        "### Python 异常（excepthook 捕获，torchrun 转发会截断）",
-        "",
-        "```",
-        _tail(traceback, 60) or "(none)",
-        "```",
-        "",
-        "### loss 诊断（NaN 出在哪一层）",
-        "",
-        "```",
-        _grep(log, DIAG_PREFIX, 400) or "(none)",
-        "```",
     ]
     return "\n".join(lines) + "\n"
 
@@ -206,7 +177,7 @@ def _render_pytest(doc: dict, *, log: Path, versions: Path, junit: Path) -> str:
         "",
         "| item | value |",
         "|---|---|",
-        f"| image | `{get('image')}` |",
+        f"| image | `{get('image', 'n/a')}` |",
         f"| target | `{get('test_path')}` |",
         f"| args | `{get('pytest_args')}` |",
     ]
@@ -272,12 +243,10 @@ def _junit_stats(path: Path) -> dict | None:
     }
 
 
-def render(
-    doc: dict, *, log: Path, traceback: Path, versions: Path, junit: Path
-) -> str:
+def render(doc: dict, *, log: Path, versions: Path, junit: Path) -> str:
     if doc.get("kind") == KIND_PYTEST:
         return _render_pytest(doc, log=log, versions=versions, junit=junit)
-    return _render_train(doc, log=log, traceback=traceback, versions=versions)
+    return _render_train(doc, log=log, versions=versions)
 
 
 def _main_phase(doc: dict) -> dict:
@@ -348,7 +317,6 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--rc", default="")
     parser.add_argument("--train-log", default="/tmp/train.log",
                         help="主日志：训练用 train.log，pytest 用 pytest.log")
-    parser.add_argument("--traceback", default="/tmp/tt_traceback.log")
     parser.add_argument("--versions", default="/tmp/after.txt")
     parser.add_argument("--junit", default="/tmp/pytest.xml")
     parser.add_argument("--map", default=".github/workflows/model_map.json")
@@ -454,7 +422,6 @@ def main(argv: list[str]) -> int:
         render(
             doc,
             log=Path(args.train_log),
-            traceback=Path(args.traceback),
             versions=Path(args.versions),
             junit=Path(args.junit),
         )

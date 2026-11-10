@@ -8,6 +8,10 @@ from torchturbo.models.modules.moe.experts import GroupedMLP
 from torchturbo.models.modules.moe.moe_config import MoEConfig
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.mark.parametrize("num_local_experts", [1, 2])
 def test_zero_token_forward_keeps_adapters_in_graph(num_local_experts):
     torch.manual_seed(0)

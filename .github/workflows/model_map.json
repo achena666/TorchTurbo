@@ -1,15 +1,15 @@
 {
-  "$schema": "CI 测试映射表：model_type -> 启动脚本 / 权重 / 端到端画像",
+  "$schema": "CI 测试映射表：model_type -> 启动脚本 / 权重 / 端到端训练用例",
   "_comment": [
     "每一条的键必须与 src/torchturbo/models/<dir>/model.py 里 @register_model(...) 的",
-    "名字一字不差。check_static.py 的 map 项会双向比对，漏一个当场报错。",
+    "名字一字不差；漏一个就是 endpoint 跑不起来而不是被选测。",
     "",
     "字段：",
     "  run_dir   scripts/runs 下的目录（放这套模型的启动脚本）；\"-\" = 还没有 CI 启动器",
     "  lf        llama-factory 脚本，逗号分隔，第一个是默认；\"-\" = 不支持",
     "  swift     ms-swift 脚本，同上",
     "  hf_repo   CI 下载的 HuggingFace 仓库；\"-\" = 未知（不给 train_model_path 就拒绝跑）",
-    "  e2e       PR 端到端画像：",
+    "  e2e       PR 端到端训练用例：",
     "              full    全量权重（train_layers=0）",
     "              trim:N  只留前 N 层（flash_trim -> model.py trim），train_layers=N",
     "              -       不参与 PR 端到端",
@@ -30,6 +30,13 @@
       "swift": "swift_mllm_sft.sh,swift_text_dpo.sh",
       "hf_repo": "Qwen/Qwen3.5-35B-A3B",
       "e2e": "trim:6"
+    },
+    "qwen3_5_moe_text": {
+      "run_dir": "-",
+      "lf": "-",
+      "swift": "-",
+      "hf_repo": "-",
+      "e2e": "-"
     },
     "bailing_hybrid": {
       "run_dir": "bailing_v3",

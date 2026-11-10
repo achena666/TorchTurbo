@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+    "ruff>=0.6.9",
 ]
 test = [
     "pytest>=7.0",
@@ -29,19 +30,6 @@ test = [
     "huggingface_hub",
     "pillow",
     "peft",
-]
-
-# 只做三件事：限定测试根、声明 marker、让「没装包也能跑」。
-# 不设 addopts 里的 -m：NPU 泳道要跑的就是被打上 npu 的那些。
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["src"]
-# --strict-markers：写错 marker 名字时直接报错，而不是静默变成「没选中」。
-addopts = "--strict-markers"
-markers = [
-    "npu: 需要 Ascend NPU；tests/conftest.py 会按 torch_npu 导入自动打标",
-    "slow: 单次运行超过 60 s",
-    "integration: 需要外部数据集、权重或网络",
 ]
 
 [tool.hatch.build.targets.wheel]

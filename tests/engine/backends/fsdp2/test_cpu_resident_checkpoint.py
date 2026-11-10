@@ -35,6 +35,10 @@ from torchturbo.models.qwen4_exp.ple import NGramEmbedding
 from torchturbo.runtime.cpu import CpuRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class ResidentModel(nn.Module):
     def __init__(self):
         super().__init__()

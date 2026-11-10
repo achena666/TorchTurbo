@@ -159,6 +159,7 @@ def _run_qsa(rank: int, init_file: str, ratio12: bool) -> None:
         dist.destroy_process_group()
 
 
+@pytest.mark.cpu
 @pytest.mark.skipif(
     not (dist.is_available() and dist.is_gloo_available()),
     reason="requires torch.distributed with Gloo support",
@@ -264,15 +265,17 @@ def _check_native_qsa_varlen(
         )
 
 
+@pytest.mark.npu
+@pytest.mark.multi_npu
 @pytest.mark.skipif(
     os.environ.get("TORCH_TURBO_TEST_QSA_VARLEN_NPU") != "1",
     reason="opt-in native NPU varlen attention with HCCL sequence parallelism",
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_native_varlen_ratio12_packed_sp2(tmp_path, dtype) -> None:
-    pytest.importorskip("torch_npu")
-    if torch.npu.device_count() < 2:
-        pytest.skip("requires two NPUs")
+    from tests.support.npu import require_npus
+
+    require_npus(2)
     mp.spawn(
         _run_native_qsa_varlen,
         args=(str(tmp_path / "qsa-native-sp"), dtype),

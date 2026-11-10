@@ -4,6 +4,11 @@ import torch
 
 from torchturbo.models.modules.moe.moe_config import MoEConfig
 from torchturbo.models.modules.moe.router import TopKRouter
+import pytest
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 def _router_config() -> MoEConfig:

@@ -3,6 +3,10 @@ name: Manual lane test
 # Run ONE lane by hand: no selection, no gate, no sibling lanes, so a red run
 # points at the lane instead of the diff. ci-pr.yml stays the only PR entry.
 #
+# No lint / select here on purpose: this workflow answers "does this lane work",
+# which the PR gate already proves for correct code. Running the selector would
+# also filter out the very case being debugged.
+#
 # Web UI: Actions -> "Manual lane test" -> Run workflow -> pick lane -> branch.
 # The branch selector picks which code runs, so any branch can be tested without
 # touching it. If the run still uses the old script names, the branch predates
@@ -12,7 +16,7 @@ name: Manual lane test
 # PR head, so this works even before the file reaches main). Re-run by removing
 # the label and adding it again.
 #
-# Suggested order: cpu-unit -> npu-unit -> npu-model.
+# Suggested order: cpu-unit -> npu-unit -> npu-e2e.
 #
 # Unit lanes default to `smoke`: a handful of dirs that stay green, so a red run
 # means the lane broke, not a test. `all` is the whole suite and is expected to
@@ -35,7 +39,7 @@ on:
         options:
           - cpu-unit
           - npu-unit
-          - npu-model
+          - npu-e2e
       scope:
         description: 'unit lanes: smoke = a few green dirs; all = the whole suite (slow, known red)'
         required: true
@@ -49,11 +53,19 @@ on:
         required: false
         default: ''
         type: string
-      profiles:
-        description: 'npu-model: JSON list of {model_type, layers}; layers=0 keeps all layers'
+      cases:
+        description: 'npu-e2e: E2E cases as JSON {model_type, layers}; layers=0 keeps all layers'
         required: false
         default: '[{"model_type":"qwen3_5","layers":0}]'
         type: string
+      framework:
+        description: 'npu-e2e: launcher family to run; some models only have swift'
+        required: true
+        default: 'lf'
+        type: choice
+        options:
+          - lf
+          - swift
       image:
         description: 'npu lanes: container image (empty = repo default)'
         required: false
@@ -69,7 +81,7 @@ permissions:
   contents: read
 
 env:
-  E2E_PROFILE: '[{"model_type":"qwen3_5","layers":0}]'
+  E2E_CASES_DEFAULT: '[{"model_type":"qwen3_5","layers":0}]'
   # Dirs with no optional deps and no known failures. Keep this list short: it
   # answers "does the lane work", not "is the code correct".
   SMOKE_CPU: 'tests/detector tests/registry tests/engine/test_freeze.py'
@@ -104,17 +116,17 @@ jobs:
           RESULT_JSON: /tmp/ci-result.json
         run: |
           set -uo pipefail
-          python3 scripts/ci/report_result.py init --file "$RESULT_JSON" \
+          python3 scripts/ci/report/report_result.py init --file "$RESULT_JSON" \
             kind=pytest model_type=pytest-cpu-unit mode=cpu \
             runner_label="${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}"
-          bash scripts/ci/install_deps.sh install
+          bash scripts/ci/unit_tests/run_tests.sh install
 
       - name: pytest
         env:
           MODE: cpu
           TEST_PATH: ${{ inputs.test_path || (inputs.scope == 'all' && env.SUITE_ALL || env.SMOKE_CPU) }}
           RESULT_JSON: /tmp/ci-result.json
-        run: bash scripts/ci/run_tests.sh
+        run: bash scripts/ci/unit_tests/run_tests.sh
 
       - name: summary
         if: always()
@@ -122,9 +134,9 @@ jobs:
           RESULT_JSON: /tmp/ci-result.json
         run: |
           set -uo pipefail
-          python3 scripts/ci/report_result.py report --file "$RESULT_JSON" \
+          python3 scripts/ci/report/report_result.py report --file "$RESULT_JSON" \
             --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
-          python3 scripts/ci/report_result.py notice --file "$RESULT_JSON" \
+          python3 scripts/ci/report/report_result.py notice --file "$RESULT_JSON" \
             --model-type pytest-cpu-unit || true
 
   npu_unit:
@@ -157,28 +169,28 @@ jobs:
           RESULT_JSON: /tmp/ci-result.json
         run: |
           set -uo pipefail
-          python3 scripts/ci/report_result.py init --file "$RESULT_JSON" \
+          python3 scripts/ci/report/report_result.py init --file "$RESULT_JSON" \
             kind=pytest model_type=pytest-npu-unit mode=npu \
             runner_label="${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}" \
             image="${{ inputs.image || vars.CI_NPU_IMAGE || 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest' }}"
           uname -m; nproc; free -h | head -2; python -V
 
       # 20 s to find "no NPU" beats discovering it after installing deps.
-      - name: npu self-check
-        run: bash scripts/ci/run_train.sh probe
+      - name: environment check
+        run: python3 scripts/ci/common/env_pod.py probe --file /tmp/torch-before.json
 
       - name: install
         env:
           MODE: npu
           RESULT_JSON: /tmp/ci-result.json
-        run: bash scripts/ci/install_deps.sh install
+        run: bash scripts/ci/unit_tests/run_tests.sh install
 
       - name: pytest
         env:
           MODE: npu
           TEST_PATH: ${{ inputs.test_path || (inputs.scope == 'all' && env.SUITE_ALL || env.SMOKE_NPU) }}
           RESULT_JSON: /tmp/ci-result.json
-        run: bash scripts/ci/run_tests.sh
+        run: bash scripts/ci/unit_tests/run_tests.sh
 
       - name: summary
         if: always()
@@ -186,16 +198,16 @@ jobs:
           RESULT_JSON: /tmp/ci-result.json
         run: |
           set -uo pipefail
-          python3 scripts/ci/report_result.py report --file "$RESULT_JSON" \
+          python3 scripts/ci/report/report_result.py report --file "$RESULT_JSON" \
             --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
-          python3 scripts/ci/report_result.py notice --file "$RESULT_JSON" \
+          python3 scripts/ci/report/report_result.py notice --file "$RESULT_JSON" \
             --model-type pytest-npu-unit || true
 
-  npu_model:
-    name: npu-model-tests
+  npu_e2e:
+    name: npu-e2e-tests
     if: |
-      ((github.event_name == 'pull_request' && github.event.label.name == 'ci:manual:npu-model')
-       || (github.event_name == 'workflow_dispatch' && inputs.lane == 'npu-model'))
+      ((github.event_name == 'pull_request' && github.event.label.name == 'ci:manual:npu-e2e')
+       || (github.event_name == 'workflow_dispatch' && inputs.lane == 'npu-e2e'))
       && (github.event_name != 'pull_request'
           || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
@@ -215,27 +227,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: npu and stack self-check
-        run: bash scripts/ci/run_train.sh probe
+      - name: environment check
+        id: environment
+        run: python3 scripts/ci/common/env_pod.py probe --file /tmp/torch-before.json
 
-      - name: train
+      - name: training orchestration
         id: lane
         timeout-minutes: 25
         env:
-          E2E_PROFILES: ${{ inputs.profiles || env.E2E_PROFILE }}
-          FRAMEWORK: lf
+          E2E_CASES: ${{ inputs.cases || env.E2E_CASES_DEFAULT }}
+          # ci-pr always runs lf: the selector only offers models with an lf
+          # launcher. Manual runs may target a swift-only model (qwen4_exp).
+          FRAMEWORK: ${{ inputs.framework || 'lf' }}
           RUNNER_LABEL: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
           IMAGE: ${{ inputs.image || vars.CI_NPU_IMAGE || 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest' }}
           SEQ_LEN: '4096'
           DATASET_IN: 'gsm8k'
           FINETUNING_TYPE: 'full'
           FETCH_TIMEOUT: '600'
-          DIAG: 'true'
           RESULT_JSON: /tmp/ci-result.json
-        run: bash scripts/ci/run_train.sh lane
+        run: bash scripts/ci/e2e_tests/run_train.sh lane
 
       # timeout-minutes only kills the process; children would keep the cards.
-      - name: cleanup
+      - name: environment cleanup
         if: always()
         continue-on-error: true
-        run: python3 scripts/ci/env_pod.py cleanup
+        run: python3 scripts/ci/common/env_pod.py cleanup

@@ -26,6 +26,10 @@ from torchturbo.models.modules.cpu_resident import NodeSharedCPUResidentParamete
 from torchturbo.models.weight_converter import BaseWeightConverter
 from torchturbo.runtime.cpu import CpuRuntime
 
+
+pytestmark = pytest.mark.cpu
+
+
 _NGRAM_NAMES = (
     "ngram_embedding.shard_0.weight",
     "ngram_embedding.shard_1.weight",

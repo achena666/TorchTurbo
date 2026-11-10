@@ -18,6 +18,10 @@ from .test_ple import adapted, new_reference
 from .test_ple_distributed import _init_process_group
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _check_cancellation(rank, dtype, length, boundaries, reentrant):
     total = length * 4
     local_slice = slice(rank * length, (rank + 1) * length)

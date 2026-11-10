@@ -10,6 +10,8 @@ pytest.importorskip("torch_npu")
 if not torch.npu.is_available():
     pytest.skip("NPU is required for SparseFlashMla precision tests", allow_module_level=True)
 
+pytestmark = [pytest.mark.npu]
+
 
 @pytest.fixture(scope="module")
 def npu_ops():
