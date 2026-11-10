@@ -30,7 +30,8 @@ except ImportError:  # reported by the checks that need it
 
 def _yaml_document(path: Path) -> dict:
     if yaml is None:
-        raise RuntimeError("PyYAML is not installed (pip install PyYAML)")
+        raise RuntimeError("PyYAML is not installed "
+                           "(pip install -r requirements-lint.txt)")
 
     class UniqueKeyLoader(yaml.SafeLoader):
         pass

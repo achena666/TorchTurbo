@@ -26,7 +26,9 @@ TOOL_DIR = Path(os.environ.get("TORCHTURBO_LINT_TOOLS", "/tmp/torchturbo-lint-to
 ACTIONLINT_VERSION = "1.7.12"
 HADOLINT_VERSION = "2.15.1"
 SHELLCHECK_VERSION = "0.11.0"
-RUFF_VERSION = "0.6.9"
+# ruff and PyYAML are not self-bootstrapped; their pinned versions live in
+# requirements-lint.txt alone, so this file cannot drift from the workflow.
+REQUIREMENTS = "requirements-lint.txt"
 
 # These are build-policy choices, not accidental lint debt.
 HADOLINT_IGNORES = ("DL3041", "DL3042", "DL3003", "DL3059")
@@ -162,7 +164,7 @@ def _ensure_ruff() -> Path:
     found = _tool_path("ruff")
     if found:
         return found
-    raise RuntimeError(f"ruff is not installed (pip install 'ruff=={RUFF_VERSION}')")
+    raise RuntimeError(f"ruff is not installed (pip install -r {REQUIREMENTS})")
 
 
 def _diagnostics(cmd: list[str], fallback: str, timeout: int = 120) -> list[Problem]:

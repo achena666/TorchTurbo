@@ -82,7 +82,8 @@ jobs:
 
       # Generic linters run first, then TorchTurbo contracts. Keeping both in
       # one driver makes every finding visible in one pass; `--verify` for the
-      # selector also runs here.
+      # selector also runs here. Only ruff and PyYAML need installing up front;
+      # shellcheck, actionlint and hadolint bootstrap themselves.
       - name: lint
         id: lint
         env:
@@ -90,7 +91,7 @@ jobs:
         run: |
           set -uo pipefail
           python3 -m pip install --quiet --disable-pip-version-check \
-            'PyYAML==6.0.3' 'ruff==0.6.9'
+            -r requirements-lint.txt
           python3 scripts/ci/lint_select/lint_check.py
 
       - name: resolve image
